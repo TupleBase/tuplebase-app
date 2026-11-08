@@ -244,6 +244,17 @@ pub fn config_dir() -> Result<PathBuf> {
         .context("cannot locate the user config directory")
 }
 
+/// Writes a file via a temp file and rename, so a crash never leaves half a file.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, format!("{text}\n")).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join(CONFIG_FILE))
 }
@@ -272,16 +283,8 @@ impl Config {
         Ok(config)
     }
 
-    /// Writes atomically (temp file + rename) so a crash never leaves a half file.
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)? + "\n")
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
+        write_atomic(path, &serde_json::to_string_pretty(self)?)
     }
 
     /// Every folder path, parents before their children.

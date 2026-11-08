@@ -14,7 +14,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow, My
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
-use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo, ValueRef};
+use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement, TypeInfo, ValueRef};
 use tokio::sync::Mutex;
 
 use crate::config::{Adapter, Connection, TlsMode};
@@ -30,6 +30,16 @@ pub struct QueryResult {
     /// Set for statements that do not return rows.
     pub rows_affected: Option<u64>,
     pub elapsed_ms: u64,
+}
+
+/// What running a script produced.
+#[derive(Debug, Clone)]
+pub struct ScriptResult {
+    /// The last statement that returned rows, or else the last statement.
+    pub result: QueryResult,
+    pub statements: usize,
+    /// At least one statement changed something rather than reading.
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -107,47 +117,115 @@ impl Db {
         }
     }
 
+    /// Runs exactly one statement. It's sent as a prepared statement, so the server
+    /// rejects anything smuggled in after a `;`. This is what agents use.
     pub async fn execute(
         &self,
         conn: &Connection,
         sql: &str,
         opts: ExecOptions,
     ) -> Result<QueryResult> {
-        let sql = safety::trim_statement(sql);
-        if sql.is_empty() {
+        let statement = safety::trim_statement(sql);
+        if statement.is_empty() {
             bail!("nothing to run");
         }
+        Ok(self.run(conn, &[statement], opts).await?.result)
+    }
+
+    /// Runs `;`-separated statements in order, stopping at the first error.
+    pub async fn execute_script(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        opts: ExecOptions,
+    ) -> Result<ScriptResult> {
+        let statements = safety::split_statements(conn.adapter, sql);
+        if statements.is_empty() {
+            bail!("nothing to run");
+        }
+        self.run(conn, &statements, opts).await
+    }
+
+    /// Uses one connection throughout, so transactions and session settings carry over
+    /// from one statement to the next.
+    async fn run(
+        &self,
+        conn: &Connection,
+        statements: &[&str],
+        opts: ExecOptions,
+    ) -> Result<ScriptResult> {
         let read_only = opts.read_only || conn.readonly;
         if read_only {
-            safety::check_read_only(sql).map_err(|e| anyhow!(e))?;
-        }
-        let started = Instant::now();
-        let mut result = match self.pool(conn).await? {
-            Pool::Pg(pool) => {
-                let mut c = pool.acquire().await?;
-                if read_only {
-                    c.execute("BEGIN READ ONLY").await?;
-                }
-                let out = run!(&mut *c, sql, opts.max_rows, pg_value);
-                if read_only && c.execute("ROLLBACK").await.is_err() {
-                    c.close().await.ok();
-                }
-                out?
+            for statement in statements {
+                safety::check_read_only(statement).map_err(|e| anyhow!(e))?;
             }
-            Pool::My(pool) => {
-                let mut c = pool.acquire().await?;
-                if read_only {
-                    c.execute("START TRANSACTION READ ONLY").await?;
+        }
+        let total = statements.len();
+        let started = Instant::now();
+        let mut shown: Option<QueryResult> = None;
+        let mut changed = false;
+
+        macro_rules! run_all {
+            ($pool:expr, $begin:literal, $decode:ident) => {{
+                let mut c = $pool.acquire().await?;
+                for (index, sql) in statements.iter().copied().enumerate() {
+                    if read_only {
+                        c.execute($begin).await?;
+                    }
+                    let out = run!(&mut *c, sql, opts.max_rows, $decode);
+                    if read_only && c.execute("ROLLBACK").await.is_err() {
+                        c.close_on_drop();
+                    }
+                    let result = if total > 1 {
+                        out.with_context(|| format!("statement {} of {total}", index + 1))?
+                    } else {
+                        out?
+                    };
+                    changed |= result.rows_affected.is_some();
+                    if shown.is_none() || !result.columns.is_empty() {
+                        shown = Some(result);
+                    }
                 }
-                let out = run!(&mut *c, sql, opts.max_rows, my_value);
-                if read_only && c.execute("ROLLBACK").await.is_err() {
-                    c.close().await.ok();
-                }
-                out?
+            }};
+        }
+        match self.pool(conn).await? {
+            Pool::Pg(pool) => run_all!(pool, "BEGIN READ ONLY", pg_value),
+            Pool::My(pool) => run_all!(pool, "START TRANSACTION READ ONLY", my_value),
+        }
+
+        let mut result = shown.expect("callers pass at least one statement");
+        result.elapsed_ms = started.elapsed().as_millis() as u64;
+        Ok(ScriptResult {
+            result,
+            statements: total,
+            changed,
+        })
+    }
+
+    /// Column names across the connection's tables, for autocomplete.
+    pub async fn list_column_names(&self, conn: &Connection) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = match self.pool(conn).await? {
+            Pool::Pg(p) => {
+                sqlx::query_as(
+                    "SELECT DISTINCT column_name::text FROM information_schema.columns \
+                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+                     ORDER BY 1 LIMIT 5000",
+                )
+                .fetch_all(&p)
+                .await?
+            }
+            Pool::My(p) => {
+                sqlx::query_as(
+                    "SELECT DISTINCT CAST(column_name AS CHAR) FROM information_schema.columns \
+                     WHERE table_schema NOT IN \
+                     ('mysql', 'information_schema', 'performance_schema', 'sys') \
+                     ORDER BY 1 LIMIT 5000",
+                )
+                .fetch_all(&p)
+                .await?
             }
         };
-        result.elapsed_ms = started.elapsed().as_millis() as u64;
-        Ok(result)
+        Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
     pub async fn list_tables(&self, conn: &Connection) -> Result<Vec<TableInfo>> {
@@ -361,6 +439,20 @@ macro_rules! run {
                     columns = row.columns().iter().map(|c| c.name().to_owned()).collect();
                 }
                 rows.push((0..row.len()).map(|i| $decode(&row, i)).collect());
+            }
+            drop(stream);
+            if columns.is_empty() {
+                // No row to read names from, so ask the server what it would have returned.
+                let prepared = $conn
+                    .prepare(AssertSqlSafe($sql.to_owned()).into_sql_str())
+                    .await;
+                if let Ok(prepared) = prepared {
+                    columns = prepared
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_owned())
+                        .collect();
+                }
             }
             Ok(QueryResult {
                 columns,

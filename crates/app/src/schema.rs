@@ -13,6 +13,7 @@ use gpui_kit::*;
 use tuplebase_core::config::Connection;
 use tuplebase_core::db::{ColumnInfo, Db, TableInfo};
 
+use crate::completions::SchemaNames;
 use crate::runtime::io;
 
 const TABLE_ICON: &[u8] = include_bytes!("../../../assets/icons/table-2.svg");
@@ -123,6 +124,7 @@ pub enum SchemaEvent {
 
 pub struct SchemaPanel {
     db: Arc<Db>,
+    names: SchemaNames,
     connection: Option<Connection>,
     pub(crate) load: Load,
     pub(crate) tables: Vec<TableInfo>,
@@ -136,7 +138,12 @@ pub struct SchemaPanel {
 impl EventEmitter<SchemaEvent> for SchemaPanel {}
 
 impl SchemaPanel {
-    pub fn new(db: Arc<Db>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        db: Arc<Db>,
+        names: SchemaNames,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter tables"));
         let _filter_subscription = cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
@@ -145,6 +152,7 @@ impl SchemaPanel {
         });
         Self {
             db,
+            names,
             connection: None,
             load: Load::Idle,
             tables: Vec::new(),
@@ -160,6 +168,7 @@ impl SchemaPanel {
     pub fn set_connection(&mut self, connection: Option<Connection>, cx: &mut Context<Self>) {
         self.connection = connection;
         self.tables.clear();
+        self.names.borrow_mut().clear();
         self.collapsed.clear();
         self.load = Load::Idle;
         self.refresh(cx);
@@ -176,13 +185,25 @@ impl SchemaPanel {
         let db = self.db.clone();
         let name = conn.name.clone();
         cx.spawn(async move |this, cx| {
-            let result = io(async move { db.list_tables(&conn).await }).await;
+            let result = io(async move {
+                let tables = db.list_tables(&conn).await?;
+                // Autocomplete is a nicety: the table list still shows without it.
+                let columns = db.list_column_names(&conn).await.unwrap_or_default();
+                Ok((tables, columns))
+            })
+            .await;
             this.update(cx, |this, cx| {
                 if !this.is_showing(&name) {
                     return;
                 }
                 match result {
-                    Ok(tables) => {
+                    Ok((tables, columns)) => {
+                        let mut names: Vec<String> =
+                            tables.iter().map(|t| t.name.clone()).collect();
+                        names.extend(columns);
+                        names.sort();
+                        names.dedup();
+                        *this.names.borrow_mut() = names;
                         this.tables = tables;
                         this.load = Load::Ready;
                     }

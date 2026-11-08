@@ -1,6 +1,7 @@
 //! Table delegate that renders a [`QueryResult`].
 
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
+use gpui_kit::component::{ActiveTheme as _, h_flex};
 use gpui_kit::*;
 use serde_json::Value;
 use tuplebase_core::db::QueryResult;
@@ -92,6 +93,19 @@ impl TableDelegate for ResultsDelegate {
         _: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         self.rows[row_ix][col_ix].clone()
+    }
+
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        h_flex()
+            .size_full()
+            .justify_center()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("No rows.")
     }
 }
 

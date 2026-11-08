@@ -86,6 +86,79 @@ async fn select_decodes_common_types() {
 }
 
 #[tokio::test]
+async fn empty_results_still_report_their_columns() {
+    each_adapter(async |db, conn| {
+        let r = db
+            .execute(&conn, "SELECT id, name FROM users WHERE id < 0", READ)
+            .await
+            .unwrap();
+        assert!(r.rows.is_empty());
+        assert_eq!(r.columns, ["id", "name"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn scripts_run_in_order_and_show_the_last_rows() {
+    each_adapter(async |db, conn| {
+        let script = "SELECT 1 AS a; SELECT 2 AS b;";
+        let run = db.execute_script(&conn, script, READ).await.unwrap();
+        assert_eq!(run.statements, 2);
+        assert!(!run.changed);
+        assert_eq!(run.result.columns, ["b"]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_script_shares_one_connection_so_transactions_work() {
+    each_adapter(async |db, conn| {
+        let script = "START TRANSACTION; UPDATE users SET name = 'temp' WHERE id = 1; \
+                      SELECT name FROM users WHERE id = 1; ROLLBACK;";
+        let run = db.execute_script(&conn, script, WRITE).await.unwrap();
+        assert!(run.changed);
+        assert_eq!(run.result.rows[0][0], json!("temp"));
+        let after = db
+            .execute(&conn, "SELECT name FROM users WHERE id = 1", READ)
+            .await
+            .unwrap();
+        assert_eq!(after.rows[0][0], json!("Ada Lovelace"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_failing_script_says_which_statement_failed() {
+    each_adapter(async |db, conn| {
+        let err = db
+            .execute_script(&conn, "SELECT 1; SELECT nope FROM users", READ)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("statement 2 of 2"), "{err:#}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn read_only_checks_every_statement_of_a_script() {
+    each_adapter(async |db, conn| {
+        let script = "SELECT 1; DELETE FROM users";
+        assert!(db.execute_script(&conn, script, READ).await.is_err());
+        assert_eq!(user_count(&db, &conn).await, 3);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn column_names_are_listed_for_autocomplete() {
+    each_adapter(async |db, conn| {
+        let names = db.list_column_names(&conn).await.unwrap();
+        assert!(names.iter().any(|n| n == "email"), "{names:?}");
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn max_rows_truncates() {
     each_adapter(async |db, conn| {
         let opts = ExecOptions {

@@ -1,25 +1,29 @@
 //! Main window: connection sidebar, SQL editor, results table.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::config::{Adapter, Config, Connection, FolderNode, folder_name, rebase_folder};
 use tuplebase_core::db::{Db, ExecOptions};
+use tuplebase_core::state::SessionState;
 use tuplebase_core::{secrets, updates};
 
+use crate::completions::{SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
-use crate::theme::folder_color;
 
 actions!(tuplebase, [RunQuery]);
 
@@ -44,8 +48,10 @@ pub fn bind_keys(cx: &mut App) {
 const EDIT_ICON: &[u8] = include_bytes!("../../../assets/icons/square-pen.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
 const NEW_FOLDER_ICON: &[u8] = include_bytes!("../../../assets/icons/folder-plus.svg");
+const HISTORY_ICON: &[u8] = include_bytes!("../../../assets/icons/clock.svg");
 const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
 
+const HISTORY_MENU_SIZE: usize = 20;
 const SIDEBAR_WIDTH: f32 = 264.;
 /// Sidebar indent per folder level.
 const TREE_INDENT: f32 = 14.;
@@ -126,6 +132,11 @@ pub struct Workspace {
     editor: Entity<EditorState>,
     results: Entity<TableState<ResultsDelegate>>,
     status: Status,
+    session: SessionState,
+    /// SQL to show once the next frame has a window to apply it with.
+    pending_editor_text: Option<String>,
+    _editor_subscription: Subscription,
+    _session_save: Option<Task<()>>,
     schema: Entity<SchemaPanel>,
     _schema_subscription: Subscription,
     settings_open: bool,
@@ -149,7 +160,8 @@ impl Workspace {
             Theme::sync_system_appearance(Some(window), cx);
         })
         .detach();
-        let this = Self::with_config(config, status, window, cx);
+        let mut this = Self::with_config(config, status, window, cx);
+        this.session = SessionState::load();
         if this.config.check_for_updates {
             this.check_for_updates(cx);
         }
@@ -347,7 +359,23 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let db = Arc::new(Db::new());
-        let schema = cx.new(|cx| SchemaPanel::new(db.clone(), window, cx));
+        let names = SchemaNames::default();
+        let editor = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language("sql")
+                .line_number(true)
+                .default_value("SELECT 1;");
+            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
+                names: names.clone(),
+            }));
+            state
+        });
+        let _editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.remember_draft(cx);
+            }
+        });
+        let schema = cx.new(|cx| SchemaPanel::new(db.clone(), names, window, cx));
         let _schema_subscription = cx.subscribe_in(
             &schema,
             window,
@@ -355,6 +383,7 @@ impl Workspace {
                 SchemaEvent::Preview(sql) => {
                     this.editor
                         .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
+                    this.remember_draft(cx);
                     this.run_query(cx);
                 }
             },
@@ -366,12 +395,11 @@ impl Workspace {
             config,
             selected: None,
             form: None,
-            editor: cx.new(|cx| {
-                EditorState::new(window, cx)
-                    .language("sql")
-                    .line_number(true)
-                    .default_value("SELECT 1;")
-            }),
+            editor,
+            session: SessionState::default(),
+            pending_editor_text: None,
+            _editor_subscription,
+            _session_save: None,
             results: cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx)),
             status,
             settings_open: false,
@@ -391,6 +419,11 @@ impl Workspace {
     fn select(&mut self, name: String, cx: &mut Context<Self>) {
         self.form = None;
         self.settings_open = false;
+        if self.pending_editor_text.is_none() {
+            self.remember_draft(cx);
+        }
+        self.pending_editor_text =
+            Some(self.session.drafts.get(&name).cloned().unwrap_or_default());
         self.selected = Some(name);
         self.results.update(cx, |table, cx| {
             table.delegate_mut().clear();
@@ -491,6 +524,7 @@ impl Workspace {
                 Ok(Some(previous)) => Some(previous.clone()),
                 _ => None,
             };
+            let renamed_from = forget.clone().filter(|old| *old != name);
             if let Some(previous) = forget {
                 io(async move {
                     db.forget(&previous).await;
@@ -502,6 +536,10 @@ impl Workspace {
             this.update(cx, |this, cx| match result {
                 Ok(_) => {
                     this.config = config;
+                    if let Some(old) = &renamed_from {
+                        this.session.rename_connection(old, &name);
+                        this.selected = Some(name.clone());
+                    }
                     this.collapsed.remove(&folder);
                     this.select(name, cx);
                 }
@@ -539,6 +577,8 @@ impl Workspace {
         self.schema
             .update(cx, |schema, cx| schema.set_connection(None, cx));
         self.config.remove(&name);
+        self.session.remove_connection(&name);
+        self.schedule_session_save(cx);
         let config = self.config.clone();
         let db = self.db.clone();
         self.status = Status::Idle;
@@ -567,6 +607,7 @@ impl Workspace {
         .detach();
     }
 
+    /// Runs the selected text, or the whole editor when nothing is selected.
     fn run_query(&mut self, cx: &mut Context<Self>) {
         let Some(conn) = self.selected_connection() else {
             return;
@@ -574,7 +615,17 @@ impl Workspace {
         if self.form.is_some() || self.settings_open || matches!(self.status, Status::Busy(_)) {
             return;
         }
-        let sql = self.editor.read(cx).value().to_string();
+        let sql = {
+            let editor = self.editor.read(cx);
+            let selected = editor.selected_value();
+            if selected.trim().is_empty() {
+                editor.value().to_string()
+            } else {
+                selected.to_string()
+            }
+        };
+        self.session.record(&conn.name, &sql);
+        self.schedule_session_save(cx);
         self.status = Status::Busy("Running…".into());
         cx.notify();
         let db = self.db.clone();
@@ -583,19 +634,19 @@ impl Workspace {
             max_rows: MAX_ROWS,
         };
         cx.spawn(async move |this, cx| {
-            let result = io(async move { db.execute(&conn, &sql, opts).await }).await;
+            let result = io(async move { db.execute_script(&conn, &sql, opts).await }).await;
             this.update(cx, |this, cx| {
                 this.status = match &result {
-                    Ok(r) => Status::Done(summary(r).into()),
+                    Ok(run) => Status::Done(summary(&run.result, run.statements).into()),
                     Err(e) => Status::Failed(format!("{e:#}").into()),
                 };
-                // A statement that changed something may have changed the schema too.
-                if matches!(&result, Ok(r) if r.rows_affected.is_some()) {
-                    this.schema.update(cx, |schema, cx| schema.refresh(cx));
-                }
-                if let Ok(r) = &result {
+                if let Ok(run) = &result {
+                    // A statement that changed something may have changed the schema too.
+                    if run.changed {
+                        this.schema.update(cx, |schema, cx| schema.refresh(cx));
+                    }
                     this.results.update(cx, |table, cx| {
-                        table.delegate_mut().set(r);
+                        table.delegate_mut().set(&run.result);
                         table.refresh(cx);
                         cx.notify();
                     });
@@ -605,6 +656,35 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Keeps what's in the editor for the selected connection.
+    fn remember_draft(&mut self, cx: &mut Context<Self>) {
+        if let Some(name) = self.selected.clone() {
+            let sql = self.editor.read(cx).value().to_string();
+            self.session.set_draft(&name, &sql);
+            self.schedule_session_save(cx);
+        }
+    }
+
+    /// Saves shortly after the last change, so typing doesn't write on every keystroke.
+    fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
+        self._session_save = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(800))
+                .await;
+            let Ok(session) = this.read_with(cx, |this, _| this.session.clone()) else {
+                return;
+            };
+            blocking(move || session.save()).await.ok();
+        }));
+    }
+
+    fn show_history_query(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_value(sql, window, cx));
+        self.remember_draft(cx);
+        cx.notify();
     }
 
     fn toggle_folder(&mut self, folder: String, cx: &mut Context<Self>) {
@@ -734,6 +814,26 @@ impl Workspace {
                                 "Asks GitHub whether a newer version exists. \
                                  Sends no connection details or queries.",
                             )),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(div().font_medium().child("Query history"))
+                            .child(div().text_sm().text_color(muted).child(
+                                "Your queries and unsaved SQL are kept on this computer only.",
+                            ))
+                            .child(
+                                h_flex().child(
+                                    Button::new("clear-history")
+                                        .small()
+                                        .label("Clear query history")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.session.history.clear();
+                                            this.schedule_session_save(cx);
+                                            cx.notify();
+                                        })),
+                                ),
+                            ),
                     )
                     .child(
                         v_flex()
@@ -890,13 +990,6 @@ impl Workspace {
                 this.move_folder(&dragged.path, &into_folder, cx);
             }))
             .child(Icon::new(chevron).xsmall().text_color(muted))
-            .child(
-                div()
-                    .w(px(3.))
-                    .h(px(12.))
-                    .rounded_full()
-                    .bg(folder_color(folder)),
-            )
             .child(
                 div()
                     .flex_1()
@@ -1056,13 +1149,9 @@ impl Workspace {
                 .bg(bg)
                 .child(text)
         };
-        let environment = (!conn.folder.is_empty())
-            .then(|| (conn.folder.replace('/', " / "), folder_color(&conn.folder)));
+        let folder_label = (!conn.folder.is_empty()).then(|| conn.folder.replace('/', " / "));
         v_flex()
             .size_full()
-            .when_some(environment.clone(), |el, (_, color)| {
-                el.child(div().w_full().h(px(3.)).flex_none().bg(color))
-            })
             .child(
                 h_flex()
                     .h(px(WINDOW_TOP_STRIP + 8.))
@@ -1074,13 +1163,46 @@ impl Workspace {
                     .border_color(border)
                     .child(logos::icon(conn.adapter, 18., cx))
                     .child(div().font_semibold().child(conn.name.clone()))
-                    .when_some(environment, |el, (name, color)| {
-                        el.child(chip(name, color, color.opacity(0.14)))
+                    .when_some(folder_label, |el, name| {
+                        el.child(chip(name, muted, muted_bg))
                     })
                     .when(conn.readonly, |el| {
                         el.child(chip("Read-only".into(), muted, muted_bg))
                     })
                     .child(drag_area().flex_1().h_full())
+                    .child({
+                        let items: Vec<String> = self
+                            .session
+                            .history_for(&conn.name)
+                            .take(HISTORY_MENU_SIZE)
+                            .map(str::to_owned)
+                            .collect();
+                        let this = cx.entity().downgrade();
+                        Button::new("history")
+                            .ghost()
+                            .small()
+                            .icon(Icon::default().data(HISTORY_ICON))
+                            .tooltip("Query history")
+                            .dropdown_menu(move |mut menu, _, _| {
+                                if items.is_empty() {
+                                    menu = menu.label("No queries yet");
+                                }
+                                for sql in &items {
+                                    let (this, query) = (this.clone(), sql.clone());
+                                    menu =
+                                        menu.item(PopupMenuItem::new(history_label(sql)).on_click(
+                                            move |_, window, cx| {
+                                                let query = query.clone();
+                                                this.update(cx, |this, cx| {
+                                                    this.show_history_query(query, window, cx);
+                                                })
+                                                .ok();
+                                            },
+                                        ));
+                                }
+                                menu
+                            })
+                    })
                     .child(
                         Button::new("edit")
                             .ghost()
@@ -1203,7 +1325,11 @@ fn drag_area() -> Div {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(text) = self.pending_editor_text.take() {
+            self.editor
+                .update(cx, |editor, cx| editor.set_value(text, window, cx));
+        }
         let has_toolbar =
             self.form.is_none() && !self.settings_open && self.selected_connection().is_some();
         let main = if let Some(form) = self.form.clone() {
@@ -1258,12 +1384,26 @@ fn rows_text(count: usize) -> String {
     }
 }
 
-fn summary(r: &tuplebase_core::db::QueryResult) -> String {
+fn summary(r: &tuplebase_core::db::QueryResult, statements: usize) -> String {
     let ms = r.elapsed_ms;
-    match r.rows_affected {
+    let outcome = match r.rows_affected {
         Some(n) => format!("{} changed in {ms} ms", rows_text(n as usize)),
         None if r.truncated => format!("First {} in {ms} ms", rows_text(r.rows.len())),
         None => format!("{} in {ms} ms", rows_text(r.rows.len())),
+    };
+    if statements > 1 {
+        format!("{statements} statements. {outcome}")
+    } else {
+        outcome
+    }
+}
+
+/// One line of a query, short enough for a menu.
+fn history_label(sql: &str) -> String {
+    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(70) {
+        Some((end, _)) => format!("{}…", &flat[..end]),
+        None => flat,
     }
 }
 
@@ -1326,13 +1466,13 @@ mod tests {
             rows_affected: affected,
             elapsed_ms: 5,
         };
-        assert_eq!(super::summary(&result(1, None, false)), "1 row in 5 ms");
+        assert_eq!(super::summary(&result(1, None, false), 1), "1 row in 5 ms");
         assert_eq!(
-            super::summary(&result(2, None, true)),
+            super::summary(&result(2, None, true), 1),
             "First 2 rows in 5 ms"
         );
         assert_eq!(
-            super::summary(&result(0, Some(3), false)),
+            super::summary(&result(0, Some(3), false), 1),
             "3 rows changed in 5 ms"
         );
     }
@@ -1465,6 +1605,76 @@ mod tests {
             assert!(this.config.connections.is_empty());
             let form = this.form.as_ref().expect("form stays open").read(cx);
             assert!(form.error.is_some());
+        });
+    }
+
+    #[test]
+    fn summary_counts_statements_and_labels_stay_short() {
+        let result = QueryResult {
+            columns: Vec::new(),
+            rows: vec![Vec::new(); 2],
+            truncated: false,
+            rows_affected: None,
+            elapsed_ms: 5,
+        };
+        assert_eq!(super::summary(&result, 3), "3 statements. 2 rows in 5 ms");
+        assert_eq!(super::history_label("select\n  1"), "select 1");
+        assert_eq!(super::history_label(&"x".repeat(100)).chars().count(), 71);
+    }
+
+    #[gpui_kit::test]
+    fn running_records_history_and_switching_keeps_drafts(cx: &mut TestAppContext) {
+        let mut config = config_with_connection();
+        let mut other = config.connections[0].clone();
+        other.name = "other".into();
+        config.upsert(other, None).unwrap();
+        let (handle, workspace) = open(config, cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 42", cx);
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.status = Status::Idle;
+                this.run_query(cx);
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("conn-other", cx));
+        window_action(handle, cx, |_, cx| {
+            assert_eq!(workspace.read(cx).editor.read(cx).value().as_str(), "");
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |this, _| this.status = Status::Idle);
+        });
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.session.history_for("db").next(), Some("select 42"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn autocomplete_finishes_a_keyword(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.press("secondary-a", cx);
+            window.input("SELE", cx);
+        });
+        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        cx.update(|cx| {
+            assert_eq!(
+                workspace.read(cx).editor.read(cx).value().as_str(),
+                "SELECT"
+            );
         });
     }
 

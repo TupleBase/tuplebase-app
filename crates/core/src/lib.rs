@@ -5,6 +5,7 @@ pub mod db;
 pub mod safety;
 pub mod secrets;
 pub mod ssh;
+pub mod state;
 pub mod updates;
 
 /// Product name shown by every front end.

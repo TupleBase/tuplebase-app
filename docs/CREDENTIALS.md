@@ -17,6 +17,12 @@ Folders, and each connection's name, type, host, port, database, user and read-o
 
 Set `TUPLEBASE_CONFIG_DIR` to use a different directory.
 
+## Query history and unsaved SQL
+
+Your recent queries and the SQL left in the editor are kept next to `connections.json`, in
+`state.json`. It holds no passwords, but query text can contain any value you typed.
+Settings → Clear query history removes the history.
+
 ## Passwords
 
 Passwords are kept in the operating system's credential store, under service
