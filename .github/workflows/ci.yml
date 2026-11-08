@@ -57,11 +57,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace
 
-  # macOS minutes cost 10x on private repos, so this runs only on manual trigger.
-  # The Release workflow always builds macOS.
   macos:
     name: macOS (build, tests)
-    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7

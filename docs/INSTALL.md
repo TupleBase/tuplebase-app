@@ -3,7 +3,7 @@
 ## From a release
 
 Download the file for your platform from
-[the releases page](https://github.com/TupleBase/tuplebase-releases/releases/latest).
+[the releases page](https://github.com/TupleBase/tuplebase-app/releases/latest).
 
 | Platform              | File                                 |
 | --------------------- | ------------------------------------ |

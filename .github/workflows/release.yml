@@ -1,8 +1,7 @@
 name: Release
 
 # Started by hand: gh workflow run release.yml -f version=0.2.0
-# Bumps the version on main, tags it, builds every platform, publishes to the public
-# TupleBase/tuplebase-releases repo.
+# Bumps the version on main, tags it, builds every platform, publishes a GitHub Release.
 on:
   workflow_dispatch:
     inputs:
@@ -66,12 +65,7 @@ jobs:
           path: dist
           merge-multiple: true
       - run: (cd dist && sha256sum * > SHA256SUMS)
-      # Public downloads repo, also read by the in-app update check. Source stays private.
-      - run: >-
-          gh release create "v$VERSION" dist/*
-          --repo TupleBase/tuplebase-releases
-          --title "TupleBase $VERSION"
-          --notes "Downloads for TupleBase $VERSION. See the README for install notes."
+      - run: gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" --title "TupleBase $VERSION" --generate-notes
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}

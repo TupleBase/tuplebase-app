@@ -8,9 +8,8 @@ Pushes to `main` and pull requests only validate. Nothing is tagged or published
 | ------- | ---------------------------------------------------- | -------------- |
 | Linux   | fmt, clippy, tests against PostgreSQL and MariaDB    | every push     |
 | Windows | build, tests                                         | every push     |
-| macOS   | build, tests                                         | manual trigger |
+| macOS   | build, tests                                         | every push     |
 
-macOS minutes cost 10x on private repos, so it runs on demand with `gh workflow run ci`.
 Docs-only changes skip CI.
 
 ## Releasing
@@ -25,12 +24,9 @@ The workflow then:
 
 1. sets the workspace version, commits `Release v0.2.0` to `main` and tags `v0.2.0`;
 2. builds macOS (Apple Silicon), Windows (x64) and Linux (x64);
-3. publishes the installers and `SHA256SUMS` to the public
-   [tuplebase-releases](https://github.com/TupleBase/tuplebase-releases) repo. The source
-   stays private here. Installed apps read that repo to notice new versions.
+3. publishes a GitHub Release with the installers, `SHA256SUMS` and generated notes.
 
-Publishing needs the `RELEASES_TOKEN` Actions secret: a fine-grained token with
-Contents read/write on `TupleBase/tuplebase-releases` only.
+Installed apps read this repo's latest release to notice new versions.
 
 ## Known limits
 

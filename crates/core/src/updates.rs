@@ -1,6 +1,6 @@
 //! Checks GitHub for a newer release.
 //!
-//! One plain HTTPS request to the public releases repo. It carries no connection
+//! One plain HTTPS request to the GitHub releases API. It carries no connection
 //! details, queries or identifiers beyond the app version in the User-Agent.
 
 use std::time::Duration;
@@ -9,10 +9,10 @@ use anyhow::Result;
 use serde::Deserialize;
 
 /// Where users download a new version.
-pub const DOWNLOAD_URL: &str = "https://github.com/TupleBase/tuplebase-releases/releases/latest";
+pub const DOWNLOAD_URL: &str = "https://github.com/TupleBase/tuplebase-app/releases/latest";
 
 const LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/TupleBase/tuplebase-releases/releases/latest";
+    "https://api.github.com/repos/TupleBase/tuplebase-app/releases/latest";
 
 #[derive(Deserialize)]
 struct Release {

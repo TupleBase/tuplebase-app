@@ -14,6 +14,9 @@ Claude Code:
 claude mcp add tuplebase -- ~/.local/bin/tuplebase-mcp
 ```
 
+If you installed from the `.dmg`, the path is
+`/Applications/TupleBase.app/Contents/MacOS/tuplebase-mcp`.
+
 Other clients, using an absolute path:
 
 ```json
