@@ -1,8 +1,13 @@
 # TupleBase desktop
 
-Native database client for macOS, Windows and Linux, written in Rust.
+Native database client for macOS, Windows and Linux, written in Rust. Connects to
+PostgreSQL, MariaDB and MySQL, and lets AI agents query them through a local MCP server.
 
 ## Docs
 
-- [Architecture and rules](ARCHITECTURE.md)
+- [Install](docs/INSTALL.md)
+- [MCP server for agents](docs/MCP.md)
+- [Where config and credentials are stored](docs/CREDENTIALS.md)
 - [Local development](docs/DEVELOPMENT.md)
+- [CI and releases](docs/RELEASING.md)
+- [Architecture and rules](ARCHITECTURE.md)

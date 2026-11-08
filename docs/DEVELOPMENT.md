@@ -2,19 +2,35 @@
 
 ## Prerequisites
 
-- [rustup](https://rustup.rs). The toolchain version in `rust-toolchain.toml` is
-  installed automatically on first build.
+- [rustup](https://rustup.rs). The toolchain in `rust-toolchain.toml` installs on first build.
 - macOS: Xcode Command Line Tools (`xcode-select --install`).
 - Windows: Visual Studio Build Tools with the C++ workload.
-- Linux: GPUI system libraries. On Debian/Ubuntu these are likely
-  `libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev libvulkan1`
-  (taken from Zed's Linux build deps, not yet verified here).
+- Linux: the libraries listed in `scripts/ci-linux-deps.sh`.
+- Docker, for the local databases.
 
 ## Commands
 
 ```sh
 cargo run -p tuplebase-app                              # run the app
+cargo run -p tuplebase-mcp                              # run the MCP server (stdio)
 cargo test --workspace                                  # tests
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all                                         # format
+scripts/install.sh                                      # release build + install
 ```
+
+## Tests against real databases
+
+```sh
+docker compose up -d --wait
+TUPLEBASE_IT=1 cargo test --workspace
+```
+
+Local databases, user `dev`, password `dev`, database `app`:
+
+| Engine     | Port  |
+| ---------- | ----- |
+| PostgreSQL | 55432 |
+| MariaDB    | 53306 |
+
+`TUPLEBASE_IT_KEYCHAIN=1` also runs a round trip against the real OS credential store.
