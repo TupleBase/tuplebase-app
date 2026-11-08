@@ -1,7 +1,9 @@
 //! Main window: connection sidebar, SQL editor, results table.
 
 use std::future::Future;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
+#[cfg(not(test))]
+use std::sync::LazyLock;
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
@@ -38,9 +40,11 @@ const MAX_ROWS: usize = 1000;
 
 /// sqlx needs Tokio; GPUI has its own executor. All database and keychain I/O runs
 /// here, and GPUI tasks await the results.
+#[cfg(not(test))]
 static RUNTIME: LazyLock<tokio::runtime::Runtime> =
     LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to start the Tokio runtime"));
 
+#[cfg(not(test))]
 fn io<T: Send + 'static>(
     fut: impl Future<Output = anyhow::Result<T>> + Send + 'static,
 ) -> impl Future<Output = anyhow::Result<T>> {
@@ -48,11 +52,26 @@ fn io<T: Send + 'static>(
     async move { handle.await? }
 }
 
+#[cfg(not(test))]
 fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
 ) -> impl Future<Output = anyhow::Result<T>> {
     let handle = RUNTIME.spawn_blocking(f);
     async move { handle.await? }
+}
+
+// UI tests stop at the "busy" state and never run I/O: GPUI's test scheduler panics
+// when a Tokio thread wakes one of its tasks.
+#[cfg(test)]
+fn io<T>(fut: impl Future<Output = anyhow::Result<T>>) -> impl Future<Output = anyhow::Result<T>> {
+    drop(fut);
+    std::future::pending()
+}
+
+#[cfg(test)]
+fn blocking<T>(f: impl FnOnce() -> anyhow::Result<T>) -> impl Future<Output = anyhow::Result<T>> {
+    drop(f);
+    std::future::pending()
 }
 
 enum Status {
