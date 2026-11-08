@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- TupleBase desktop app icon. macOS grid: 824x824 body at 100,100, ~22.5% corner radius.
+       Brand: Ink background #1E1E1E, Light mark #E4E4E4 (tuplebase-project/assets/brand). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262626"/>
+      <stop offset="1" stop-color="#1A1A1A"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#bg)"/>
+  <!-- Hybrid mark (24x24 viewBox, glyph bbox 4..20) scaled 23x around the center. -->
+  <g transform="translate(512 512) scale(23) translate(-12 -12)" fill="#E4E4E4" stroke="#E4E4E4">
+    <circle cx="6.2" cy="6.2" r="2.2" stroke="none"/>
+    <circle cx="12" cy="6.2" r="2.2" stroke="none"/>
+    <circle cx="17.8" cy="6.2" r="2.2" stroke="none"/>
+    <rect x="4.75" y="10.55" width="14.5" height="2.9" rx="1.45" fill="none" stroke-width="1.5"/>
+    <rect x="4.75" y="16.35" width="14.5" height="2.9" rx="1.45" fill="none" stroke-width="1.5"/>
+  </g>
+</svg>
