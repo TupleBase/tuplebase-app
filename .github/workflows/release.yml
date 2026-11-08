@@ -45,6 +45,8 @@ jobs:
         run: scripts/ci-linux-deps.sh
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: cargo build --release -p tuplebase-app -p tuplebase-mcp
       - run: scripts/package.sh "${{ matrix.platform }}"
         shell: bash
