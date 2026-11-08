@@ -1,10 +1,7 @@
 //! Main window: connection sidebar, SQL editor, results table.
 
 use std::collections::HashSet;
-use std::future::Future;
 use std::sync::Arc;
-#[cfg(not(test))]
-use std::sync::LazyLock;
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
@@ -20,6 +17,8 @@ use tuplebase_core::{secrets, updates};
 use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::logos;
 use crate::results::ResultsDelegate;
+use crate::runtime::{blocking, io};
+use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme::folder_color;
 
 actions!(tuplebase, [RunQuery]);
@@ -53,42 +52,6 @@ const WINDOW_TOP_STRIP: f32 = 40.;
 
 /// Rows shown per query in the app; agents get their own cap in the MCP server.
 const MAX_ROWS: usize = 1000;
-
-/// sqlx needs Tokio; GPUI has its own executor. All database and keychain I/O runs
-/// here, and GPUI tasks await the results.
-#[cfg(not(test))]
-static RUNTIME: LazyLock<tokio::runtime::Runtime> =
-    LazyLock::new(|| tokio::runtime::Runtime::new().expect("failed to start the Tokio runtime"));
-
-#[cfg(not(test))]
-fn io<T: Send + 'static>(
-    fut: impl Future<Output = anyhow::Result<T>> + Send + 'static,
-) -> impl Future<Output = anyhow::Result<T>> {
-    let handle = RUNTIME.spawn(fut);
-    async move { handle.await? }
-}
-
-#[cfg(not(test))]
-fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-) -> impl Future<Output = anyhow::Result<T>> {
-    let handle = RUNTIME.spawn_blocking(f);
-    async move { handle.await? }
-}
-
-// UI tests stop at the "busy" state and never run I/O: GPUI's test scheduler panics
-// when a Tokio thread wakes one of its tasks.
-#[cfg(test)]
-fn io<T>(fut: impl Future<Output = anyhow::Result<T>>) -> impl Future<Output = anyhow::Result<T>> {
-    drop(fut);
-    std::future::pending()
-}
-
-#[cfg(test)]
-fn blocking<T>(f: impl FnOnce() -> anyhow::Result<T>) -> impl Future<Output = anyhow::Result<T>> {
-    drop(f);
-    std::future::pending()
-}
 
 enum Status {
     Idle,
@@ -137,6 +100,8 @@ pub struct Workspace {
     editor: Entity<EditorState>,
     results: Entity<TableState<ResultsDelegate>>,
     status: Status,
+    schema: Entity<SchemaPanel>,
+    _schema_subscription: Subscription,
     settings_open: bool,
     folder_edit: Option<FolderEdit>,
     _folder_edit_subscription: Option<Subscription>,
@@ -310,8 +275,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let db = Arc::new(Db::new());
+        let schema = cx.new(|cx| SchemaPanel::new(db.clone(), window, cx));
+        let _schema_subscription = cx.subscribe_in(
+            &schema,
+            window,
+            |this, _, event: &SchemaEvent, window, cx| match event {
+                SchemaEvent::Preview(sql) => {
+                    this.editor
+                        .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
+                    this.run_query(cx);
+                }
+            },
+        );
         Self {
-            db: Arc::new(Db::new()),
+            db,
+            schema,
+            _schema_subscription,
             config,
             selected: None,
             form: None,
@@ -348,6 +328,9 @@ impl Workspace {
         let Some(conn) = self.selected_connection() else {
             return;
         };
+        let shown = conn.clone();
+        self.schema
+            .update(cx, |schema, cx| schema.set_connection(Some(shown), cx));
         self.status = Status::Busy(format!("Connecting to {}…", conn.name).into());
         cx.notify();
         let db = self.db.clone();
@@ -483,6 +466,8 @@ impl Workspace {
         let Some(name) = self.selected.take() else {
             return;
         };
+        self.schema
+            .update(cx, |schema, cx| schema.set_connection(None, cx));
         self.config.remove(&name);
         let config = self.config.clone();
         let db = self.db.clone();
@@ -534,6 +519,10 @@ impl Workspace {
                     Ok(r) => Status::Done(summary(r).into()),
                     Err(e) => Status::Failed(format!("{e:#}").into()),
                 };
+                // A statement that changed something may have changed the schema too.
+                if matches!(&result, Ok(r) if r.rows_affected.is_some()) {
+                    this.schema.update(cx, |schema, cx| schema.refresh(cx));
+                }
                 if let Ok(r) = &result {
                     this.results.update(cx, |table, cx| {
                         table.delegate_mut().set(r);
@@ -998,31 +987,43 @@ impl Workspace {
                     ),
             )
             .child(
-                div()
-                    .id("sql-editor")
-                    .test_support()
-                    .h(px(220.))
-                    .flex_none()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(Editor::new(&self.editor).appearance(false).h_full()),
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.schema.clone())
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(
+                                div()
+                                    .id("sql-editor")
+                                    .test_support()
+                                    .h(px(220.))
+                                    .flex_none()
+                                    .border_b_1()
+                                    .border_color(border)
+                                    .child(Editor::new(&self.editor).appearance(false).h_full()),
+                            )
+                            .child(
+                                div().flex_1().min_h_0().child(match placeholder {
+                                    Some(text) => h_flex()
+                                        .size_full()
+                                        .justify_center()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(text)
+                                        .into_any_element(),
+                                    None => DataTable::new(&self.results)
+                                        .small()
+                                        .bordered(false)
+                                        .into_any_element(),
+                                }),
+                            )
+                            .child(self.render_status(cx)),
+                    ),
             )
-            .child(
-                div().flex_1().min_h_0().child(match placeholder {
-                    Some(text) => h_flex()
-                        .size_full()
-                        .justify_center()
-                        .text_sm()
-                        .text_color(muted)
-                        .child(text)
-                        .into_any_element(),
-                    None => DataTable::new(&self.results)
-                        .small()
-                        .bordered(false)
-                        .into_any_element(),
-                }),
-            )
-            .child(self.render_status(cx))
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1409,6 +1410,41 @@ mod tests {
             window.drag_to("conn-db", "folder-Local", cx);
         });
         cx.update(|cx| assert_eq!(workspace.read(cx).config.connections[0].folder, "Local"));
+    }
+
+    #[gpui_kit::test]
+    fn previewing_a_table_runs_its_query(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let conn = this.config.connections[0].clone();
+                this.selected = Some(conn.name.clone());
+                this.schema.update(cx, |schema, cx| {
+                    schema.set_connection(Some(conn), cx);
+                    schema.tables = vec![tuplebase_core::db::TableInfo {
+                        schema: "public".into(),
+                        name: "users".into(),
+                        kind: "BASE TABLE".into(),
+                    }];
+                    schema.load = crate::schema::Load::Ready;
+                    cx.notify();
+                });
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            window.hover("table-public-users", cx);
+            window.click("preview-table-public-users", cx);
+        });
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert!(this.schema.read(cx).expanded.is_empty());
+            assert_eq!(
+                this.editor.read(cx).value().as_str(),
+                r#"SELECT * FROM "public"."users" LIMIT 100"#
+            );
+            assert!(matches!(this.status, Status::Busy(_)));
+        });
     }
 
     #[gpui_kit::test]

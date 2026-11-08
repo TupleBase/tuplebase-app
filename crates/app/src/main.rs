@@ -4,6 +4,8 @@
 mod conn_form;
 mod logos;
 mod results;
+mod runtime;
+mod schema;
 mod theme;
 mod workspace;
 

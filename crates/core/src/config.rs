@@ -34,6 +34,23 @@ impl Adapter {
         }
     }
 
+    /// Quotes an identifier for this database.
+    pub fn quote_ident(self, ident: &str) -> String {
+        match self {
+            Adapter::Postgres => format!("\"{}\"", ident.replace('"', "\"\"")),
+            Adapter::Mariadb | Adapter::Mysql => format!("`{}`", ident.replace('`', "``")),
+        }
+    }
+
+    /// SQL showing the first rows of a table.
+    pub fn preview_sql(self, schema: &str, table: &str) -> String {
+        format!(
+            "SELECT * FROM {}.{} LIMIT 100",
+            self.quote_ident(schema),
+            self.quote_ident(table)
+        )
+    }
+
     pub fn default_port(self) -> u16 {
         match self {
             Adapter::Postgres => 5432,
@@ -295,6 +312,16 @@ mod tests {
             user: "dev".into(),
             readonly: false,
         }
+    }
+
+    #[test]
+    fn identifiers_are_quoted_for_each_database() {
+        assert_eq!(Adapter::Postgres.quote_ident(r#"a"b"#), r#""a""b""#);
+        assert_eq!(Adapter::Mariadb.quote_ident("a`b"), "`a``b`");
+        assert_eq!(
+            Adapter::Mysql.preview_sql("app", "users"),
+            "SELECT * FROM `app`.`users` LIMIT 100"
+        );
     }
 
     #[test]
