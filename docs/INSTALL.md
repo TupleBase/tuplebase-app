@@ -83,6 +83,7 @@ rm -rf ~/Applications/TupleBase.app ~/.local/bin/tuplebase-mcp
 rm -f ~/.local/bin/tuplebase-app ~/.local/bin/tuplebase-mcp \
   ~/.local/share/applications/tuplebase.desktop \
   ~/.local/share/icons/hicolor/256x256/apps/tuplebase.png
+rm -rf ~/.local/share/doc/tuplebase
 ```
 
 ```powershell

@@ -14,4 +14,5 @@ PostgreSQL, MariaDB and MySQL, and lets AI agents query them through a local MCP
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Bundled dependencies are listed in
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt).

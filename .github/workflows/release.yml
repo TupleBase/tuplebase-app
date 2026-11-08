@@ -23,6 +23,9 @@ jobs:
           ref: main
           fetch-depth: 0
       - run: rustup toolchain install
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.3
       - run: scripts/release-tag.sh "$VERSION"
         env:
           VERSION: ${{ inputs.version }}

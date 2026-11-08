@@ -55,6 +55,11 @@ install_linux() {
   install -Dm755 "$2/tuplebase-app" "$BIN_DIR/tuplebase-app"
   install -Dm755 "$2/tuplebase-mcp" "$BIN_DIR/tuplebase-mcp"
   install -Dm644 "$2/tuplebase.png" "$share/icons/hicolor/256x256/apps/tuplebase.png"
+  for doc in LICENSE THIRD-PARTY-NOTICES.txt; do
+    if [ -f "$2/$doc" ]; then
+      install -Dm644 "$2/$doc" "$share/doc/tuplebase/$doc"
+    fi
+  done
   mkdir -p "$share/applications"
   cat >"$share/applications/tuplebase.desktop" <<DESKTOP
 [Desktop Entry]

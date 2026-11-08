@@ -19,9 +19,13 @@ sed -i.bak "/^\[workspace.package\]/,/^\[/s/^version *= *\".*\"/version = \"$VER
 rm Cargo.toml.bak
 cargo update --workspace
 
+# Fails if a new dependency uses a license that about.toml does not accept.
+cargo fetch --locked
+cargo about generate about.hbs -o THIRD-PARTY-NOTICES.txt
+
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock THIRD-PARTY-NOTICES.txt
 # Nothing to commit when releasing the version already in Cargo.toml.
 git diff --cached --quiet || git commit -m "Release $TAG"
 git tag "$TAG"

@@ -22,10 +22,12 @@ case "$PLATFORM" in
   linux-*)
     cp "$ROOT"/target/release/tuplebase-{app,mcp} "$STAGE/"
     cp "$ROOT/assets/icon/icon-256.png" "$STAGE/tuplebase.png"
+    cp "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.txt" "$STAGE/"
     tar -C "$(dirname "$STAGE")" -czf "$DIST/$NAME.tar.gz" "$NAME"
     ;;
   windows-*)
     cp "$ROOT"/target/release/tuplebase-{app,mcp}.exe "$STAGE/"
+    cp "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.txt" "$STAGE/"
     (cd "$STAGE" && 7z a -tzip "$DIST/$NAME.zip" . >/dev/null)
     ;;
   *)

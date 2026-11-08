@@ -11,7 +11,7 @@ VERSION="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' "
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 for bin in $BINS; do cp "$ROOT/target/release/$bin" "$APP/Contents/MacOS/"; done
-cp "$ROOT/assets/icon/TupleBase.icns" "$APP/Contents/Resources/"
+cp "$ROOT/assets/icon/TupleBase.icns" "$ROOT/LICENSE" "$ROOT/THIRD-PARTY-NOTICES.txt" "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
