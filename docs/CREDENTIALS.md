@@ -32,7 +32,7 @@ Passwords are kept in the operating system's credential store, under service
 | ------- | ----------------------------------------------------------- |
 | macOS   | Keychain (open Keychain Access, search `app.tuplebase.desktop`) |
 | Windows | Credential Manager                                          |
-| Linux   | Secret Service (GNOME Keyring, KWallet); one must be running |
+| Linux   | Secret Service (GNOME Keyring, KWallet); one must be running to save a password |
 
 SSH tunnel passwords and private key passphrases are stored the same way, with the
 account `<connection>#ssh`. Private key files stay where they are; only their path is

@@ -38,6 +38,15 @@ fn entry(account: &str) -> Result<Entry> {
     Entry::new(SERVICE, account).context("opening the OS credential store")
 }
 
+/// `None` when this machine has no credential store, so nothing can be saved in one.
+fn existing_entry(account: &str) -> Result<Option<Entry>> {
+    match Entry::new(SERVICE, account) {
+        Ok(entry) => Ok(Some(entry)),
+        Err(Error::NoDefaultStore) => Ok(None),
+        Err(e) => Err(e).context("opening the OS credential store"),
+    }
+}
+
 fn store(account: &str, secret: &str) -> Result<()> {
     entry(account)?
         .set_password(secret)
@@ -48,7 +57,10 @@ fn read(account: &str, env_var: &str) -> Result<Option<String>> {
     if let Ok(value) = std::env::var(env_var) {
         return Ok(Some(value));
     }
-    match entry(account)?.get_password() {
+    let Some(entry) = existing_entry(account)? else {
+        return Ok(None);
+    };
+    match entry.get_password() {
         Ok(secret) => Ok(Some(secret)),
         Err(Error::NoEntry) => Ok(None),
         Err(e) => Err(e).context("reading from the OS credential store"),
@@ -56,7 +68,10 @@ fn read(account: &str, env_var: &str) -> Result<Option<String>> {
 }
 
 fn delete(account: &str) -> Result<()> {
-    match entry(account)?.delete_credential() {
+    let Some(entry) = existing_entry(account)? else {
+        return Ok(());
+    };
+    match entry.delete_credential() {
         Ok(()) | Err(Error::NoEntry) => Ok(()),
         Err(e) => Err(e).context("deleting from the OS credential store"),
     }
