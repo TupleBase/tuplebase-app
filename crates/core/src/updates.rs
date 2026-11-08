@@ -255,13 +255,7 @@ fn upgrade_command(
 ) -> Command {
     let mut command = if cfg!(windows) {
         let mut c = Command::new("powershell");
-        c.args([
-            "-NoProfile",
-            "-WindowStyle",
-            "Hidden",
-            "-Command",
-            WINDOWS_UPGRADE,
-        ]);
+        c.args(["-NoProfile", "-Command", WINDOWS_UPGRADE]);
         c
     } else {
         let mut c = Command::new("sh");
@@ -285,9 +279,10 @@ fn upgrade_command(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        // A hidden console: without any console PowerShell exits without running the script.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     command
 }
