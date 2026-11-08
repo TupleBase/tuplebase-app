@@ -1,0 +1,73 @@
+name: GUI smoke
+
+# Opens the real app window on Linux and Windows, checks it stays open, and saves a
+# screenshot as a build artifact. Run by hand: gh workflow run gui-smoke.yml
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  TUPLEBASE_CONFIG_DIR: dev/smoke
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: scripts/ci-linux-deps.sh
+      # A virtual display, software Vulkan, and a screenshot tool.
+      - run: sudo apt-get install -yq xvfb mesa-vulkan-drivers imagemagick
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - run: cargo build -p tuplebase-app
+      - name: Open the window
+        run: |
+          mkdir smoke
+          xvfb-run -a -s "-screen 0 1280x800x24" bash -c '
+            target/debug/tuplebase-app > smoke/linux.log 2>&1 &
+            pid=$!
+            sleep 25
+            import -window root smoke/linux.png
+            kill -0 "$pid" || { echo "the app exited early"; cat smoke/linux.log; exit 1; }
+            kill "$pid"
+          '
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gui-smoke-linux
+          path: smoke
+
+  windows:
+    runs-on: windows-2025
+    env:
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - run: cargo build -p tuplebase-app
+      - name: Open the window
+        run: |
+          New-Item -ItemType Directory smoke | Out-Null
+          $app = Start-Process target\debug\tuplebase-app.exe -PassThru `
+            -RedirectStandardOutput smoke\out.log -RedirectStandardError smoke\err.log
+          Start-Sleep 25
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $screen = [Windows.Forms.SystemInformation]::VirtualScreen
+          $image = New-Object Drawing.Bitmap $screen.Width, $screen.Height
+          [Drawing.Graphics]::FromImage($image).CopyFromScreen($screen.Location, [Drawing.Point]::Empty, $screen.Size)
+          $image.Save("smoke\windows.png")
+          if ($app.HasExited) { Get-Content smoke\err.log; throw "the app exited early: $($app.ExitCode)" }
+          Stop-Process $app
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: gui-smoke-windows
+          path: smoke

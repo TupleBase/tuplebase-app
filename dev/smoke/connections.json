@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "folders": ["Smoke test"],
+  "connections": [
+    {
+      "name": "local-file",
+      "folder": "Smoke test",
+      "adapter": "sqlite",
+      "host": "",
+      "port": 0,
+      "database": "smoke.sqlite",
+      "user": "",
+      "readonly": false
+    }
+  ],
+  "check_for_updates": false
+}

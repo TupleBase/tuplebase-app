@@ -40,3 +40,8 @@ After publishing, the workflow installs the new release with `install.sh` and
 - **Not code-signed:** browser downloads warn on first launch. The command-line install
   avoids that, see [Install](INSTALL.md).
 - **Apple Silicon only** on macOS; there is no Intel build.
+
+## Checking the window on Linux and Windows
+
+`gh workflow run gui-smoke.yml` opens the real app on both and saves a screenshot as a
+build artifact. It isn't part of CI: run it after UI or dependency changes.
