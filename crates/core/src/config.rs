@@ -77,6 +77,13 @@ pub struct Config {
     pub version: u32,
     #[serde(default)]
     pub connections: Vec<Connection>,
+    /// Ask GitHub for a newer version at startup.
+    #[serde(default = "enabled")]
+    pub check_for_updates: bool,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -84,6 +91,7 @@ impl Default for Config {
         Self {
             version: 1,
             connections: Vec::new(),
+            check_for_updates: true,
         }
     }
 }
@@ -225,6 +233,12 @@ mod tests {
         conn.name = "x".into();
         conn.host = " ".into();
         assert!(config.upsert(conn, None).is_err());
+    }
+
+    #[test]
+    fn update_check_defaults_to_on_for_existing_files() {
+        let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
+        assert!(config.check_for_updates);
     }
 
     #[test]

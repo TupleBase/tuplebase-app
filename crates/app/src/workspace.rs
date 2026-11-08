@@ -4,6 +4,7 @@ use std::future::Future;
 use std::sync::{Arc, LazyLock};
 
 use gpui_kit::component::button::*;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
@@ -11,7 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::config::{Config, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
-use tuplebase_core::secrets;
+use tuplebase_core::{secrets, updates};
 
 use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::results::ResultsDelegate;
@@ -69,6 +70,8 @@ pub struct Workspace {
     editor: Entity<EditorState>,
     results: Entity<TableState<ResultsDelegate>>,
     status: Status,
+    /// Newer version found by the update check.
+    available_update: Option<String>,
     _form_subscription: Option<Subscription>,
 }
 
@@ -79,7 +82,47 @@ impl Workspace {
             Ok(config) => (config, Status::Idle),
             Err(e) => (Config::default(), Status::Failed(format!("{e:#}").into())),
         };
-        Self::with_config(config, status, window, cx)
+        let this = Self::with_config(config, status, window, cx);
+        if this.config.check_for_updates {
+            this.check_for_updates(cx);
+        }
+        this
+    }
+
+    fn check_for_updates(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            // Failures stay silent: being offline is not worth an error.
+            let latest = blocking(|| updates::check(env!("CARGO_PKG_VERSION")))
+                .await
+                .ok()
+                .flatten();
+            this.update(cx, |this, cx| {
+                this.available_update = latest;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn set_check_for_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.config.check_for_updates = enabled;
+        self.available_update = None;
+        if enabled {
+            self.check_for_updates(cx);
+        }
+        cx.notify();
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = blocking(move || config.save()).await {
+                this.update(cx, |this, cx| {
+                    this.status = Status::Failed(format!("{e:#}").into());
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn with_config(
@@ -101,6 +144,7 @@ impl Workspace {
             }),
             results: cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx)),
             status,
+            available_update: None,
             _form_subscription: None,
         }
     }
@@ -349,6 +393,8 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("connections")
+                    .flex_1()
+                    .min_h_0()
                     .px_2()
                     .gap_1()
                     .overflow_y_scroll()
@@ -375,6 +421,38 @@ impl Workspace {
                                 cx.listener(move |this, _, _, cx| this.select(name.clone(), cx)),
                             )
                     })),
+            )
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(border)
+                    .when_some(self.available_update.clone(), |el, version| {
+                        el.child(
+                            Button::new("download-update")
+                                .primary()
+                                .small()
+                                .label(format!("Update to {version}"))
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.open_url(updates::DOWNLOAD_URL);
+                                })),
+                        )
+                    })
+                    .child(
+                        Checkbox::new("check-updates")
+                            .label("Check for updates")
+                            .checked(self.config.check_for_updates)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.set_check_for_updates(*checked, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(concat!("TupleBase ", env!("CARGO_PKG_VERSION"))),
+                    ),
             )
     }
 
@@ -594,6 +672,28 @@ mod tests {
             assert_eq!(this.selected.as_deref(), Some("db"));
             assert!(matches!(this.status, Status::Busy(_)));
         });
+    }
+
+    #[gpui_kit::test]
+    fn update_button_appears_only_when_a_version_is_available(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("download-update").is_none());
+            assert!(window.find("check-updates").visible());
+        })
+        .unwrap();
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.available_update = Some("9.9.9".into());
+                cx.notify();
+            });
+        });
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("download-update").visible());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
