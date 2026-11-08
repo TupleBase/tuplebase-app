@@ -4,7 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.sh | sh
 #
 # Set TUPLEBASE_VERSION=x.y.z to install a specific version. The app also sets
-# TUPLEBASE_APP_PATH or TUPLEBASE_BIN_DIR to update itself where it is installed.
+# TUPLEBASE_APP_PATH or TUPLEBASE_BIN_DIR to update itself where it is installed, and
+# TUPLEBASE_DOWNLOAD_DIR when it has already downloaded the release files.
 set -eu
 
 REPO_URL="https://github.com/TupleBase/tuplebase-app"
@@ -100,9 +101,14 @@ main() {
   trap 'exit 1' INT TERM
   cd "$tmp"
 
-  echo "Downloading TupleBase $version..."
-  curl -fsSLO "$base/$file" || fail "could not download $file"
-  curl -fsSLO "$base/SHA256SUMS" || fail "could not download SHA256SUMS"
+  if [ -n "${TUPLEBASE_DOWNLOAD_DIR:-}" ]; then
+    cp "$TUPLEBASE_DOWNLOAD_DIR/$file" "$TUPLEBASE_DOWNLOAD_DIR/SHA256SUMS" . ||
+      fail "could not find $file in $TUPLEBASE_DOWNLOAD_DIR"
+  else
+    echo "Downloading TupleBase $version..."
+    curl -fsSLO "$base/$file" || fail "could not download $file"
+    curl -fsSLO "$base/SHA256SUMS" || fail "could not download SHA256SUMS"
+  fi
   verify "$file"
 
   case "$platform" in

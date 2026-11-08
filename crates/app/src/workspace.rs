@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use gpui_kit::component::button::*;
@@ -150,6 +151,23 @@ impl Render for DraggedConnection {
     }
 }
 
+/// How far along a newer version is.
+enum UpdateState {
+    Available {
+        version: String,
+        /// Why the last attempt failed.
+        error: Option<SharedString>,
+    },
+    Downloading {
+        version: String,
+        percent: Arc<AtomicU8>,
+    },
+    Ready {
+        download: updates::Download,
+        installation: updates::Installation,
+    },
+}
+
 pub struct Workspace {
     db: Arc<Db>,
     config: Config,
@@ -175,8 +193,8 @@ pub struct Workspace {
     _folder_edit_subscription: Option<Subscription>,
     /// Folders closed in the sidebar.
     collapsed: HashSet<String>,
-    /// Newer version found by the update check.
-    available_update: Option<String>,
+    /// A newer version found by the update check, and how far along it is.
+    update_state: Option<UpdateState>,
     _form_subscription: Option<Subscription>,
 }
 
@@ -207,7 +225,10 @@ impl Workspace {
                 .ok()
                 .flatten();
             this.update(cx, |this, cx| {
-                this.available_update = latest;
+                this.update_state = latest.map(|version| UpdateState::Available {
+                    version,
+                    error: None,
+                });
                 cx.notify();
             })
             .ok();
@@ -217,7 +238,7 @@ impl Workspace {
 
     fn set_check_for_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.config.check_for_updates = enabled;
-        self.available_update = None;
+        self.update_state = None;
         if enabled {
             self.check_for_updates(cx);
         }
@@ -441,7 +462,7 @@ impl Workspace {
             folder_edit: None,
             _folder_edit_subscription: None,
             collapsed: HashSet::new(),
-            available_update: None,
+            update_state: None,
             _form_subscription: None,
         }
     }
@@ -809,27 +830,165 @@ impl Workspace {
         }
     }
 
-    /// Replaces this app with a new version, or sends development builds to the download
-    /// page so a release doesn't overwrite them.
-    fn install_update(&mut self, version: &str, cx: &mut Context<Self>) {
+    /// Downloads an update while the app stays open. Development builds go to the
+    /// download page instead, so a release can't overwrite them.
+    fn download_update(&mut self, version: String, cx: &mut Context<Self>) {
         let installation = std::env::current_exe()
             .ok()
             .and_then(|exe| updates::detect_installation(&exe));
-        let Some(installation) = installation else {
-            cx.open_url(updates::DOWNLOAD_URL);
+        match installation {
+            Some(installation) => self.start_download(version, installation, cx),
+            None => cx.open_url(updates::DOWNLOAD_URL),
+        }
+    }
+
+    fn start_download(
+        &mut self,
+        version: String,
+        installation: updates::Installation,
+        cx: &mut Context<Self>,
+    ) {
+        let percent = Arc::new(AtomicU8::new(0));
+        self.update_state = Some(UpdateState::Downloading {
+            version: version.clone(),
+            percent: percent.clone(),
+        });
+        cx.notify();
+
+        // Redraws as the percentage moves, until the download ends.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let downloading = this.update(cx, |this, cx| {
+                    cx.notify();
+                    matches!(this.update_state, Some(UpdateState::Downloading { .. }))
+                });
+                if !matches!(downloading, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let wanted = version.clone();
+            let result = blocking(move || {
+                updates::download(&wanted, |p| percent.store(p, Ordering::Relaxed))
+            })
+            .await;
+            this.update(cx, |this, cx| {
+                // Unticking "Check for updates" abandons the download.
+                if !matches!(this.update_state, Some(UpdateState::Downloading { .. })) {
+                    return;
+                }
+                this.update_state = Some(match result {
+                    Ok(download) => UpdateState::Ready {
+                        download,
+                        installation,
+                    },
+                    Err(e) => UpdateState::Available {
+                        version,
+                        error: Some(format!("{e:#}").into()),
+                    },
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn restart_to_update(&mut self, cx: &mut Context<Self>) {
+        let Some(UpdateState::Ready {
+            download,
+            installation,
+        }) = &self.update_state
+        else {
             return;
         };
-        match updates::spawn_upgrade(&installation, version) {
+        match updates::spawn_upgrade(installation, download) {
             Ok(()) => {
                 // The usual delayed save would not run after quitting.
                 self.session.save().ok();
                 cx.quit();
             }
             Err(e) => {
-                self.status = Status::Failed(format!("{e:#}").into());
+                self.update_state = Some(UpdateState::Available {
+                    version: download.version.clone(),
+                    error: Some(format!("{e:#}").into()),
+                });
                 cx.notify();
             }
         }
+    }
+
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (danger, muted, track, fill) = {
+            let theme = cx.theme();
+            (
+                theme.danger,
+                theme.muted_foreground,
+                theme.border,
+                theme.primary,
+            )
+        };
+        Some(match self.update_state.as_ref()? {
+            UpdateState::Available { version, error } => {
+                let label = format!("Update to {version}");
+                let version = version.clone();
+                v_flex()
+                    .gap_1()
+                    .when_some(error.clone(), |el, error| {
+                        el.child(div().text_sm().text_color(danger).child(error))
+                    })
+                    .child(
+                        Button::new("download-update")
+                            .primary()
+                            .small()
+                            .label(label)
+                            .tooltip("Downloads in the background while you keep working")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.download_update(version.clone(), cx);
+                            })),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::Downloading { version, percent } => {
+                let percent = percent.load(Ordering::Relaxed);
+                let label = if percent == 0 {
+                    format!("Downloading {version}…")
+                } else {
+                    format!("Downloading {version}… {percent}%")
+                };
+                v_flex()
+                    .id("update-progress")
+                    .test_support()
+                    .gap_1()
+                    .child(div().text_sm().text_color(muted).child(label))
+                    .child(
+                        div().h(px(4.)).w_full().rounded_full().bg(track).child(
+                            div()
+                                .h_full()
+                                .rounded_full()
+                                .bg(fill)
+                                .w(relative(f32::from(percent) / 100.)),
+                        ),
+                    )
+                    .into_any_element()
+            }
+            UpdateState::Ready { download, .. } => Button::new("restart-to-update")
+                .primary()
+                .small()
+                .label("Restart to update")
+                .tooltip(format!(
+                    "Closes TupleBase, installs {} and reopens",
+                    download.version
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.restart_to_update(cx)))
+                .into_any_element(),
+        })
     }
 
     fn toggle_folder(&mut self, folder: String, cx: &mut Context<Self>) {
@@ -913,18 +1072,7 @@ impl Workspace {
                     .gap_2()
                     .border_t_1()
                     .border_color(border)
-                    .when_some(self.available_update.clone(), |el, version| {
-                        el.child(
-                            Button::new("download-update")
-                                .primary()
-                                .small()
-                                .label(format!("Update to {version}"))
-                                .tooltip("Closes TupleBase, installs the update and reopens")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.install_update(&version, cx);
-                                })),
-                        )
-                    })
+                    .children(self.render_update(cx))
                     .child(
                         h_flex().child(
                             Button::new("open-settings")
@@ -1727,7 +1875,10 @@ mod tests {
         .unwrap();
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
-                this.available_update = Some("9.9.9".into());
+                this.update_state = Some(super::UpdateState::Available {
+                    version: "9.9.9".into(),
+                    error: None,
+                });
                 cx.notify();
             });
         });
@@ -1736,6 +1887,38 @@ mod tests {
             assert!(window.find("download-update").visible());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn an_update_shows_progress_and_then_offers_a_restart(cx: &mut TestAppContext) {
+        use tuplebase_core::updates::{Download, Installation};
+        let (handle, workspace) = open(Config::default(), cx);
+        let place = || Installation::Directory("/tmp/none".into());
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.start_download("9.9.9".into(), place(), cx);
+            });
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("update-progress").visible());
+            assert!(window.try_find("download-update").is_none());
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.update_state = Some(super::UpdateState::Ready {
+                    download: Download {
+                        dir: "/tmp/none".into(),
+                        version: "9.9.9".into(),
+                    },
+                    installation: place(),
+                });
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("restart-to-update").visible());
+            assert!(window.try_find("update-progress").is_none());
+        });
     }
 
     #[gpui_kit::test]

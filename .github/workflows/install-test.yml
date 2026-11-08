@@ -19,6 +19,13 @@ jobs:
       - uses: actions/checkout@v7
       - run: sh install.sh
       - run: test -x "$HOME/.local/bin/tuplebase-mcp"
+      # The app's updater downloads the files first, then runs the installer on them.
+      - name: Install from downloaded files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern '*' --dir "$RUNNER_TEMP/update"
+          TUPLEBASE_DOWNLOAD_DIR="$RUNNER_TEMP/update" sh install.sh
 
   windows:
     runs-on: windows-2025
@@ -29,3 +36,10 @@ jobs:
           foreach ($bin in "tuplebase-app.exe", "tuplebase-mcp.exe") {
             if (-not (Test-Path "$env:LOCALAPPDATA\Programs\TupleBase\$bin")) { throw "missing $bin" }
           }
+      - name: Install from downloaded files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo $env:GITHUB_REPOSITORY --pattern '*' --dir "$env:RUNNER_TEMP\update"
+          $env:TUPLEBASE_DOWNLOAD_DIR = "$env:RUNNER_TEMP\update"
+          ./install.ps1

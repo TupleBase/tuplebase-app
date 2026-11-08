@@ -3,6 +3,7 @@
 #   irm https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.ps1 | iex
 #
 # Set $env:TUPLEBASE_VERSION = "x.y.z" to install a specific version.
+# The app sets $env:TUPLEBASE_DOWNLOAD_DIR when it has already downloaded the release files.
 
 # Everything runs in this block, so a truncated download cannot run half a script.
 & {
@@ -25,9 +26,15 @@
     New-Item -ItemType Directory -Path $tmp | Out-Null
 
     try {
-        Write-Host "Downloading TupleBase $version..."
-        Invoke-WebRequest "$base/$file" -OutFile (Join-Path $tmp $file)
-        Invoke-WebRequest "$base/SHA256SUMS" -OutFile (Join-Path $tmp "SHA256SUMS")
+        if ($env:TUPLEBASE_DOWNLOAD_DIR) {
+            Copy-Item (Join-Path $env:TUPLEBASE_DOWNLOAD_DIR $file) $tmp
+            Copy-Item (Join-Path $env:TUPLEBASE_DOWNLOAD_DIR "SHA256SUMS") $tmp
+        }
+        else {
+            Write-Host "Downloading TupleBase $version..."
+            Invoke-WebRequest "$base/$file" -OutFile (Join-Path $tmp $file)
+            Invoke-WebRequest "$base/SHA256SUMS" -OutFile (Join-Path $tmp "SHA256SUMS")
+        }
 
         $line = Select-String -Path (Join-Path $tmp "SHA256SUMS") -SimpleMatch $file
         $expected = ($line.Line -split '\s+')[0]

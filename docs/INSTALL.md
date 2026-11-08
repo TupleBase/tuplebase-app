@@ -63,9 +63,11 @@ scripts/uninstall.sh   # remove it again; config and passwords stay
 ## Updates
 
 At startup the app asks GitHub whether a newer version exists. If one does, an **Update
-to x.y.z** button appears at the bottom of the sidebar. One click closes TupleBase, installs
-the new version where the app already is, and reopens it. Connections and passwords are
-kept. A log of the last update is saved as `update.log` next to `connections.json`.
+to x.y.z** button appears at the bottom of the sidebar. Click it and the update downloads
+in the background while you keep working. When it's ready, **Restart to update** closes
+TupleBase, installs the new version where the app already is, and reopens it. Connections
+and passwords are kept. A log of the last update is saved as `update.log` next to
+`connections.json`.
 
 Running the install command again also updates to the latest version.
 
