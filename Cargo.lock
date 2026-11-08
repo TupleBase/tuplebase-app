@@ -8816,7 +8816,7 @@ dependencies = [
 
 [[package]]
 name = "tuplebase-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -8830,7 +8830,7 @@ dependencies = [
 
 [[package]]
 name = "tuplebase-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "directories",
@@ -8848,7 +8848,7 @@ dependencies = [
 
 [[package]]
 name = "tuplebase-mcp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "rmcp",
