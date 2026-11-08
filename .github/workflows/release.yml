@@ -1,0 +1,70 @@
+name: Release
+
+# Started by hand: gh workflow run release -f version=0.2.0
+# Bumps the version on main, tags it, builds every platform, publishes a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 0.2.0"
+        required: true
+
+concurrency: release
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - run: rustup toolchain install
+      - run: scripts/release-tag.sh "$VERSION"
+        env:
+          VERSION: ${{ inputs.version }}
+
+  build:
+    needs: tag
+    strategy:
+      matrix:
+        include:
+          - { os: macos-15, platform: macos-arm64 }
+          - { os: windows-2025, platform: windows-x64 }
+          # Oldest supported Ubuntu, so the binary runs on older glibc.
+          - { os: ubuntu-22.04, platform: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: v${{ inputs.version }}
+      - if: runner.os == 'Linux'
+        run: scripts/ci-linux-deps.sh
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p tuplebase-app -p tuplebase-mcp
+      - run: scripts/package.sh "${{ matrix.platform }}"
+        shell: bash
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - run: (cd dist && sha256sum * > SHA256SUMS)
+      - run: gh release create "v$VERSION" dist/* --title "TupleBase $VERSION" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
