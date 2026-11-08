@@ -73,10 +73,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           NOTES: >-
-            **macOS:** builds are not code-signed, so a browser download is blocked on first launch.
-            [Allow it in a few steps](https://github.com/TupleBase/tuplebase-app/blob/main/docs/INSTALL.md#macos-tuplebase-not-opened),
-            or use the [command-line install](https://github.com/TupleBase/tuplebase-app/blob/main/docs/INSTALL.md#command-line-recommended),
-            which avoids the warning.
+            **macOS:** use the [command-line install](https://github.com/TupleBase/tuplebase-app/blob/main/docs/INSTALL.md#command-line-recommended)
+            to avoid the first-launch block.
+            Already downloaded the DMG? [Allow it in a few steps](https://github.com/TupleBase/tuplebase-app/blob/main/docs/INSTALL.md#macos-tuplebase-not-opened).
 
   verify-install:
     needs: publish

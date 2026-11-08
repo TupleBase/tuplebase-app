@@ -26,7 +26,7 @@ The workflow then:
    `Release v0.2.0` to `main` and tags `v0.2.0`;
 2. builds macOS (Apple Silicon), Windows (x64) and Linux (x64);
 3. publishes a GitHub Release with the installers, `SHA256SUMS` and generated notes,
-   which start with a link to the macOS first-launch steps.
+   which start with a note on installing on macOS.
 
 The notices step stops the release if a new dependency uses a license not listed in
 `about.toml`. Review that license before adding it there.

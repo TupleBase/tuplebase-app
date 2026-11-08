@@ -43,8 +43,9 @@ irm https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.ps1 |
 ```
 
 Builds are not code-signed, and the command line avoids the warning a browser download
-triggers. The [install guide](docs/INSTALL.md) covers downloads, install locations and
-updates.
+triggers. If macOS blocks a downloaded copy,
+[allow it in System Settings](docs/INSTALL.md#macos-tuplebase-not-opened). The
+[install guide](docs/INSTALL.md) covers downloads, install locations and updates.
 
 ## Supported engines
 
@@ -62,14 +63,6 @@ compatible agents four tools:
 - `run_query` runs a statement and returns rows, or the affected row count.
 
 See [MCP server for agents](docs/MCP.md) to connect one.
-
-## Install
-
-See [Install](docs/INSTALL.md).
-
-**macOS:** builds are not code-signed, so a copy downloaded with a browser is blocked on
-first launch. [Click Open Anyway in System Settings](docs/INSTALL.md#macos-tuplebase-not-opened)
-to allow it, or use the command-line install, which avoids the warning.
 
 ## Docs
 
