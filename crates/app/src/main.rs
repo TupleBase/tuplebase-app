@@ -2,10 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod conn_form;
+mod logos;
 mod results;
+mod theme;
 mod workspace;
 
-use gpui_kit::component::Theme;
+use gpui_kit::component::{Theme, TitleBar};
 use gpui_kit::*;
 use workspace::Workspace;
 
@@ -23,6 +25,7 @@ fn main() {
             // Must run before any gpui-kit component is used.
             gpui_kit::init(cx);
 
+            theme::init(cx);
             workspace::bind_keys(cx);
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
@@ -38,14 +41,15 @@ fn main() {
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some(tuplebase_core::PRODUCT_NAME.into()),
-                    ..Default::default()
+                    traffic_light_position: Some(point(px(13.), px(13.))),
+                    ..TitleBar::title_bar_options()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
                     size(px(1200.), px(780.)),
                     cx,
                 ))),
-                ..Default::default()
+                ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);

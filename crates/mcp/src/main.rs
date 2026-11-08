@@ -89,6 +89,7 @@ impl Server {
                 .map(|c| {
                     json!({
                         "name": c.name,
+                        "folder": c.folder,
                         "adapter": c.adapter,
                         "host": c.host,
                         "port": c.port,

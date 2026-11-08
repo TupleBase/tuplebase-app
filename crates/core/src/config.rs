@@ -46,6 +46,9 @@ impl Adapter {
 pub struct Connection {
     /// Unique name; also the keychain account for this connection's password.
     pub name: String,
+    /// Sidebar folder, typically an environment. Empty means no folder.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub folder: String,
     pub adapter: Adapter,
     pub host: String,
     pub port: u16,
@@ -75,6 +78,9 @@ impl Connection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
+    /// Sidebar folders, so that empty ones are kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<String>,
     #[serde(default)]
     pub connections: Vec<Connection>,
     /// Ask GitHub for a newer version at startup.
@@ -90,6 +96,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
+            folders: Vec::new(),
             connections: Vec::new(),
             check_for_updates: true,
         }
@@ -147,6 +154,103 @@ impl Config {
         Ok(())
     }
 
+    /// Folder names in display order, including empty folders.
+    pub fn folders(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .folders
+            .iter()
+            .cloned()
+            .chain(
+                self.connections
+                    .iter()
+                    .filter(|c| !c.folder.is_empty())
+                    .map(|c| c.folder.clone()),
+            )
+            .collect();
+        names.sort();
+        names.dedup();
+        names.sort_by_key(|n| n.to_lowercase());
+        names
+    }
+
+    /// Connections by folder: every folder in order, then those with no folder (`""`).
+    pub fn grouped(&self) -> Vec<(String, Vec<&Connection>)> {
+        let members = |folder: &str| {
+            let mut found: Vec<&Connection> = self
+                .connections
+                .iter()
+                .filter(|c| c.folder == folder)
+                .collect();
+            found.sort_by_key(|c| c.name.to_lowercase());
+            found
+        };
+        let mut groups: Vec<(String, Vec<&Connection>)> = self
+            .folders()
+            .into_iter()
+            .map(|folder| {
+                let found = members(&folder);
+                (folder, found)
+            })
+            .collect();
+        let loose = members("");
+        if !loose.is_empty() {
+            groups.push((String::new(), loose));
+        }
+        groups
+    }
+
+    fn check_folder_name(&self, name: &str, current: Option<&str>) -> Result<()> {
+        if name.is_empty() {
+            bail!("folder name is required");
+        }
+        let taken = self
+            .folders()
+            .iter()
+            .any(|f| f.to_lowercase() == name.to_lowercase() && Some(f.as_str()) != current);
+        if taken {
+            bail!("a folder named \"{name}\" already exists");
+        }
+        Ok(())
+    }
+
+    pub fn add_folder(&mut self, name: &str) -> Result<()> {
+        let name = name.trim();
+        self.check_folder_name(name, None)?;
+        self.folders.push(name.to_owned());
+        Ok(())
+    }
+
+    /// Renames a folder and updates the connections inside it.
+    pub fn rename_folder(&mut self, old: &str, new: &str) -> Result<()> {
+        let new = new.trim();
+        self.check_folder_name(new, Some(old))?;
+        self.folders.retain(|f| f != old);
+        self.folders.push(new.to_owned());
+        for conn in self.connections.iter_mut().filter(|c| c.folder == old) {
+            conn.folder = new.to_owned();
+        }
+        Ok(())
+    }
+
+    /// Removes a folder. Its connections are kept and moved out of it.
+    pub fn remove_folder(&mut self, name: &str) {
+        self.folders.retain(|f| f != name);
+        for conn in self.connections.iter_mut().filter(|c| c.folder == name) {
+            conn.folder.clear();
+        }
+    }
+
+    /// Moves a connection into `folder` (`""` for none). Returns whether anything changed.
+    pub fn move_connection(&mut self, name: &str, folder: &str) -> bool {
+        match self.connections.iter_mut().find(|c| c.name == name) {
+            Some(conn) if conn.folder != folder => {
+                conn.folder = folder.to_owned();
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn find(&self, name: &str) -> Option<&Connection> {
         self.connections.iter().find(|c| c.name == name)
     }
@@ -183,6 +287,7 @@ mod tests {
     fn pg(name: &str) -> Connection {
         Connection {
             name: name.into(),
+            folder: String::new(),
             adapter: Adapter::Postgres,
             host: "localhost".into(),
             port: 5432,
@@ -233,6 +338,95 @@ mod tests {
         conn.name = "x".into();
         conn.host = " ".into();
         assert!(config.upsert(conn, None).is_err());
+    }
+
+    #[test]
+    fn connections_are_grouped_by_folder_with_loose_ones_last() {
+        let mut config = Config::default();
+        for (name, folder) in [("c", ""), ("b", "Prod"), ("a", "Prod"), ("d", "Dev")] {
+            let mut conn = pg(name);
+            conn.folder = folder.into();
+            config.upsert(conn, None).unwrap();
+        }
+        let grouped = config.grouped();
+        let groups: Vec<(&str, Vec<&str>)> = grouped
+            .iter()
+            .map(|(f, m)| (f.as_str(), m.iter().map(|c| c.name.as_str()).collect()))
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                ("Dev", vec!["d"]),
+                ("Prod", vec!["a", "b"]),
+                ("", vec!["c"])
+            ]
+        );
+        assert_eq!(config.folders(), ["Dev", "Prod"]);
+    }
+
+    fn in_folder(name: &str, folder: &str) -> Connection {
+        let mut conn = pg(name);
+        conn.folder = folder.into();
+        conn
+    }
+
+    #[test]
+    fn empty_folders_are_kept_and_grouped() {
+        let mut config = Config::default();
+        config.add_folder(" Local ").unwrap();
+        assert_eq!(config.folders(), ["Local"]);
+        assert_eq!(config.grouped(), [("Local".to_string(), vec![])]);
+    }
+
+    #[test]
+    fn folder_names_must_be_present_and_unique() {
+        let mut config = Config::default();
+        config.add_folder("Prod").unwrap();
+        assert!(config.add_folder("  ").is_err());
+        assert!(config.add_folder("prod").is_err());
+    }
+
+    #[test]
+    fn renaming_a_folder_updates_its_connections() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "Prod"), None).unwrap();
+        config.rename_folder("Prod", "Live").unwrap();
+        assert_eq!(config.connections[0].folder, "Live");
+        assert_eq!(config.folders(), ["Live"]);
+    }
+
+    #[test]
+    fn renaming_a_folder_can_change_only_its_case_but_not_clash() {
+        let mut config = Config::default();
+        config.add_folder("prod").unwrap();
+        config.add_folder("Dev").unwrap();
+        config.rename_folder("prod", "Prod").unwrap();
+        assert!(config.rename_folder("Prod", "dev").is_err());
+    }
+
+    #[test]
+    fn removing_a_folder_keeps_its_connections() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "Prod"), None).unwrap();
+        config.remove_folder("Prod");
+        assert_eq!(config.connections.len(), 1);
+        assert_eq!(config.connections[0].folder, "");
+        assert!(config.folders().is_empty());
+    }
+
+    #[test]
+    fn moving_a_connection_reports_whether_it_changed() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "Prod"), None).unwrap();
+        assert!(config.move_connection("a", "Dev"));
+        assert!(!config.move_connection("a", "Dev"));
+        assert!(!config.move_connection("missing", "Dev"));
+    }
+
+    #[test]
+    fn a_connection_without_a_folder_does_not_write_the_field() {
+        let json = serde_json::to_string(&pg("a")).unwrap();
+        assert!(!json.contains("folder"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ new versions ([details](INSTALL.md#updates)).
 
 ## Connection settings
 
-Name, type, host, port, database, user and the read-only flag are saved as plain JSON,
+Folders, and each connection's name, type, host, port, database, user and read-only flag, are saved as plain JSON,
 **with no passwords**, in `connections.json`:
 
 | OS      | Path                                                                  |

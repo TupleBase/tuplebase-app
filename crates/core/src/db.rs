@@ -215,7 +215,7 @@ impl Db {
     async fn pool(&self, conn: &Connection) -> Result<Pool> {
         let mut pools = self.pools.lock().await;
         if let Some((cached, pool)) = pools.get(&conn.name)
-            && cached == conn
+            && same_target(cached, conn)
         {
             return Ok(pool.clone());
         }
@@ -230,6 +230,13 @@ impl Db {
         }
         Ok(pool)
     }
+}
+
+/// Whether two configs reach the same server; moving between folders doesn't change that.
+fn same_target(a: &Connection, b: &Connection) -> bool {
+    let mut a = a.clone();
+    a.folder.clone_from(&b.folder);
+    a == *b
 }
 
 async fn open_pool(conn: &Connection, password: Option<String>) -> Result<Pool> {

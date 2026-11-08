@@ -33,6 +33,7 @@ fn connection(adapter: Adapter) -> Connection {
     });
     Connection {
         name: name.into(),
+        folder: String::new(),
         adapter,
         host: "127.0.0.1".into(),
         port,
