@@ -43,8 +43,9 @@ irm https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.ps1 |
 ```
 
 Builds are not code-signed, and the command line avoids the warning a browser download
-triggers. The [install guide](docs/INSTALL.md) covers downloads, install locations and
-updates.
+triggers. If macOS blocks a downloaded copy,
+[allow it in System Settings](docs/INSTALL.md#macos-tuplebase-not-opened). The
+[install guide](docs/INSTALL.md) covers downloads, install locations and updates.
 
 ## Supported engines
 

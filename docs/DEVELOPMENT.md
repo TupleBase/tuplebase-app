@@ -17,6 +17,7 @@ cargo test --workspace                                  # tests
 cargo clippy --workspace --all-targets -- -D warnings   # lint
 cargo fmt --all                                         # format
 scripts/install.sh                                      # release build + install
+scripts/uninstall.sh                                    # remove it; config and passwords stay
 ```
 
 ## Tests against real databases
