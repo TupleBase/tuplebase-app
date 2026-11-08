@@ -69,3 +69,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
+
+  verify-install:
+    needs: publish
+    uses: ./.github/workflows/install-test.yml

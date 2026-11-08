@@ -28,10 +28,13 @@ The workflow then:
 
 Installed apps read this repo's latest release to notice new versions.
 
+After publishing, the workflow installs the new release with `install.sh` and
+`install.ps1` on all three platforms to confirm the installers still work.
+
 ## Known limits
 
-- **Not code-signed:** macOS and Windows warn on first launch, see [Install](INSTALL.md).
-  Signing needs an Apple Developer ID and a Windows signing certificate.
+- **Not code-signed:** browser downloads warn on first launch. The command-line install
+  avoids that, see [Install](INSTALL.md).
 - **Apple Silicon only** on macOS; there is no Intel build.
 - **No license notices yet:** the installers bundle open-source crates whose licenses
   require attribution. Generate third-party notices before distributing widely.

@@ -1,0 +1,31 @@
+name: Install test
+
+# Installs the latest published release with the one-line installers.
+# Runs after every release, or by hand: gh workflow run install-test.yml
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    strategy:
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: sh install.sh
+      - run: test -x "$HOME/.local/bin/tuplebase-mcp"
+
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./install.ps1
+      - run: |
+          foreach ($bin in "tuplebase-app.exe", "tuplebase-mcp.exe") {
+            if (-not (Test-Path "$env:LOCALAPPDATA\Programs\TupleBase\$bin")) { throw "missing $bin" }
+          }

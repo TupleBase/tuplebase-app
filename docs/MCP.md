@@ -15,7 +15,8 @@ claude mcp add tuplebase -- ~/.local/bin/tuplebase-mcp
 ```
 
 If you installed from the `.dmg`, the path is
-`/Applications/TupleBase.app/Contents/MacOS/tuplebase-mcp`.
+`/Applications/TupleBase.app/Contents/MacOS/tuplebase-mcp`. On Windows, use
+`%LOCALAPPDATA%\Programs\TupleBase\tuplebase-mcp.exe`.
 
 Other clients, using an absolute path:
 
