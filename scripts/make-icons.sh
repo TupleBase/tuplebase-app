@@ -19,4 +19,12 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$DIR/TupleBase.icns"
 
-echo "Wrote $DIR/{icon-1024.png,icon-256.png,TupleBase.icns}"
+ICO_SIZES="16 24 32 48 64 256"
+ICO_PNGS=()
+for size in $ICO_SIZES; do
+  sips -z "$size" "$size" "$DIR/icon-1024.png" --out "$TMP/ico-$size.png" >/dev/null
+  ICO_PNGS+=("$TMP/ico-$size.png")
+done
+python3 -I "$ROOT/scripts/make-ico.py" "$DIR/TupleBase.ico" "${ICO_PNGS[@]}"
+
+echo "Wrote $DIR/{icon-1024.png,icon-256.png,TupleBase.icns,TupleBase.ico}"
