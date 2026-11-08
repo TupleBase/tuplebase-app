@@ -13,7 +13,9 @@ use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tuplebase_core::config::{Adapter, Config, Connection, FolderNode, folder_name, rebase_folder};
+use tuplebase_core::config::{
+    Adapter, Config, Connection, FolderNode, folder_name, parent_of, rebase_folder,
+};
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
 use tuplebase_core::{secrets, updates};
@@ -25,7 +27,17 @@ use crate::results::ResultsDelegate;
 use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
 
-actions!(tuplebase, [RunQuery]);
+actions!(
+    tuplebase,
+    [
+        RunQuery,
+        TreeUp,
+        TreeDown,
+        TreeCollapse,
+        TreeExpand,
+        TreeOpen
+    ]
+);
 
 #[cfg(target_os = "macos")]
 const RUN_KEY: &str = "cmd-enter";
@@ -42,6 +54,11 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(RUN_KEY, RunQuery, Some("Input")),
         KeyBinding::new(RUN_KEY, RunQuery, None),
+        KeyBinding::new("up", TreeUp, Some(TREE_CONTEXT)),
+        KeyBinding::new("down", TreeDown, Some(TREE_CONTEXT)),
+        KeyBinding::new("left", TreeCollapse, Some(TREE_CONTEXT)),
+        KeyBinding::new("right", TreeExpand, Some(TREE_CONTEXT)),
+        KeyBinding::new("enter", TreeOpen, Some(TREE_CONTEXT)),
     ]);
 }
 
@@ -52,9 +69,10 @@ const HISTORY_ICON: &[u8] = include_bytes!("../../../assets/icons/clock.svg");
 const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
 
 const HISTORY_MENU_SIZE: usize = 20;
-const SIDEBAR_WIDTH: f32 = 264.;
+const TREE_CONTEXT: &str = "ConnectionTree";
+const SIDEBAR_WIDTH: f32 = 300.;
 /// Sidebar indent per folder level.
-const TREE_INDENT: f32 = 14.;
+const TREE_INDENT: f32 = 16.;
 /// Empty space at the top of the window, where the traffic lights sit on macOS.
 const WINDOW_TOP_STRIP: f32 = 40.;
 
@@ -66,6 +84,13 @@ enum Status {
     Busy(SharedString),
     Done(SharedString),
     Failed(SharedString),
+}
+
+/// One visible line of the connection tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TreeRow {
+    Folder(String),
+    Connection(String),
 }
 
 /// Inline name field in the sidebar, for creating or renaming a folder.
@@ -82,6 +107,7 @@ struct FolderEdit {
 struct DraggedConnection {
     name: String,
     adapter: Adapter,
+    color: String,
 }
 
 /// A folder being dragged into another one.
@@ -119,7 +145,7 @@ impl Render for DraggedConnection {
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
             .text_sm()
-            .child(logos::icon(self.adapter, 16., cx))
+            .child(logos::icon(self.adapter, &self.color, 16., cx))
             .child(self.name.clone())
     }
 }
@@ -139,6 +165,11 @@ pub struct Workspace {
     _session_save: Option<Task<()>>,
     schema: Entity<SchemaPanel>,
     _schema_subscription: Subscription,
+    tree_focus: FocusHandle,
+    tree_scroll: ScrollHandle,
+    /// The row arrow keys act on.
+    cursor: Option<TreeRow>,
+    tree_focused: bool,
     settings_open: bool,
     folder_edit: Option<FolderEdit>,
     _folder_edit_subscription: Option<Subscription>,
@@ -402,6 +433,10 @@ impl Workspace {
             _session_save: None,
             results: cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx)),
             status,
+            tree_focus: cx.focus_handle(),
+            tree_scroll: ScrollHandle::new(),
+            cursor: None,
+            tree_focused: false,
             settings_open: false,
             folder_edit: None,
             _folder_edit_subscription: None,
@@ -442,6 +477,10 @@ impl Workspace {
             let name = conn.name.clone();
             let result = io(async move { db.test(&conn).await }).await;
             this.update(cx, |this, cx| {
+                // The user may have moved on to another connection by now.
+                if this.selected.as_deref() != Some(name.as_str()) {
+                    return;
+                }
                 this.status = match result {
                     Ok(()) => Status::Done(format!("Connected to {name}").into()),
                     Err(e) => Status::Failed(format!("{e:#}").into()),
@@ -633,9 +672,14 @@ impl Workspace {
             read_only: false,
             max_rows: MAX_ROWS,
         };
+        let name = conn.name.clone();
         cx.spawn(async move |this, cx| {
             let result = io(async move { db.execute_script(&conn, &sql, opts).await }).await;
             this.update(cx, |this, cx| {
+                // Rows from a connection the user has left must not show under another.
+                if this.selected.as_deref() != Some(name.as_str()) {
+                    return;
+                }
                 this.status = match &result {
                     Ok(run) => Status::Done(summary(&run.result, run.statements).into()),
                     Err(e) => Status::Failed(format!("{e:#}").into()),
@@ -685,6 +729,107 @@ impl Workspace {
             .update(cx, |editor, cx| editor.set_value(sql, window, cx));
         self.remember_draft(cx);
         cx.notify();
+    }
+
+    /// Every row currently showing in the tree, top to bottom.
+    fn visible_rows(&self) -> Vec<TreeRow> {
+        fn walk(node: &FolderNode<'_>, collapsed: &HashSet<String>, rows: &mut Vec<TreeRow>) {
+            for folder in &node.folders {
+                rows.push(TreeRow::Folder(folder.path.clone()));
+                if !collapsed.contains(&folder.path) {
+                    walk(folder, collapsed, rows);
+                }
+            }
+            for conn in &node.connections {
+                rows.push(TreeRow::Connection(conn.name.clone()));
+            }
+        }
+        let mut rows = Vec::new();
+        walk(&self.config.tree(), &self.collapsed, &mut rows);
+        rows
+    }
+
+    fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let rows = self.visible_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .cursor
+            .as_ref()
+            .and_then(|cursor| rows.iter().position(|row| row == cursor));
+        let last = rows.len() as isize - 1;
+        let next = match current {
+            Some(index) => (index as isize + delta).clamp(0, last),
+            None if delta > 0 => 0,
+            None => last,
+        } as usize;
+        self.tree_scroll.scroll_to_item(next);
+        self.cursor = Some(rows[next].clone());
+        cx.notify();
+    }
+
+    /// Left arrow: closes an open folder, otherwise jumps to the folder above.
+    fn tree_collapse(&mut self, cx: &mut Context<Self>) {
+        let parent = match self.cursor.clone() {
+            Some(TreeRow::Folder(path)) if !self.collapsed.contains(&path) => {
+                self.collapsed.insert(path);
+                cx.notify();
+                return;
+            }
+            Some(TreeRow::Folder(path)) => parent_of(&path).to_owned(),
+            Some(TreeRow::Connection(name)) => self
+                .config
+                .find(&name)
+                .map(|c| c.folder.clone())
+                .unwrap_or_default(),
+            None => return,
+        };
+        if !parent.is_empty() {
+            self.cursor = Some(TreeRow::Folder(parent));
+            cx.notify();
+        }
+    }
+
+    /// Right arrow: opens a closed folder, otherwise moves into it or opens the connection.
+    fn tree_expand(&mut self, cx: &mut Context<Self>) {
+        match self.cursor.clone() {
+            Some(TreeRow::Folder(path)) if self.collapsed.remove(&path) => cx.notify(),
+            Some(TreeRow::Folder(_)) => self.move_cursor(1, cx),
+            Some(TreeRow::Connection(name)) => self.select(name, cx),
+            None => {}
+        }
+    }
+
+    fn tree_open(&mut self, cx: &mut Context<Self>) {
+        match self.cursor.clone() {
+            Some(TreeRow::Folder(path)) => self.toggle_folder(path, cx),
+            Some(TreeRow::Connection(name)) => self.select(name, cx),
+            None => {}
+        }
+    }
+
+    /// Replaces this app with a new version, or sends development builds to the download
+    /// page so a release doesn't overwrite them.
+    fn install_update(&mut self, version: &str, cx: &mut Context<Self>) {
+        let installation = std::env::current_exe()
+            .ok()
+            .and_then(|exe| updates::detect_installation(&exe));
+        let Some(installation) = installation else {
+            cx.open_url(updates::DOWNLOAD_URL);
+            return;
+        };
+        match updates::spawn_upgrade(&installation, version) {
+            Ok(()) => {
+                // The usual delayed save would not run after quitting.
+                self.session.save().ok();
+                cx.quit();
+            }
+            Err(e) => {
+                self.status = Status::Failed(format!("{e:#}").into());
+                cx.notify();
+            }
+        }
     }
 
     fn toggle_folder(&mut self, folder: String, cx: &mut Context<Self>) {
@@ -741,6 +886,14 @@ impl Workspace {
             .child(
                 v_flex()
                     .id("connections")
+                    .track_focus(&self.tree_focus)
+                    .key_context(TREE_CONTEXT)
+                    .track_scroll(&self.tree_scroll)
+                    .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.move_cursor(-1, cx)))
+                    .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.move_cursor(1, cx)))
+                    .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.tree_collapse(cx)))
+                    .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.tree_expand(cx)))
+                    .on_action(cx.listener(|this, _: &TreeOpen, _, cx| this.tree_open(cx)))
                     .flex_1()
                     .min_h_0()
                     .px_2()
@@ -766,8 +919,9 @@ impl Workspace {
                                 .primary()
                                 .small()
                                 .label(format!("Update to {version}"))
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    cx.open_url(updates::DOWNLOAD_URL);
+                                .tooltip("Closes TupleBase, installs the update and reopens")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.install_update(&version, cx);
                                 })),
                         )
                     })
@@ -861,6 +1015,10 @@ impl Workspace {
         )
     }
 
+    fn is_cursor(&self, row: &TreeRow) -> bool {
+        self.tree_focused && self.cursor.as_ref() == Some(row)
+    }
+
     fn render_tree(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let tree = self.config.tree();
         let mut rows = Vec::new();
@@ -938,7 +1096,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, hover, radius) = (theme.muted_foreground, theme.sidebar_accent, theme.radius);
+        let (muted, hover, radius, ring) = (
+            theme.muted_foreground,
+            theme.sidebar_accent,
+            theme.radius,
+            theme.ring,
+        );
         let chevron = if self.collapsed.contains(folder) {
             IconName::ChevronRight
         } else {
@@ -964,13 +1127,19 @@ impl Workspace {
         h_flex()
             .id(SharedString::from(format!("folder-{folder}")))
             .test_support()
+            .border_1()
+            .border_color(if self.is_cursor(&TreeRow::Folder(folder.to_owned())) {
+                ring
+            } else {
+                transparent_black()
+            })
             .group(row_group.clone())
             .relative()
             .when(depth == 0, |d| d.mt_2())
             .gap_1p5()
             .pl(px(4. + depth as f32 * TREE_INDENT))
             .pr_1()
-            .h(px(24.))
+            .h(px(30.))
             .rounded(radius)
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
@@ -1051,7 +1220,11 @@ impl Workspace {
                             })),
                     ),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_folder(toggle.clone(), cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.cursor = Some(TreeRow::Folder(toggle.clone()));
+                this.tree_focus.focus(window, cx);
+                this.toggle_folder(toggle.clone(), cx);
+            }))
     }
 
     fn render_connection(
@@ -1061,25 +1234,36 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let (muted, active, radius) = (theme.muted_foreground, theme.sidebar_accent, theme.radius);
+        let (muted, active, radius, ring) = (
+            theme.muted_foreground,
+            theme.sidebar_accent,
+            theme.radius,
+            theme.ring,
+        );
         let selected = self.selected.as_deref() == Some(conn.name.as_str());
         let name = conn.name.clone();
         let folder = conn.folder.clone();
         h_flex()
             .id(SharedString::from(format!("conn-{}", conn.name)))
             .test_support()
-            .h(px(26.))
-            .gap_1p5()
+            .border_1()
+            .border_color(if self.is_cursor(&TreeRow::Connection(conn.name.clone())) {
+                ring
+            } else {
+                transparent_black()
+            })
+            .h(px(32.))
+            .gap_2()
             .pr_2()
             .pl(px(8. + depth as f32 * TREE_INDENT))
             .rounded(radius)
             .cursor_pointer()
             .when(selected, |d| d.bg(active))
             .hover(move |s| s.bg(active))
-            .child(logos::icon(conn.adapter, 16., cx))
+            .child(logos::icon(conn.adapter, &conn.color, 18., cx))
             .child(
                 div()
-                    .max_w(px(150.))
+                    .max_w(px(170.))
                     .truncate()
                     .text_sm()
                     .child(conn.name.clone()),
@@ -1097,6 +1281,7 @@ impl Workspace {
                 DraggedConnection {
                     name: conn.name.clone(),
                     adapter: conn.adapter,
+                    color: conn.color.clone(),
                 },
                 |dragged, _, _, cx| cx.new(|_| dragged.clone()),
             )
@@ -1106,7 +1291,11 @@ impl Workspace {
                     this.move_connection(&dragged.name, &folder, cx);
                 }),
             )
-            .on_click(cx.listener(move |this, _, _, cx| this.select(name.clone(), cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.cursor = Some(TreeRow::Connection(name.clone()));
+                this.tree_focus.focus(window, cx);
+                this.select(name.clone(), cx);
+            }))
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1161,7 +1350,7 @@ impl Workspace {
                     .gap_2()
                     .border_b_1()
                     .border_color(border)
-                    .child(logos::icon(conn.adapter, 18., cx))
+                    .child(logos::icon(conn.adapter, &conn.color, 20., cx))
                     .child(div().font_semibold().child(conn.name.clone()))
                     .when_some(folder_label, |el, name| {
                         el.child(chip(name, muted, muted_bg))
@@ -1326,6 +1515,7 @@ fn drag_area() -> Div {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tree_focused = self.tree_focus.is_focused(window);
         if let Some(text) = self.pending_editor_text.take() {
             self.editor
                 .update(cx, |editor, cx| editor.set_value(text, window, cx));
@@ -1410,7 +1600,7 @@ fn history_label(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
-    use super::{Config, Connection, Status, Workspace, bind_keys};
+    use super::{Config, Connection, Status, TreeRow, Workspace, bind_keys};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds,
@@ -1450,6 +1640,7 @@ mod tests {
             database: "app".into(),
             user: "dev".into(),
             readonly: false,
+            color: String::new(),
             tls: Default::default(),
             ssh: None,
         };
@@ -1675,6 +1866,42 @@ mod tests {
                 workspace.read(cx).editor.read(cx).value().as_str(),
                 "SELECT"
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn arrow_keys_walk_and_fold_the_tree(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        let cursor = |cx: &mut TestAppContext| {
+            workspace
+                .read_with(cx, |this, _| this.cursor.clone())
+                .unwrap()
+        };
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.press("up", cx));
+        assert_eq!(cursor(cx), TreeRow::Folder("Production".into()));
+
+        window_action(handle, cx, |window, cx| window.press("left", cx));
+        cx.update(|cx| assert!(workspace.read(cx).collapsed.contains("Production")));
+
+        window_action(handle, cx, |window, cx| window.press("right", cx));
+        cx.update(|cx| assert!(workspace.read(cx).collapsed.is_empty()));
+
+        window_action(handle, cx, |window, cx| window.press("right", cx));
+        assert_eq!(cursor(cx), TreeRow::Connection("db".into()));
+
+        window_action(handle, cx, |window, cx| window.press("left", cx));
+        assert_eq!(cursor(cx), TreeRow::Folder("Production".into()));
+    }
+
+    #[gpui_kit::test]
+    fn a_connection_color_can_be_chosen_in_the_form(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("color-3", cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.form.as_ref().unwrap().read(cx).color, "#E2A336");
         });
     }
 

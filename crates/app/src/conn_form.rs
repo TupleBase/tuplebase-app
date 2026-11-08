@@ -12,6 +12,11 @@ use tuplebase_core::ssh;
 use crate::logos;
 use crate::runtime::io;
 
+/// Icon color choices. The first, empty one means the database's own color.
+const COLORS: [&str; 9] = [
+    "", "#E5484D", "#F76B15", "#E2A336", "#46A758", "#2EA69A", "#3E8BD6", "#8E6FD8", "#D66BA0",
+];
+
 // Short-lived event, so boxing the larger variant would buy nothing.
 #[allow(clippy::large_enum_variant)]
 pub enum ConnFormEvent {
@@ -38,6 +43,7 @@ pub struct ConnForm {
     user: Entity<InputState>,
     password: Entity<InputState>,
     readonly: bool,
+    pub(crate) color: String,
     tls: TlsMode,
     use_ssh: bool,
     ssh_host: Entity<InputState>,
@@ -108,6 +114,7 @@ impl ConnForm {
             user,
             password,
             readonly: existing.is_some_and(|c| c.readonly),
+            color: existing.map(|c| c.color.clone()).unwrap_or_default(),
             tls: existing.map_or(TlsMode::default(), |c| c.tls),
             use_ssh: ssh.is_some(),
             ssh_host,
@@ -164,6 +171,7 @@ impl ConnForm {
                 database: text(&self.database, cx),
                 user: text(&self.user, cx),
                 readonly: self.readonly,
+                color: self.color.clone(),
                 tls: self.tls,
                 ssh,
             },
@@ -237,10 +245,36 @@ impl ConnForm {
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .child(logos::icon(adapter, 18., cx))
+            .child(logos::icon(adapter, "", 18., cx))
             .child(div().text_sm().child(adapter.label()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.adapter = adapter;
+                cx.notify();
+            }))
+    }
+
+    fn render_swatch(
+        &self,
+        index: usize,
+        value: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let selected = self.color == value;
+        let ring = cx.theme().foreground;
+        let fill = logos::color_of(self.adapter, value, cx);
+        div()
+            .id(SharedString::from(format!("color-{index}")))
+            .test_support()
+            .size(px(24.))
+            .p(px(2.))
+            .rounded_full()
+            .border_2()
+            .when(selected, |d| d.border_color(ring))
+            .when(!selected, |d| d.border_color(transparent_black()))
+            .cursor_pointer()
+            .child(div().size_full().rounded_full().bg(fill))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.color = value.to_owned();
                 cx.notify();
             }))
     }
@@ -365,6 +399,16 @@ impl Render for ConnForm {
                                 .children(Adapter::ALL.map(|a| self.render_adapter(a, cx))),
                         )
                         .child(field("Name", Input::new(&self.name).id("conn-name")))
+                        .child(field(
+                            "Color",
+                            h_flex().gap_1().children(
+                                COLORS
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, value)| self.render_swatch(index, value, cx))
+                                    .collect::<Vec<_>>(),
+                            ),
+                        ))
                         .child(
                             h_flex()
                                 .gap_3()

@@ -52,6 +52,7 @@ async fn tunneled(name: &str, adapter: Adapter, db_host: &str, port: u16) -> Con
         database: "app".into(),
         user: "dev".into(),
         readonly: false,
+        color: String::new(),
         tls: TlsMode::default(),
         ssh: Some(SshConfig {
             host: "127.0.0.1".into(),

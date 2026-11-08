@@ -4,6 +4,7 @@
 //! name and rebuilt when the connection's settings change.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -91,9 +92,18 @@ impl Open {
     }
 }
 
+/// One connection's pool, and how its last attempt to connect went.
+#[derive(Default)]
+struct Slot {
+    open: Option<Open>,
+    failure: Option<(Instant, String)>,
+}
+
 #[derive(Default)]
 pub struct Db {
-    pools: Mutex<HashMap<String, Open>>,
+    /// Each connection has its own lock, so one that's slow or unreachable can't hold up
+    /// the others. The outer lock is only held to look a slot up.
+    slots: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
 }
 
 impl Db {
@@ -112,7 +122,10 @@ impl Db {
 
     /// Closes and drops the cached pool, e.g. after the connection was edited.
     pub async fn forget(&self, name: &str) {
-        if let Some(open) = self.pools.lock().await.remove(name) {
+        let slot = self.slots.lock().await.remove(name);
+        if let Some(slot) = slot
+            && let Some(open) = slot.lock().await.open.take()
+        {
             open.pool.close().await;
         }
     }
@@ -305,50 +318,80 @@ impl Db {
     }
 
     async fn pool(&self, conn: &Connection) -> Result<Pool> {
-        let mut pools = self.pools.lock().await;
-        if let Some(open) = pools.get(&conn.name)
+        let waiting_since = Instant::now();
+        let slot = self
+            .slots
+            .lock()
+            .await
+            .entry(conn.name.clone())
+            .or_default()
+            .clone();
+        let mut slot = slot.lock().await;
+        if let Some(open) = &slot.open
             && open.is_usable_for(conn)
         {
             return Ok(open.pool.clone());
         }
-        let name = conn.name.clone();
-        // Keychain access can block (or show an OS prompt), so keep it off the runtime.
-        let password = tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??;
-        let tunnel = match &conn.ssh {
-            None => None,
-            Some(config) => {
-                let name = conn.name.clone();
-                let secret =
-                    tokio::task::spawn_blocking(move || secrets::get_ssh_password(&name)).await??;
-                let tunnel = ssh::open(conn, config, secret)
-                    .await
-                    .with_context(|| format!("opening the SSH tunnel for \"{}\"", conn.name))?;
-                Some(tunnel)
-            }
-        };
-        let (host, port) = match &tunnel {
-            Some(tunnel) => ("127.0.0.1", tunnel.local_port()),
-            None => (conn.host.as_str(), conn.port),
-        };
-        let pool = open_pool(conn, host, port, password)
-            .await
-            .with_context(|| format!("connecting to \"{}\"", conn.name))?;
-        let open = Open {
-            config: conn.clone(),
-            pool: pool.clone(),
-            tunnel,
-        };
-        if let Some(old) = pools.insert(conn.name.clone(), open) {
-            old.pool.close().await;
+        // Several callers can queue up behind one attempt. If it failed while they
+        // waited, they share the answer instead of each waiting out their own timeout.
+        if let Some((failed_at, message)) = &slot.failure
+            && *failed_at >= waiting_since
+        {
+            bail!("{message}");
         }
-        Ok(pool)
+        match connect(conn).await {
+            Ok(open) => {
+                let pool = open.pool.clone();
+                slot.failure = None;
+                if let Some(old) = slot.open.replace(open) {
+                    old.pool.close().await;
+                }
+                Ok(pool)
+            }
+            Err(e) => {
+                slot.failure = Some((Instant::now(), format!("{e:#}")));
+                Err(e)
+            }
+        }
     }
 }
 
-/// Whether two configs reach the same server; moving between folders doesn't change that.
+/// Opens the SSH tunnel, if any, and then the connection pool.
+async fn connect(conn: &Connection) -> Result<Open> {
+    let name = conn.name.clone();
+    // Keychain access can block (or show an OS prompt), so keep it off the runtime.
+    let password = tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??;
+    let tunnel = match &conn.ssh {
+        None => None,
+        Some(config) => {
+            let name = conn.name.clone();
+            let secret =
+                tokio::task::spawn_blocking(move || secrets::get_ssh_password(&name)).await??;
+            let tunnel = ssh::open(conn, config, secret)
+                .await
+                .with_context(|| format!("opening the SSH tunnel for \"{}\"", conn.name))?;
+            Some(tunnel)
+        }
+    };
+    let (host, port) = match &tunnel {
+        Some(tunnel) => ("127.0.0.1", tunnel.local_port()),
+        None => (conn.host.as_str(), conn.port),
+    };
+    let pool = open_pool(conn, host, port, password)
+        .await
+        .with_context(|| format!("connecting to \"{}\"", conn.name))?;
+    Ok(Open {
+        config: conn.clone(),
+        pool,
+        tunnel,
+    })
+}
+
+/// Whether two configs reach the same server; folder and color don't affect that.
 fn same_target(a: &Connection, b: &Connection) -> bool {
     let mut a = a.clone();
     a.folder.clone_from(&b.folder);
+    a.color.clone_from(&b.color);
     a == *b
 }
 

@@ -3,11 +3,12 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.sh | sh
 #
-# Set TUPLEBASE_VERSION=x.y.z to install a specific version.
+# Set TUPLEBASE_VERSION=x.y.z to install a specific version. The app also sets
+# TUPLEBASE_APP_PATH or TUPLEBASE_BIN_DIR to update itself where it is installed.
 set -eu
 
 REPO_URL="https://github.com/TupleBase/tuplebase-app"
-BIN_DIR="$HOME/.local/bin"
+BIN_DIR="${TUPLEBASE_BIN_DIR:-$HOME/.local/bin}"
 
 fail() {
   echo "error: $1" >&2
@@ -38,13 +39,16 @@ cleanup() {
 }
 
 install_macos() {
-  app="$HOME/Applications/TupleBase.app"
+  app="${TUPLEBASE_APP_PATH:-$HOME/Applications/TupleBase.app}"
   mnt="$tmp/mnt"
-  mkdir -p "$mnt" "$HOME/Applications" "$BIN_DIR"
+  mkdir -p "$mnt" "$(dirname "$app")" "$BIN_DIR"
   hdiutil attach -nobrowse -quiet -readonly -mountpoint "$mnt" "$1" </dev/null
   mounted=1
+  # Copy first, so a failure can't leave you without an app.
+  rm -rf "$app.new"
+  ditto "$mnt/TupleBase.app" "$app.new"
   rm -rf "$app"
-  ditto "$mnt/TupleBase.app" "$app"
+  mv "$app.new" "$app"
   ln -sf "$app/Contents/MacOS/tuplebase-mcp" "$BIN_DIR/tuplebase-mcp"
   echo "Installed app: $app"
 }

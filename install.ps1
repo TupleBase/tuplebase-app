@@ -10,7 +10,8 @@
     $ProgressPreference = "SilentlyContinue"
 
     $repo = "TupleBase/tuplebase-app"
-    $dir = Join-Path $env:LOCALAPPDATA "Programs\TupleBase"
+    $dir = $env:TUPLEBASE_INSTALL_DIR
+    if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA "Programs\TupleBase" }
 
     $version = $env:TUPLEBASE_VERSION
     if (-not $version) {

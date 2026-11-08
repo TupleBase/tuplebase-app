@@ -40,6 +40,7 @@ fn connection(adapter: Adapter) -> Connection {
         database: "app".into(),
         user: "dev".into(),
         readonly: false,
+        color: String::new(),
         tls: Default::default(),
         ssh: None,
     }
@@ -154,6 +155,46 @@ async fn column_names_are_listed_for_autocomplete() {
     each_adapter(async |db, conn| {
         let names = db.list_column_names(&conn).await.unwrap();
         assert!(names.iter().any(|n| n == "email"), "{names:?}");
+    })
+    .await;
+}
+
+/// A connection that hangs like a database behind a VPN that's down: the TCP connection
+/// is accepted and then nothing ever answers.
+#[tokio::test]
+async fn a_hanging_connection_does_not_hold_up_others() {
+    each_adapter(async |db, conn| {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let silent_server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let mut hanging = conn.clone();
+        hanging.name = format!("{}-hanging", conn.name);
+        hanging.port = port;
+
+        let db = std::sync::Arc::new(db);
+        let attempt = {
+            let db = db.clone();
+            tokio::spawn(async move { db.test(&hanging).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let started = std::time::Instant::now();
+        db.test(&conn).await.unwrap();
+        assert!(started.elapsed().as_secs() < 3, "{:?}", started.elapsed());
+        assert!(
+            !attempt.is_finished(),
+            "the hanging attempt should still be waiting"
+        );
+
+        attempt.abort();
+        silent_server.abort();
     })
     .await;
 }

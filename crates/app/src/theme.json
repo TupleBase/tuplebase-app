@@ -5,7 +5,8 @@
     {
       "name": "TupleBase Light",
       "mode": "light",
-      "font.size": 14,
+      "font.size": 16,
+      "mono_font.size": 14,
       "radius": 6,
       "radius.lg": 8,
       "shadow": false,
@@ -114,7 +115,8 @@
     {
       "name": "TupleBase Dark",
       "mode": "dark",
-      "font.size": 14,
+      "font.size": 16,
+      "mono_font.size": 14,
       "radius": 6,
       "radius.lg": 8,
       "shadow": false,

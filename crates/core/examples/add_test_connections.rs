@@ -26,6 +26,7 @@ fn main() -> anyhow::Result<()> {
                 database: "app".into(),
                 user: user.into(),
                 readonly: false,
+                color: String::new(),
                 tls: TlsMode::default(),
                 ssh: None,
             };

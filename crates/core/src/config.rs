@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 /// Separates folder levels in a stored path, e.g. `RGG/storefront/bear`.
 const FOLDER_SEPARATOR: char = '/';
 
-fn parent_of(path: &str) -> &str {
+/// The folder a folder path sits in; `""` at the top level.
+pub fn parent_of(path: &str) -> &str {
     path.rsplit_once(FOLDER_SEPARATOR)
         .map_or("", |(parent, _)| parent)
 }
@@ -153,6 +154,9 @@ pub struct Connection {
     /// Blocks writes from the app and from agents.
     #[serde(default)]
     pub readonly: bool,
+    /// Icon color as `#RRGGBB`. Empty means the database's own color.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub color: String,
     #[serde(default, skip_serializing_if = "TlsMode::is_default")]
     pub tls: TlsMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +173,13 @@ impl Connection {
         }
         if self.user.trim().is_empty() {
             bail!("user is required for \"{}\"", self.name);
+        }
+        let color_is_valid = self.color.is_empty()
+            || (self.color.len() == 7
+                && self.color.starts_with('#')
+                && self.color[1..].chars().all(|c| c.is_ascii_hexdigit()));
+        if !color_is_valid {
+            bail!("color must look like #RRGGBB");
         }
         if let Some(ssh) = &self.ssh {
             if ssh.host.trim().is_empty() || ssh.user.trim().is_empty() {
@@ -459,6 +470,7 @@ mod tests {
             database: "app".into(),
             user: "dev".into(),
             readonly: false,
+            color: String::new(),
             tls: TlsMode::default(),
             ssh: None,
         }
@@ -482,6 +494,17 @@ mod tests {
             key_path: String::new(),
             fingerprint: "SHA256:abc".into(),
         }
+    }
+
+    #[test]
+    fn colors_must_be_hex_or_empty() {
+        let mut config = Config::default();
+        let mut conn = pg("a");
+        conn.color = "#3E8BD6".into();
+        assert!(config.upsert(conn.clone(), None).is_ok());
+        conn.name = "b".into();
+        conn.color = "blue".into();
+        assert!(config.upsert(conn, None).is_err());
     }
 
     #[test]

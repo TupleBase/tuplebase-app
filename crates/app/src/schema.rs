@@ -17,8 +17,8 @@ use crate::completions::SchemaNames;
 use crate::runtime::io;
 
 const TABLE_ICON: &[u8] = include_bytes!("../../../assets/icons/table-2.svg");
-const PANEL_WIDTH: f32 = 240.;
-const ROW_HEIGHT: f32 = 26.;
+const PANEL_WIDTH: f32 = 270.;
+const ROW_HEIGHT: f32 = 30.;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TableKey {
