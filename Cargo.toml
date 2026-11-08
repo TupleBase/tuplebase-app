@@ -5,4 +5,5 @@ members = ["crates/core", "crates/app", "crates/mcp"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 publish = false

@@ -11,3 +11,7 @@ PostgreSQL, MariaDB and MySQL, and lets AI agents query them through a local MCP
 - [Local development](docs/DEVELOPMENT.md)
 - [CI and releases](docs/RELEASING.md)
 - [Architecture and rules](ARCHITECTURE.md)
+
+## License
+
+[MIT](LICENSE)
