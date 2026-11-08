@@ -14,20 +14,8 @@ Windows (x64), in PowerShell:
 irm https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.ps1 | iex
 ```
 
-This is the way to avoid the operating system's "unknown developer" warning. Builds are
-not code-signed, and the warning only applies to files downloaded by a browser.
-
-The script finds the latest release, downloads it, verifies it against `SHA256SUMS` and
-installs it for the current user, without admin rights. You can read
-[install.sh](../install.sh) and [install.ps1](../install.ps1) before running them.
-
-| Platform | App                                                 | MCP server                                          |
-| -------- | --------------------------------------------------- | --------------------------------------------------- |
-| macOS    | `~/Applications/TupleBase.app`                      | `~/.local/bin/tuplebase-mcp`                        |
-| Linux    | `~/.local/bin/tuplebase-app`, plus a menu entry     | `~/.local/bin/tuplebase-mcp`                        |
-| Windows  | `%LOCALAPPDATA%\Programs\TupleBase\tuplebase-app.exe` | `%LOCALAPPDATA%\Programs\TupleBase\tuplebase-mcp.exe` |
-
-To install a specific version, set `TUPLEBASE_VERSION=0.1.0` first.
+This installs for the current user, without admin rights, and avoids the operating
+system's "unknown developer" warning. See [details](#command-line-details).
 
 ## Browser download
 
@@ -40,25 +28,53 @@ Download the file for your platform from
 | Windows (x64)         | `TupleBase-<version>-windows-x64.zip`  |
 | Linux (x64)           | `TupleBase-<version>-linux-x64.tar.gz` |
 
-Browser downloads get the OS warning on first launch:
+### macOS: "TupleBase" Not Opened
 
-- **macOS** blocks the app. Allow it in System Settings → Privacy & Security → Open
-  Anyway, or run `xattr -dr com.apple.quarantine /Applications/TupleBase.app`.
-- **Windows** SmartScreen: More info → Run anyway.
+Builds are not code-signed, so macOS blocks the app the first time you open it. Allow it
+once for each version you download with a browser. In-app updates don't need this.
 
-## From source
+1. Open TupleBase. When macOS says **"TupleBase" Not Opened**, click **Done**, not Move to
+   Trash.
+2. Open **System Settings**, go to **Privacy & Security**, and scroll down to **Security**.
+3. Click **Open Anyway**. It shows for about an hour after step 1.
 
-macOS and Linux, needs the [prerequisites](DEVELOPMENT.md#prerequisites):
+   ```text
+   +----------------------------------------------------------------+
+   | "TupleBase" was blocked to protect your Mac.   [ Open Anyway ] |  <-- click
+   +----------------------------------------------------------------+
+   | Apple could not verify "TupleBase" is free of malware that may |
+   | harm your Mac or compromise your privacy.                      |
+   +----------------------------------------------------------------+
+   ```
+
+4. When macOS asks, confirm with **Open Anyway** and your password or Touch ID.
+
+Or replace these steps with one Terminal command:
 
 ```sh
-scripts/install.sh     # build and install for the current user, no sudo
-scripts/uninstall.sh   # remove it again; config and passwords stay
+xattr -dr com.apple.quarantine /Applications/TupleBase.app
 ```
 
-| Platform | App                            | MCP server                  |
-| -------- | ------------------------------ | --------------------------- |
-| macOS    | `~/Applications/TupleBase.app` | `~/.local/bin/tuplebase-mcp` |
-| Linux    | `~/.local/bin/tuplebase-app`   | `~/.local/bin/tuplebase-mcp` |
+Either way you turn off the macOS check for this app, so only do it for a file from
+[the releases page](https://github.com/TupleBase/tuplebase-app/releases/latest).
+
+### Windows: SmartScreen
+
+If Windows warns on first launch, click **More info**, then **Run anyway**.
+
+## Command line details
+
+The script finds the latest release, downloads it, verifies it against `SHA256SUMS` and
+installs it. You can read [install.sh](../install.sh) and [install.ps1](../install.ps1)
+before running them. To install a specific version, set `TUPLEBASE_VERSION=0.1.0` first.
+
+| Platform | App                                                 | MCP server                                          |
+| -------- | --------------------------------------------------- | --------------------------------------------------- |
+| macOS    | `~/Applications/TupleBase.app`                      | `~/.local/bin/tuplebase-mcp`                        |
+| Linux    | `~/.local/bin/tuplebase-app`, plus a menu entry     | `~/.local/bin/tuplebase-mcp`                        |
+| Windows  | `%LOCALAPPDATA%\Programs\TupleBase\tuplebase-app.exe` | `%LOCALAPPDATA%\Programs\TupleBase\tuplebase-mcp.exe` |
+
+To build from source instead, see [Local development](DEVELOPMENT.md).
 
 ## Updates
 
