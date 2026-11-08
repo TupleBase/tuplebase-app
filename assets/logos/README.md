@@ -5,3 +5,6 @@ logos are trademarks of their owners; TupleBase is not affiliated with or endors
 
 The SVG files come from [devicon](https://github.com/devicons/devicon) v2.18.0 (MIT) and are
 unmodified, so keep them that way when updating: no recoloring or distortion.
+
+The `-dark` files are the same shapes with the logo's dark navy swapped for a lighter tone,
+so they stay visible on the dark theme. Nothing else differs.

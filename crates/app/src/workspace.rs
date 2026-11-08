@@ -10,7 +10,7 @@ use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tuplebase_core::config::{Adapter, Config, Connection};
+use tuplebase_core::config::{Adapter, Config, Connection, FolderNode, folder_name, rebase_folder};
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::{secrets, updates};
 
@@ -47,6 +47,8 @@ const NEW_FOLDER_ICON: &[u8] = include_bytes!("../../../assets/icons/folder-plus
 const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
 
 const SIDEBAR_WIDTH: f32 = 264.;
+/// Sidebar indent per folder level.
+const TREE_INDENT: f32 = 14.;
 /// Empty space at the top of the window, where the traffic lights sit on macOS.
 const WINDOW_TOP_STRIP: f32 = 40.;
 
@@ -62,6 +64,8 @@ enum Status {
 
 /// Inline name field in the sidebar, for creating or renaming a folder.
 struct FolderEdit {
+    /// Where a new folder goes; unused when renaming.
+    parent: String,
     /// The folder being renamed; `None` when creating one.
     renaming: Option<String>,
     input: Entity<InputState>,
@@ -72,6 +76,28 @@ struct FolderEdit {
 struct DraggedConnection {
     name: String,
     adapter: Adapter,
+}
+
+/// A folder being dragged into another one.
+#[derive(Clone)]
+struct DraggedFolder {
+    path: String,
+}
+
+impl Render for DraggedFolder {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .text_color(theme.popover_foreground)
+            .text_sm()
+            .child(folder_name(&self.path).to_owned())
+    }
 }
 
 impl Render for DraggedConnection {
@@ -87,7 +113,7 @@ impl Render for DraggedConnection {
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
             .text_sm()
-            .child(logos::tile(self.adapter, 20.))
+            .child(logos::icon(self.adapter, 16., cx))
             .child(self.name.clone())
     }
 }
@@ -172,11 +198,17 @@ impl Workspace {
 
     fn begin_folder_edit(
         &mut self,
+        parent: String,
         renaming: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let value = renaming.clone().unwrap_or_default();
+        self.collapsed.remove(&parent);
+        let value = renaming
+            .as_deref()
+            .map(folder_name)
+            .unwrap_or_default()
+            .to_owned();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Folder name")
@@ -191,7 +223,11 @@ impl Workspace {
                     }
                 }),
             );
-        self.folder_edit = Some(FolderEdit { renaming, input });
+        self.folder_edit = Some(FolderEdit {
+            parent,
+            renaming,
+            input,
+        });
         cx.notify();
     }
 
@@ -207,22 +243,38 @@ impl Workspace {
         };
         cx.notify();
         let name = edit.input.read(cx).value().trim().to_string();
-        if name.is_empty() || edit.renaming.as_deref() == Some(name.as_str()) {
+        let unchanged = edit
+            .renaming
+            .as_deref()
+            .is_some_and(|old| folder_name(old) == name);
+        if name.is_empty() || unchanged {
             return;
         }
         let result = match &edit.renaming {
-            Some(old) => self.config.rename_folder(old, &name),
-            None => self.config.add_folder(&name),
+            Some(old) => self
+                .config
+                .rename_folder(old, &name)
+                .map(|new| Some((old.clone(), new))),
+            None => self.config.add_folder(&edit.parent, &name).map(|_| None),
         };
         match result {
-            Ok(()) => {
-                if edit.renaming.is_some_and(|old| self.collapsed.remove(&old)) {
-                    self.collapsed.insert(name);
+            Ok(renamed) => {
+                if let Some((old, new)) = renamed {
+                    self.rebase_collapsed(&old, &new);
                 }
                 self.save_config(cx);
             }
             Err(e) => self.status = Status::Failed(format!("{e:#}").into()),
         }
+    }
+
+    /// Keeps folders closed after they, or a folder above them, get a new path.
+    fn rebase_collapsed(&mut self, old: &str, new: &str) {
+        self.collapsed = self
+            .collapsed
+            .drain()
+            .map(|path| rebase_folder(&path, old, new).unwrap_or(path))
+            .collect();
     }
 
     fn remove_folder(&mut self, folder: &str, cx: &mut Context<Self>) {
@@ -238,8 +290,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let has_connections = self.config.connections.iter().any(|c| c.folder == folder);
-        if !has_connections {
+        let is_inside = |path: &str| path != folder && rebase_folder(path, &folder, "").is_some();
+        let has_contents = self.config.folders().iter().any(|f| is_inside(f))
+            || self
+                .config
+                .connections
+                .iter()
+                .any(|c| c.folder == folder || is_inside(&c.folder));
+        if !has_contents {
             self.remove_folder(&folder, cx);
             return;
         }
@@ -248,8 +306,8 @@ impl Workspace {
             let this = this.clone();
             let name = folder.clone();
             alert
-                .title(format!("Delete folder “{folder}”?"))
-                .description("Its connections move out of the folder. None of them are deleted.")
+                .title(format!("Delete folder “{}”?", folder_name(&folder)))
+                .description("What's inside moves up one level. No connections are deleted.")
                 .confirm()
                 .ok_text("Delete folder")
                 .ok_variant(ButtonVariant::Danger)
@@ -259,6 +317,19 @@ impl Workspace {
                     true
                 })
         });
+    }
+
+    fn move_folder(&mut self, path: &str, new_parent: &str, cx: &mut Context<Self>) {
+        match self.config.move_folder(path, new_parent) {
+            Ok(None) => return,
+            Ok(Some(new_path)) => {
+                self.rebase_collapsed(path, &new_path);
+                self.collapsed.remove(new_parent);
+                self.save_config(cx);
+            }
+            Err(e) => self.status = Status::Failed(format!("{e:#}").into()),
+        }
+        cx.notify();
     }
 
     fn move_connection(&mut self, name: &str, folder: &str, cx: &mut Context<Self>) {
@@ -572,7 +643,7 @@ impl Workspace {
                                     .icon(Icon::default().data(NEW_FOLDER_ICON))
                                     .tooltip("New folder")
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.begin_folder_edit(None, window, cx);
+                                        this.begin_folder_edit(String::new(), None, window, cx);
                                     })),
                             )
                             .child(
@@ -597,6 +668,9 @@ impl Workspace {
                     .overflow_y_scroll()
                     .on_drop(cx.listener(|this, dragged: &DraggedConnection, _, cx| {
                         this.move_connection(&dragged.name, "", cx);
+                    }))
+                    .on_drop(cx.listener(|this, dragged: &DraggedFolder, _, cx| {
+                        this.move_folder(&dragged.path, "", cx);
                     }))
                     .children(self.render_tree(cx)),
             )
@@ -688,35 +762,65 @@ impl Workspace {
     }
 
     fn render_tree(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let tree = self.config.tree();
         let mut rows = Vec::new();
-        let editing = self.folder_edit.as_ref();
-        if let Some(edit) = editing.filter(|e| e.renaming.is_none()) {
-            rows.push(self.render_folder_input(edit, cx).into_any_element());
-        }
-        for (folder, members) in self.config.grouped() {
-            let named = !folder.is_empty();
-            if named {
-                match editing.filter(|e| e.renaming.as_deref() == Some(folder.as_str())) {
-                    Some(edit) => rows.push(self.render_folder_input(edit, cx).into_any_element()),
-                    None => rows.push(
-                        self.render_folder(&folder, members.len(), cx)
-                            .into_any_element(),
-                    ),
-                }
-            }
-            if !self.collapsed.contains(&folder) {
-                for conn in members {
-                    rows.push(self.render_connection(conn, named, cx).into_any_element());
-                }
-            }
-        }
+        self.render_new_folder_field("", 0, &mut rows, cx);
+        self.render_folder_contents(&tree, 0, &mut rows, cx);
         rows
     }
 
-    fn render_folder_input(&self, edit: &FolderEdit, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_new_folder_field(
+        &self,
+        parent: &str,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        let edit = self.folder_edit.as_ref();
+        if let Some(edit) = edit.filter(|e| e.renaming.is_none() && e.parent == parent) {
+            rows.push(self.render_folder_input(edit, depth, cx).into_any_element());
+        }
+    }
+
+    /// Subfolders first, then the connections directly inside.
+    fn render_folder_contents(
+        &self,
+        node: &FolderNode<'_>,
+        depth: usize,
+        rows: &mut Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        for folder in &node.folders {
+            let renaming = self
+                .folder_edit
+                .as_ref()
+                .filter(|e| e.renaming.as_deref() == Some(folder.path.as_str()));
+            rows.push(match renaming {
+                Some(edit) => self.render_folder_input(edit, depth, cx).into_any_element(),
+                None => self
+                    .render_folder(&folder.path, folder.connection_count(), depth, cx)
+                    .into_any_element(),
+            });
+            if !self.collapsed.contains(&folder.path) {
+                self.render_new_folder_field(&folder.path, depth + 1, rows, cx);
+                self.render_folder_contents(folder, depth + 1, rows, cx);
+            }
+        }
+        for conn in &node.connections {
+            rows.push(self.render_connection(conn, depth, cx).into_any_element());
+        }
+    }
+
+    fn render_folder_input(
+        &self,
+        edit: &FolderEdit,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
-            .mt_2()
-            .px_1()
+            .when(depth == 0, |d| d.mt_2())
+            .pl(px(4. + depth as f32 * TREE_INDENT))
+            .pr_1()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_folder_edit(cx)))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape" {
@@ -730,6 +834,7 @@ impl Workspace {
         &self,
         folder: &str,
         count: usize,
+        depth: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -740,39 +845,50 @@ impl Workspace {
             IconName::ChevronDown
         };
         let row_group = SharedString::from(format!("folder-row-{folder}"));
-        let name = folder.to_owned();
+        let path = folder.to_owned();
         let action = |id: String, tooltip: &'static str| {
             Button::new(SharedString::from(id))
                 .ghost()
                 .xsmall()
                 .tooltip(tooltip)
         };
-        let (add_to, rename, remove, toggle, drop_into) = (
-            name.clone(),
-            name.clone(),
-            name.clone(),
-            name.clone(),
-            name.clone(),
+        let (add_in, new_in, rename, remove, toggle, into_connection, into_folder) = (
+            path.clone(),
+            path.clone(),
+            path.clone(),
+            path.clone(),
+            path.clone(),
+            path.clone(),
+            path.clone(),
         );
         h_flex()
             .id(SharedString::from(format!("folder-{folder}")))
             .test_support()
             .group(row_group.clone())
             .relative()
-            .mt_2()
+            .when(depth == 0, |d| d.mt_2())
             .gap_1p5()
-            .px_1()
+            .pl(px(4. + depth as f32 * TREE_INDENT))
+            .pr_1()
             .h(px(24.))
             .rounded(radius)
             .cursor_pointer()
             .hover(move |s| s.bg(hover))
+            .on_drag(DraggedFolder { path: path.clone() }, |dragged, _, _, cx| {
+                cx.new(|_| dragged.clone())
+            })
             .drag_over::<DraggedConnection>(move |s, _, _, _| s.bg(hover))
+            .drag_over::<DraggedFolder>(move |s, _, _, _| s.bg(hover))
             .on_drop(
                 cx.listener(move |this, dragged: &DraggedConnection, _, cx| {
                     cx.stop_propagation();
-                    this.move_connection(&dragged.name, &drop_into, cx);
+                    this.move_connection(&dragged.name, &into_connection, cx);
                 }),
             )
+            .on_drop(cx.listener(move |this, dragged: &DraggedFolder, _, cx| {
+                cx.stop_propagation();
+                this.move_folder(&dragged.path, &into_folder, cx);
+            }))
             .child(Icon::new(chevron).xsmall().text_color(muted))
             .child(
                 div()
@@ -788,7 +904,7 @@ impl Workspace {
                     .truncate()
                     .text_sm()
                     .font_medium()
-                    .child(name),
+                    .child(folder_name(folder).to_owned()),
             )
             .child(
                 div()
@@ -809,7 +925,15 @@ impl Workspace {
                             .icon(IconName::Plus)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.open_form(None, add_to.clone(), window, cx);
+                                this.open_form(None, add_in.clone(), window, cx);
+                            })),
+                    )
+                    .child(
+                        action(format!("add-folder-in-{folder}"), "New folder inside")
+                            .icon(Icon::default().data(NEW_FOLDER_ICON))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.begin_folder_edit(new_in.clone(), None, window, cx);
                             })),
                     )
                     .child(
@@ -817,7 +941,12 @@ impl Workspace {
                             .icon(Icon::default().data(RENAME_ICON))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                this.begin_folder_edit(Some(rename.clone()), window, cx);
+                                this.begin_folder_edit(
+                                    String::new(),
+                                    Some(rename.clone()),
+                                    window,
+                                    cx,
+                                );
                             })),
                     )
                     .child(
@@ -835,7 +964,7 @@ impl Workspace {
     fn render_connection(
         &self,
         conn: &Connection,
-        in_folder: bool,
+        depth: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
@@ -846,27 +975,30 @@ impl Workspace {
         h_flex()
             .id(SharedString::from(format!("conn-{}", conn.name)))
             .test_support()
-            .gap_2()
+            .h(px(26.))
+            .gap_1p5()
             .pr_2()
-            .py_1()
-            .pl(px(if in_folder { 22. } else { 8. }))
+            .pl(px(8. + depth as f32 * TREE_INDENT))
             .rounded(radius)
             .cursor_pointer()
             .when(selected, |d| d.bg(active))
             .hover(move |s| s.bg(active))
-            .child(logos::tile(conn.adapter, 24.))
+            .child(logos::icon(conn.adapter, 16., cx))
             .child(
-                v_flex()
-                    .min_w_0()
+                div()
+                    .max_w(px(150.))
+                    .truncate()
+                    .text_sm()
+                    .child(conn.name.clone()),
+            )
+            .child(
+                div()
                     .flex_1()
-                    .child(div().text_sm().truncate().child(conn.name.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .truncate()
-                            .text_color(muted)
-                            .child(format!("{}:{}", conn.host, conn.port)),
-                    ),
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(conn.host.clone()),
             )
             .on_drag(
                 DraggedConnection {
@@ -924,8 +1056,8 @@ impl Workspace {
                 .bg(bg)
                 .child(text)
         };
-        let environment =
-            (!conn.folder.is_empty()).then(|| (conn.folder.clone(), folder_color(&conn.folder)));
+        let environment = (!conn.folder.is_empty())
+            .then(|| (conn.folder.replace('/', " / "), folder_color(&conn.folder)));
         v_flex()
             .size_full()
             .when_some(environment.clone(), |el, (_, color)| {
@@ -940,7 +1072,7 @@ impl Workspace {
                     .gap_2()
                     .border_b_1()
                     .border_color(border)
-                    .child(logos::tile(conn.adapter, 26.))
+                    .child(logos::icon(conn.adapter, 18., cx))
                     .child(div().font_semibold().child(conn.name.clone()))
                     .when_some(environment, |el, (name, color)| {
                         el.child(chip(name, color, color.opacity(0.14)))
@@ -1393,6 +1525,44 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_folder_can_be_created_inside_another(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.hover("folder-Production", cx);
+            window.click("add-folder-in-Production", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            window.input("EU", cx);
+            window.press("enter", cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("folder-Production/EU").visible());
+        });
+        cx.update(|cx| {
+            assert_eq!(
+                workspace.read(cx).config.folders(),
+                ["Production", "Production/EU"]
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn dragging_a_folder_into_another_moves_it(cx: &mut TestAppContext) {
+        let mut config = config_with_connection();
+        config.add_folder("", "Archive").unwrap();
+        let (handle, workspace) = open(config, cx);
+        window_action(handle, cx, |window, cx| {
+            window.drag_to("folder-Production", "folder-Archive", cx);
+        });
+        cx.update(|cx| {
+            assert_eq!(
+                workspace.read(cx).config.connections[0].folder,
+                "Archive/Production"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     fn renaming_a_folder_moves_its_connections(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         window_action(handle, cx, |window, cx| {
@@ -1425,7 +1595,7 @@ mod tests {
     #[gpui_kit::test]
     fn deleting_an_empty_folder_needs_no_confirmation(cx: &mut TestAppContext) {
         let mut config = Config::default();
-        config.add_folder("Old").unwrap();
+        config.add_folder("", "Old").unwrap();
         let (handle, workspace) = open(config, cx);
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Old", cx);
@@ -1437,7 +1607,7 @@ mod tests {
     #[gpui_kit::test]
     fn dragging_a_connection_onto_a_folder_moves_it(cx: &mut TestAppContext) {
         let mut config = config_with_connection();
-        config.add_folder("Local").unwrap();
+        config.add_folder("", "Local").unwrap();
         let (handle, workspace) = open(config, cx);
         window_action(handle, cx, |window, cx| {
             window.drag_to("conn-db", "folder-Local", cx);

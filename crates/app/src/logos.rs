@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, LazyLock};
 
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use tuplebase_core::config::Adapter;
 
@@ -13,8 +14,12 @@ static POSTGRES: LazyLock<Arc<Image>> =
     LazyLock::new(|| svg_image(include_bytes!("../../../assets/logos/postgresql.svg")));
 static MARIADB: LazyLock<Arc<Image>> =
     LazyLock::new(|| svg_image(include_bytes!("../../../assets/logos/mariadb.svg")));
+static MARIADB_DARK: LazyLock<Arc<Image>> =
+    LazyLock::new(|| svg_image(include_bytes!("../../../assets/logos/mariadb-dark.svg")));
 static MYSQL: LazyLock<Arc<Image>> =
     LazyLock::new(|| svg_image(include_bytes!("../../../assets/logos/mysql.svg")));
+static MYSQL_DARK: LazyLock<Arc<Image>> =
+    LazyLock::new(|| svg_image(include_bytes!("../../../assets/logos/mysql-dark.svg")));
 static BRAND: LazyLock<Arc<Image>> = LazyLock::new(|| {
     Arc::new(Image::from_bytes(
         ImageFormat::Png,
@@ -22,25 +27,21 @@ static BRAND: LazyLock<Arc<Image>> = LazyLock::new(|| {
     ))
 });
 
-fn logo(adapter: Adapter) -> Arc<Image> {
-    match adapter {
-        Adapter::Postgres => POSTGRES.clone(),
-        Adapter::Mariadb => MARIADB.clone(),
-        Adapter::Mysql => MYSQL.clone(),
+fn logo(adapter: Adapter, dark: bool) -> Arc<Image> {
+    match (adapter, dark) {
+        (Adapter::Postgres, _) => POSTGRES.clone(),
+        (Adapter::Mariadb, false) => MARIADB.clone(),
+        (Adapter::Mariadb, true) => MARIADB_DARK.clone(),
+        (Adapter::Mysql, false) => MYSQL.clone(),
+        (Adapter::Mysql, true) => MYSQL_DARK.clone(),
     }
 }
 
-/// A logo on a white tile, so its official colors read on light and dark themes alike.
-pub fn tile(adapter: Adapter, size: f32) -> Div {
-    div()
+/// A database's logo, shown small and inline like a file icon in an editor.
+pub fn icon(adapter: Adapter, size: f32, cx: &App) -> Img {
+    img(logo(adapter, cx.theme().mode.is_dark()))
         .size(px(size))
         .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(size * 0.24))
-        .bg(rgb(0xFFFFFF))
-        .child(img(logo(adapter)).size(px(size * 0.82)))
 }
 
 pub fn brand(size: f32) -> Img {

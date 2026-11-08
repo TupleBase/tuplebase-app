@@ -237,7 +237,7 @@ impl ConnForm {
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .child(logos::tile(adapter, 24.))
+            .child(logos::icon(adapter, 18., cx))
             .child(div().text_sm().child(adapter.label()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.adapter = adapter;

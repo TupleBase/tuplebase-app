@@ -33,17 +33,19 @@ fn folder_hex(folder: &str) -> u32 {
     };
     if has(&["prod", "production", "live"]) {
         RED
-    } else if has(&["staging", "stage", "uat", "qa", "test", "testing"]) {
-        AMBER
     } else if has(&["dev", "development", "local", "sandbox"]) {
         GREEN
+    } else if has(&["staging", "stage", "uat", "qa", "test", "testing"]) {
+        AMBER
     } else {
-        let sum: usize = name.bytes().map(usize::from).sum();
+        // Nested folders share their top-level folder's color.
+        let root = name.split('/').next().unwrap_or(&name);
+        let sum: usize = root.bytes().map(usize::from).sum();
         OTHERS[sum % OTHERS.len()]
     }
 }
 
-/// The color of an environment folder, from its name.
+/// The color of an environment folder, from its path.
 pub fn folder_color(folder: &str) -> Hsla {
     rgb(folder_hex(folder)).into()
 }
@@ -59,6 +61,17 @@ mod tests {
         assert_eq!(folder_hex("eu-prod"), RED);
         assert_eq!(folder_hex("Staging"), AMBER);
         assert_eq!(folder_hex("local dev"), GREEN);
+    }
+
+    #[test]
+    fn nested_folders_inherit_their_environment_and_color() {
+        assert_eq!(folder_hex("Production/EU"), RED);
+        assert_eq!(folder_hex("Analytics/one"), folder_hex("Analytics/two"));
+    }
+
+    #[test]
+    fn local_wins_over_test() {
+        assert_eq!(folder_hex("Local test databases"), GREEN);
     }
 
     #[test]

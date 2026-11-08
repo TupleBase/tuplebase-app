@@ -34,4 +34,12 @@ Local databases, user `dev`, password `dev`, database `app`:
 | MariaDB    | 53306 |
 | SSH server | 52222 |
 
+To get these in the app, in a "Local test databases" folder that needs no passwords:
+
+```sh
+cargo run -p tuplebase-core --example add_test_connections
+```
+
+It only touches your own config, and is safe to run again.
+
 `TUPLEBASE_IT_KEYCHAIN=1` also runs a round trip against the real OS credential store.

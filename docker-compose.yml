@@ -6,6 +6,8 @@ services:
       POSTGRES_USER: dev
       POSTGRES_PASSWORD: dev
       POSTGRES_DB: app
+      # Local test database only: accepts connections without a password.
+      POSTGRES_HOST_AUTH_METHOD: trust
     ports: ["55432:5432"]
     volumes: ["./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
     healthcheck:
@@ -20,7 +22,9 @@ services:
       MARIADB_DATABASE: app
       MARIADB_ROOT_PASSWORD: root
     ports: ["53306:3306"]
-    volumes: ["./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    volumes:
+      - ./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./dev/mariadb-test-user.sql:/docker-entrypoint-initdb.d/zz-test-user.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -udev -pdev app -e 'select 1 from users limit 1'"]
       interval: 2s

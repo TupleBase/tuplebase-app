@@ -3,11 +3,42 @@
 //! The file never holds secrets; passwords live in the OS keychain (see
 //! [`crate::secrets`]).
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+/// Separates folder levels in a stored path, e.g. `RGG/storefront/bear`.
+const FOLDER_SEPARATOR: char = '/';
+
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once(FOLDER_SEPARATOR)
+        .map_or("", |(parent, _)| parent)
+}
+
+/// The last level of a folder path.
+pub fn folder_name(path: &str) -> &str {
+    path.rsplit(FOLDER_SEPARATOR).next().unwrap_or(path)
+}
+
+fn join_folder(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}{FOLDER_SEPARATOR}{name}")
+    }
+}
+
+/// `path` moved from under `old` to under `new`, or `None` if it isn't inside `old`.
+pub fn rebase_folder(path: &str, old: &str, new: &str) -> Option<String> {
+    if path == old {
+        return Some(new.to_owned());
+    }
+    let rest = path.strip_prefix(old)?.strip_prefix(FOLDER_SEPARATOR)?;
+    Some(join_folder(new, rest))
+}
 
 /// File name inside [`config_dir`].
 pub const CONFIG_FILE: &str = "connections.json";
@@ -110,7 +141,7 @@ fn default_ssh_port() -> u16 {
 pub struct Connection {
     /// Unique name; also the keychain account for this connection's password.
     pub name: String,
-    /// Sidebar folder, typically an environment. Empty means no folder.
+    /// Sidebar folder path, like `RGG/storefront/bear`. Empty means no folder.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub folder: String,
     pub adapter: Adapter,
@@ -154,10 +185,30 @@ impl Connection {
     }
 }
 
+/// A folder with what's directly inside it. The root has an empty path.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FolderNode<'a> {
+    pub path: String,
+    pub folders: Vec<FolderNode<'a>>,
+    pub connections: Vec<&'a Connection>,
+}
+
+impl FolderNode<'_> {
+    /// Connections in this folder and every folder below it.
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
+            + self
+                .folders
+                .iter()
+                .map(FolderNode::connection_count)
+                .sum::<usize>()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub version: u32,
-    /// Sidebar folders, so that empty ones are kept.
+    /// Sidebar folder paths, so that empty folders are kept.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<String>,
     #[serde(default)]
@@ -233,90 +284,122 @@ impl Config {
         Ok(())
     }
 
-    /// Folder names in display order, including empty folders.
+    /// Every folder path, parents before their children.
     pub fn folders(&self) -> Vec<String> {
-        let mut names: Vec<String> = self
-            .folders
-            .iter()
-            .cloned()
-            .chain(
-                self.connections
-                    .iter()
-                    .filter(|c| !c.folder.is_empty())
-                    .map(|c| c.folder.clone()),
-            )
-            .collect();
-        names.sort();
-        names.dedup();
-        names.sort_by_key(|n| n.to_lowercase());
-        names
-    }
-
-    /// Connections by folder: every folder in order, then those with no folder (`""`).
-    pub fn grouped(&self) -> Vec<(String, Vec<&Connection>)> {
-        let members = |folder: &str| {
-            let mut found: Vec<&Connection> = self
-                .connections
-                .iter()
-                .filter(|c| c.folder == folder)
-                .collect();
-            found.sort_by_key(|c| c.name.to_lowercase());
-            found
-        };
-        let mut groups: Vec<(String, Vec<&Connection>)> = self
-            .folders()
-            .into_iter()
-            .map(|folder| {
-                let found = members(&folder);
-                (folder, found)
-            })
-            .collect();
-        let loose = members("");
-        if !loose.is_empty() {
-            groups.push((String::new(), loose));
+        let mut paths = BTreeSet::new();
+        let saved = self.folders.iter().map(String::as_str);
+        let used = self.connections.iter().map(|c| c.folder.as_str());
+        for path in saved.chain(used).filter(|p| !p.is_empty()) {
+            let mut current = path;
+            while !current.is_empty() {
+                paths.insert(current.to_owned());
+                current = parent_of(current);
+            }
         }
-        groups
+        let mut paths: Vec<String> = paths.into_iter().collect();
+        paths.sort_by_key(|p| {
+            p.split(FOLDER_SEPARATOR)
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+        });
+        paths
     }
 
-    fn check_folder_name(&self, name: &str, current: Option<&str>) -> Result<()> {
+    /// The whole folder structure, from the root.
+    pub fn tree(&self) -> FolderNode<'_> {
+        self.node(String::new(), &self.folders())
+    }
+
+    fn node(&self, path: String, all: &[String]) -> FolderNode<'_> {
+        let folders = all
+            .iter()
+            .filter(|f| parent_of(f) == path)
+            .map(|f| self.node(f.clone(), all))
+            .collect();
+        let mut connections: Vec<&Connection> = self
+            .connections
+            .iter()
+            .filter(|c| c.folder == path)
+            .collect();
+        connections.sort_by_key(|c| c.name.to_lowercase());
+        FolderNode {
+            path,
+            folders,
+            connections,
+        }
+    }
+
+    fn check_folder_name(&self, parent: &str, name: &str, current: Option<&str>) -> Result<()> {
         if name.is_empty() {
             bail!("folder name is required");
         }
-        let taken = self
-            .folders()
-            .iter()
-            .any(|f| f.to_lowercase() == name.to_lowercase() && Some(f.as_str()) != current);
+        if name.contains(FOLDER_SEPARATOR) {
+            bail!("folder names can't contain \"{FOLDER_SEPARATOR}\"");
+        }
+        let taken = self.folders().iter().any(|f| {
+            parent_of(f) == parent
+                && folder_name(f).to_lowercase() == name.to_lowercase()
+                && Some(f.as_str()) != current
+        });
         if taken {
-            bail!("a folder named \"{name}\" already exists");
+            bail!("a folder named \"{name}\" already exists here");
         }
         Ok(())
     }
 
-    pub fn add_folder(&mut self, name: &str) -> Result<()> {
+    fn rewrite_folders(&mut self, old: &str, new: &str) {
+        let paths = self
+            .folders
+            .iter_mut()
+            .chain(self.connections.iter_mut().map(|c| &mut c.folder));
+        for path in paths {
+            if let Some(moved) = rebase_folder(path, old, new) {
+                *path = moved;
+            }
+        }
+        self.folders.retain(|f| !f.is_empty());
+    }
+
+    /// Creates a folder inside `parent` (`""` for the top level) and returns its path.
+    pub fn add_folder(&mut self, parent: &str, name: &str) -> Result<String> {
         let name = name.trim();
-        self.check_folder_name(name, None)?;
-        self.folders.push(name.to_owned());
-        Ok(())
+        self.check_folder_name(parent, name, None)?;
+        let path = join_folder(parent, name);
+        self.folders.push(path.clone());
+        Ok(path)
     }
 
-    /// Renames a folder and updates the connections inside it.
-    pub fn rename_folder(&mut self, old: &str, new: &str) -> Result<()> {
-        let new = new.trim();
-        self.check_folder_name(new, Some(old))?;
-        self.folders.retain(|f| f != old);
-        self.folders.push(new.to_owned());
-        for conn in self.connections.iter_mut().filter(|c| c.folder == old) {
-            conn.folder = new.to_owned();
-        }
-        Ok(())
+    /// Renames a folder, keeping what's inside it, and returns its new path.
+    pub fn rename_folder(&mut self, path: &str, new_name: &str) -> Result<String> {
+        let new_name = new_name.trim();
+        let parent = parent_of(path).to_owned();
+        self.check_folder_name(&parent, new_name, Some(path))?;
+        let new_path = join_folder(&parent, new_name);
+        self.rewrite_folders(path, &new_path);
+        Ok(new_path)
     }
 
-    /// Removes a folder. Its connections are kept and moved out of it.
-    pub fn remove_folder(&mut self, name: &str) {
-        self.folders.retain(|f| f != name);
-        for conn in self.connections.iter_mut().filter(|c| c.folder == name) {
-            conn.folder.clear();
+    /// Removes a folder. What's inside it moves up one level; nothing is deleted.
+    pub fn remove_folder(&mut self, path: &str) {
+        let parent = parent_of(path).to_owned();
+        self.folders.retain(|f| f != path);
+        self.rewrite_folders(path, &parent);
+    }
+
+    /// Moves a folder into `new_parent` (`""` for the top level). Returns the new path,
+    /// or `None` if it was already there.
+    pub fn move_folder(&mut self, path: &str, new_parent: &str) -> Result<Option<String>> {
+        if parent_of(path) == new_parent {
+            return Ok(None);
         }
+        if rebase_folder(new_parent, path, "").is_some() {
+            bail!("a folder can't be moved inside itself");
+        }
+        let name = folder_name(path).to_owned();
+        self.check_folder_name(new_parent, &name, None)?;
+        let new_path = join_folder(new_parent, &name);
+        self.rewrite_folders(path, &new_path);
+        Ok(Some(new_path))
     }
 
     /// Moves a connection into `folder` (`""` for none). Returns whether anything changed.
@@ -469,78 +552,145 @@ mod tests {
         assert!(config.upsert(conn, None).is_err());
     }
 
-    #[test]
-    fn connections_are_grouped_by_folder_with_loose_ones_last() {
-        let mut config = Config::default();
-        for (name, folder) in [("c", ""), ("b", "Prod"), ("a", "Prod"), ("d", "Dev")] {
-            let mut conn = pg(name);
-            conn.folder = folder.into();
-            config.upsert(conn, None).unwrap();
-        }
-        let grouped = config.grouped();
-        let groups: Vec<(&str, Vec<&str>)> = grouped
-            .iter()
-            .map(|(f, m)| (f.as_str(), m.iter().map(|c| c.name.as_str()).collect()))
-            .collect();
-        assert_eq!(
-            groups,
-            [
-                ("Dev", vec!["d"]),
-                ("Prod", vec!["a", "b"]),
-                ("", vec!["c"])
-            ]
-        );
-        assert_eq!(config.folders(), ["Dev", "Prod"]);
-    }
-
     fn in_folder(name: &str, folder: &str) -> Connection {
         let mut conn = pg(name);
         conn.folder = folder.into();
         conn
     }
 
-    #[test]
-    fn empty_folders_are_kept_and_grouped() {
-        let mut config = Config::default();
-        config.add_folder(" Local ").unwrap();
-        assert_eq!(config.folders(), ["Local"]);
-        assert_eq!(config.grouped(), [("Local".to_string(), vec![])]);
+    /// `(indented folder or connection)` lines, depth first.
+    fn outline(config: &Config) -> Vec<String> {
+        fn walk(node: &FolderNode<'_>, depth: usize, out: &mut Vec<String>) {
+            for folder in &node.folders {
+                out.push(format!(
+                    "{}{}/",
+                    "  ".repeat(depth),
+                    folder_name(&folder.path)
+                ));
+                walk(folder, depth + 1, out);
+            }
+            for conn in &node.connections {
+                out.push(format!("{}{}", "  ".repeat(depth), conn.name));
+            }
+        }
+        let mut out = Vec::new();
+        walk(&config.tree(), 0, &mut out);
+        out
     }
 
     #[test]
-    fn folder_names_must_be_present_and_unique() {
+    fn tree_nests_folders_before_connections_and_loose_ones_last() {
         let mut config = Config::default();
-        config.add_folder("Prod").unwrap();
-        assert!(config.add_folder("  ").is_err());
-        assert!(config.add_folder("prod").is_err());
+        for (name, folder) in [("z", ""), ("b", "Prod"), ("a", "Prod/EU"), ("d", "Dev")] {
+            config.upsert(in_folder(name, folder), None).unwrap();
+        }
+        assert_eq!(
+            outline(&config),
+            ["Dev/", "  d", "Prod/", "  EU/", "    a", "  b", "z"]
+        );
+        assert_eq!(config.folders(), ["Dev", "Prod", "Prod/EU"]);
     }
 
     #[test]
-    fn renaming_a_folder_updates_its_connections() {
+    fn folders_sort_by_level_not_by_raw_text() {
         let mut config = Config::default();
-        config.upsert(in_folder("a", "Prod"), None).unwrap();
-        config.rename_folder("Prod", "Live").unwrap();
-        assert_eq!(config.connections[0].folder, "Live");
-        assert_eq!(config.folders(), ["Live"]);
+        config.add_folder("", "a b").unwrap();
+        let a = config.add_folder("", "a").unwrap();
+        config.add_folder(&a, "z").unwrap();
+        assert_eq!(config.folders(), ["a", "a/z", "a b"]);
     }
 
     #[test]
-    fn renaming_a_folder_can_change_only_its_case_but_not_clash() {
+    fn empty_nested_folders_are_kept() {
         let mut config = Config::default();
-        config.add_folder("prod").unwrap();
-        config.add_folder("Dev").unwrap();
+        let top = config.add_folder("", " RGG ").unwrap();
+        let child = config.add_folder(&top, "storefront").unwrap();
+        assert_eq!(child, "RGG/storefront");
+        assert_eq!(outline(&config), ["RGG/", "  storefront/"]);
+    }
+
+    #[test]
+    fn empty_folders_survive_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let mut config = Config::default();
+        let top = config.add_folder("", "RGG").unwrap();
+        config.add_folder(&top, "storefront").unwrap();
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().folders(),
+            ["RGG", "RGG/storefront"]
+        );
+    }
+
+    #[test]
+    fn connection_count_includes_nested_folders() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "P"), None).unwrap();
+        config.upsert(in_folder("b", "P/Q"), None).unwrap();
+        let tree = config.tree();
+        assert_eq!(tree.folders[0].connection_count(), 2);
+    }
+
+    #[test]
+    fn folder_names_are_validated_per_level() {
+        let mut config = Config::default();
+        let p = config.add_folder("", "Prod").unwrap();
+        assert!(config.add_folder("", "  ").is_err());
+        assert!(config.add_folder("", "prod").is_err());
+        assert!(config.add_folder("", "a/b").is_err());
+        assert!(config.add_folder(&p, "prod").is_ok());
+    }
+
+    #[test]
+    fn renaming_a_folder_updates_everything_inside() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "P/Q"), None).unwrap();
+        config.upsert(in_folder("b", "P"), None).unwrap();
+        assert_eq!(config.rename_folder("P", "Live").unwrap(), "Live");
+        assert_eq!(config.find("a").unwrap().folder, "Live/Q");
+        assert_eq!(config.find("b").unwrap().folder, "Live");
+    }
+
+    #[test]
+    fn renaming_can_change_only_case_but_not_clash() {
+        let mut config = Config::default();
+        config.add_folder("", "prod").unwrap();
+        config.add_folder("", "Dev").unwrap();
         config.rename_folder("prod", "Prod").unwrap();
         assert!(config.rename_folder("Prod", "dev").is_err());
     }
 
     #[test]
-    fn removing_a_folder_keeps_its_connections() {
+    fn removing_a_folder_moves_its_contents_up_one_level() {
         let mut config = Config::default();
-        config.upsert(in_folder("a", "Prod"), None).unwrap();
-        config.remove_folder("Prod");
-        assert_eq!(config.connections.len(), 1);
-        assert_eq!(config.connections[0].folder, "");
-        assert!(config.folders().is_empty());
+        config.upsert(in_folder("a", "P/Q"), None).unwrap();
+        config.upsert(in_folder("b", "P/Q/R"), None).unwrap();
+        config.remove_folder("P/Q");
+        assert_eq!(config.find("a").unwrap().folder, "P");
+        assert_eq!(config.find("b").unwrap().folder, "P/R");
+        config.remove_folder("P");
+        assert_eq!(config.find("a").unwrap().folder, "");
+        assert_eq!(config.find("b").unwrap().folder, "R");
+    }
+
+    #[test]
+    fn folders_move_with_their_contents() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "P/Q"), None).unwrap();
+        config.add_folder("", "T").unwrap();
+        assert_eq!(config.move_folder("P/Q", "T").unwrap().unwrap(), "T/Q");
+        assert_eq!(config.find("a").unwrap().folder, "T/Q");
+        assert_eq!(config.move_folder("T/Q", "T").unwrap(), None);
+    }
+
+    #[test]
+    fn a_folder_cannot_move_inside_itself() {
+        let mut config = Config::default();
+        config.add_folder("", "P").unwrap();
+        config.add_folder("P", "Q").unwrap();
+        assert!(config.move_folder("P", "P/Q").is_err());
+        assert!(config.move_folder("P", "P").is_err());
     }
 
     #[test]
