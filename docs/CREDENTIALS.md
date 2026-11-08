@@ -1,6 +1,8 @@
 # Where config and credentials are stored
 
 Everything stays on your machine. TupleBase has no account, no cloud and no telemetry.
+The app only connects to your databases and, unless you turn it off, asks GitHub for
+new versions ([details](INSTALL.md#updates)).
 
 ## Connection settings
 

@@ -1,0 +1,9 @@
+{
+  // TupleBase config — safe to commit: secrets are never stored here.
+  "version": 1,
+  "groups": {
+    "local": {
+      "local-pg": { "adapter": "postgres", "host": "localhost", "port": 5432, "database": "tuplebase", "user": "tuplebase" }
+    }
+  }
+}

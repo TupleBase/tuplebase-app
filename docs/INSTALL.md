@@ -3,7 +3,7 @@
 ## From a release
 
 Download the file for your platform from
-[GitHub Releases](https://github.com/TupleBase/tuplebase-app/releases).
+[the releases page](https://github.com/TupleBase/tuplebase-releases/releases/latest).
 
 | Platform              | File                                 |
 | --------------------- | ------------------------------------ |
@@ -30,3 +30,12 @@ scripts/uninstall.sh   # remove it again; config and passwords stay
 | -------- | ------------------------------ | --------------------------- |
 | macOS    | `~/Applications/TupleBase.app` | `~/.local/bin/tuplebase-mcp` |
 | Linux    | `~/.local/bin/tuplebase-app`   | `~/.local/bin/tuplebase-mcp` |
+
+## Updates
+
+At startup the app asks GitHub whether a newer version exists. If one does, an **Update
+to x.y.z** button appears at the bottom of the sidebar and opens the download page.
+Install the new version over the old one; connections and passwords are kept.
+
+The check is one HTTPS request to GitHub. It sends no connection details or queries.
+Untick **Check for updates** in the sidebar to turn it off.
