@@ -357,6 +357,7 @@ impl Workspace {
                         let selected = self.selected.as_deref() == Some(c.name.as_str());
                         div()
                             .id(SharedString::from(format!("conn-{}", c.name)))
+                            .test_support()
                             .px_2()
                             .py_1()
                             .rounded_md()
@@ -520,7 +521,7 @@ mod tests {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                     Default::default(),
-                    size(px(1200.), px(780.)),
+                    size(px(1317.), px(877.)),
                 ))),
                 ..Default::default()
             };
@@ -578,6 +579,21 @@ mod tests {
             assert!(window.find("empty-add").visible());
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_connection_selects_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("conn-db", cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.selected.as_deref(), Some("db"));
+            assert!(matches!(this.status, Status::Busy(_)));
+        });
     }
 
     #[gpui_kit::test]

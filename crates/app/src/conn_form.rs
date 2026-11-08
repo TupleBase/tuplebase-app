@@ -148,12 +148,18 @@ impl Render for ConnForm {
             .max_w(px(560.))
             .child(div().text_lg().font_semibold().child(title))
             .child(row("Type", Select::new(&self.adapter)))
-            .child(row("Name", Input::new(&self.name)))
-            .child(row("Host", Input::new(&self.host)))
-            .child(row("Port", Input::new(&self.port)))
-            .child(row("Database", Input::new(&self.database)))
-            .child(row("User", Input::new(&self.user)))
-            .child(row("Password", Input::new(&self.password).mask_toggle()))
+            .child(row("Name", Input::new(&self.name).id("conn-name")))
+            .child(row("Host", Input::new(&self.host).id("conn-host")))
+            .child(row("Port", Input::new(&self.port).id("conn-port")))
+            .child(row(
+                "Database",
+                Input::new(&self.database).id("conn-database"),
+            ))
+            .child(row("User", Input::new(&self.user).id("conn-user")))
+            .child(row(
+                "Password",
+                Input::new(&self.password).id("conn-password").mask_toggle(),
+            ))
             .child(row(
                 "",
                 Checkbox::new("readonly")
