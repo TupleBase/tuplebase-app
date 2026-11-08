@@ -40,6 +40,8 @@ fn connection(adapter: Adapter) -> Connection {
         database: "app".into(),
         user: "dev".into(),
         readonly: false,
+        tls: Default::default(),
+        ssh: None,
     }
 }
 

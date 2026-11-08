@@ -94,6 +94,7 @@ impl Server {
                         "host": c.host,
                         "port": c.port,
                         "database": c.database,
+                        "via_ssh": c.ssh.is_some(),
                         "writable": self.allow_writes && !c.readonly,
                     })
                 })

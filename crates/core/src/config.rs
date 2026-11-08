@@ -59,6 +59,53 @@ impl Adapter {
     }
 }
 
+/// How strictly to require an encrypted connection to the database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// Encrypt if the server supports it.
+    #[default]
+    Prefer,
+    /// Refuse to connect without encryption.
+    Require,
+    /// Also verify the server's certificate and hostname.
+    Verify,
+}
+
+impl TlsMode {
+    pub const ALL: [TlsMode; 3] = [TlsMode::Prefer, TlsMode::Require, TlsMode::Verify];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TlsMode::Prefer => "If available",
+            TlsMode::Require => "Required",
+            TlsMode::Verify => "Verified",
+        }
+    }
+
+    fn is_default(&self) -> bool {
+        *self == TlsMode::default()
+    }
+}
+
+/// Reach the database through this SSH server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub user: String,
+    /// Private key file. Empty means password authentication.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_path: String,
+    /// The server's key as `SHA256:…`; connections are refused if it doesn't match.
+    pub fingerprint: String,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     /// Unique name; also the keychain account for this connection's password.
@@ -75,6 +122,10 @@ pub struct Connection {
     /// Blocks writes from the app and from agents.
     #[serde(default)]
     pub readonly: bool,
+    #[serde(default, skip_serializing_if = "TlsMode::is_default")]
+    pub tls: TlsMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshConfig>,
 }
 
 impl Connection {
@@ -87,6 +138,17 @@ impl Connection {
         }
         if self.user.trim().is_empty() {
             bail!("user is required for \"{}\"", self.name);
+        }
+        if let Some(ssh) = &self.ssh {
+            if ssh.host.trim().is_empty() || ssh.user.trim().is_empty() {
+                bail!("SSH host and user are required for \"{}\"", self.name);
+            }
+            if !ssh.fingerprint.trim().starts_with("SHA256:") {
+                bail!("the SSH server fingerprint must look like SHA256:…");
+            }
+            if self.tls == TlsMode::Verify {
+                bail!("certificates can't be verified through an SSH tunnel; use Required");
+            }
         }
         Ok(())
     }
@@ -311,6 +373,8 @@ mod tests {
             database: "app".into(),
             user: "dev".into(),
             readonly: false,
+            tls: TlsMode::default(),
+            ssh: None,
         }
     }
 
@@ -322,6 +386,44 @@ mod tests {
             Adapter::Mysql.preview_sql("app", "users"),
             "SELECT * FROM `app`.`users` LIMIT 100"
         );
+    }
+
+    fn ssh() -> SshConfig {
+        SshConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "me".into(),
+            key_path: String::new(),
+            fingerprint: "SHA256:abc".into(),
+        }
+    }
+
+    #[test]
+    fn ssh_needs_a_fingerprint() {
+        let mut config = Config::default();
+        let mut conn = pg("a");
+        conn.ssh = Some(SshConfig {
+            fingerprint: String::new(),
+            ..ssh()
+        });
+        assert!(config.upsert(conn, None).is_err());
+    }
+
+    #[test]
+    fn certificate_verification_is_refused_through_a_tunnel() {
+        let mut config = Config::default();
+        let mut conn = pg("a");
+        conn.ssh = Some(ssh());
+        conn.tls = TlsMode::Verify;
+        assert!(config.upsert(conn.clone(), None).is_err());
+        conn.tls = TlsMode::Require;
+        assert!(config.upsert(conn, None).is_ok());
+    }
+
+    #[test]
+    fn default_tls_and_no_ssh_are_not_written() {
+        let json = serde_json::to_string(&pg("a")).unwrap();
+        assert!(!json.contains("tls") && !json.contains("ssh"));
     }
 
     #[test]

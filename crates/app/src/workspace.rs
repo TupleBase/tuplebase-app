@@ -362,11 +362,13 @@ impl Workspace {
             ConnFormEvent::Save {
                 connection,
                 password,
+                ssh_password,
                 previous,
             } => this.save_connection(
                 form,
                 connection.clone(),
                 password.clone(),
+                ssh_password.clone(),
                 previous.clone(),
                 cx,
             ),
@@ -385,6 +387,7 @@ impl Workspace {
         form: Entity<ConnForm>,
         connection: Connection,
         password: Option<String>,
+        ssh_password: Option<String>,
         previous: Option<String>,
         cx: &mut Context<Self>,
     ) {
@@ -401,18 +404,14 @@ impl Workspace {
             let result = blocking(move || {
                 saved.save()?;
                 let renamed = previous.as_ref().filter(|p| **p != connection.name);
-                match (&password, renamed) {
-                    (Some(pw), _) => secrets::set_password(&connection.name, pw)?,
-                    // Renamed without retyping the password: move the stored one.
-                    (None, Some(old)) => {
-                        if let Some(pw) = secrets::get_password(old)? {
-                            secrets::set_password(&connection.name, &pw)?;
-                        }
-                    }
-                    (None, None) => {}
-                }
                 if let Some(old) = renamed {
-                    secrets::delete_password(old)?;
+                    secrets::rename(old, &connection.name)?;
+                }
+                if let Some(pw) = &password {
+                    secrets::set_password(&connection.name, pw)?;
+                }
+                if let Some(secret) = &ssh_password {
+                    secrets::set_ssh_password(&connection.name, secret)?;
                 }
                 Ok(previous)
             })
@@ -477,7 +476,7 @@ impl Workspace {
             let forget_name = name.clone();
             let result = blocking(move || {
                 config.save()?;
-                secrets::delete_password(&name)
+                secrets::delete_all(&name)
             })
             .await;
             io(async move {
@@ -1179,6 +1178,8 @@ mod tests {
             database: "app".into(),
             user: "dev".into(),
             readonly: false,
+            tls: Default::default(),
+            ssh: None,
         };
         config.upsert(conn, None).unwrap();
         config
@@ -1301,6 +1302,38 @@ mod tests {
         });
         cx.run_until_parked();
         result.unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn ssh_fields_appear_and_require_a_fingerprint(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-ssh-host").is_none());
+            window.click("use-ssh", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("conn-ssh-host").bounds().size.width > px(0.));
+            window.click("conn-name", cx);
+            window.input("tunneled", cx);
+            window.click("conn-host", cx);
+            window.input("db", cx);
+            window.click("conn-user", cx);
+            window.input("me", cx);
+            // The longer form scrolls, so bring Save into view.
+            window.scroll(
+                "conn-form",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2000.))),
+                cx,
+            );
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert!(this.config.connections.is_empty());
+            let form = this.form.as_ref().expect("form stays open").read(cx);
+            assert!(form.error.is_some());
+        });
     }
 
     #[gpui_kit::test]

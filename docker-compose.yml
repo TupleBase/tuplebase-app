@@ -25,3 +25,20 @@ services:
       test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -udev -pdev app -e 'select 1 from users limit 1'"]
       interval: 2s
       retries: 30
+  # SSH bastion for tunnel tests; it reaches the databases by service name.
+  sshd:
+    image: alpine:3.22
+    command:
+      - sh
+      - -c
+      - |
+        apk add --no-cache openssh >/dev/null
+        ssh-keygen -A >/dev/null
+        adduser -D -s /bin/sh dev
+        echo dev:dev | chpasswd
+        exec /usr/sbin/sshd -D -e -o AllowTcpForwarding=yes -o PasswordAuthentication=yes
+    ports: ["52222:22"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+      interval: 2s
+      retries: 30

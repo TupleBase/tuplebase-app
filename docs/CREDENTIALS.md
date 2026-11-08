@@ -28,6 +28,10 @@ Passwords are kept in the operating system's credential store, under service
 | Windows | Credential Manager                                          |
 | Linux   | Secret Service (GNOME Keyring, KWallet); one must be running |
 
+SSH tunnel passwords and private key passphrases are stored the same way, with the
+account `<connection>#ssh`. Private key files stay where they are; only their path is
+saved.
+
 The app and the MCP server read the same entries, so agent configs never contain a
 password.
 
@@ -40,6 +44,7 @@ after an update.
 `TUPLEBASE_SECRET_<NAME>_PASSWORD` takes priority over the store, for headless machines
 and CI. `<NAME>` is the connection name upper-cased, with every non-alphanumeric
 character replaced by `_`: connection `app-db` reads `TUPLEBASE_SECRET_APP_DB_PASSWORD`.
+`TUPLEBASE_SECRET_<NAME>_SSH_PASSWORD` does the same for the SSH password or passphrase.
 
 ## Removing everything
 

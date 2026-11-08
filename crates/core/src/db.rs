@@ -10,14 +10,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
+use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgSslMode};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo, ValueRef};
 use tokio::sync::Mutex;
 
-use crate::config::{Adapter, Connection};
+use crate::config::{Adapter, Connection, TlsMode};
+use crate::ssh::{self, Tunnel};
 use crate::{safety, secrets};
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,9 +68,22 @@ impl Pool {
     }
 }
 
+/// An open connection pool, and the SSH tunnel it runs through, if any.
+struct Open {
+    config: Connection,
+    pool: Pool,
+    tunnel: Option<Tunnel>,
+}
+
+impl Open {
+    fn is_usable_for(&self, conn: &Connection) -> bool {
+        same_target(&self.config, conn) && self.tunnel.as_ref().is_none_or(Tunnel::is_alive)
+    }
+}
+
 #[derive(Default)]
 pub struct Db {
-    pools: Mutex<HashMap<String, (Connection, Pool)>>,
+    pools: Mutex<HashMap<String, Open>>,
 }
 
 impl Db {
@@ -88,8 +102,8 @@ impl Db {
 
     /// Closes and drops the cached pool, e.g. after the connection was edited.
     pub async fn forget(&self, name: &str) {
-        if let Some((_, pool)) = self.pools.lock().await.remove(name) {
-            pool.close().await;
+        if let Some(open) = self.pools.lock().await.remove(name) {
+            open.pool.close().await;
         }
     }
 
@@ -214,19 +228,40 @@ impl Db {
 
     async fn pool(&self, conn: &Connection) -> Result<Pool> {
         let mut pools = self.pools.lock().await;
-        if let Some((cached, pool)) = pools.get(&conn.name)
-            && same_target(cached, conn)
+        if let Some(open) = pools.get(&conn.name)
+            && open.is_usable_for(conn)
         {
-            return Ok(pool.clone());
+            return Ok(open.pool.clone());
         }
         let name = conn.name.clone();
         // Keychain access can block (or show an OS prompt), so keep it off the runtime.
         let password = tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??;
-        let pool = open_pool(conn, password)
+        let tunnel = match &conn.ssh {
+            None => None,
+            Some(config) => {
+                let name = conn.name.clone();
+                let secret =
+                    tokio::task::spawn_blocking(move || secrets::get_ssh_password(&name)).await??;
+                let tunnel = ssh::open(conn, config, secret)
+                    .await
+                    .with_context(|| format!("opening the SSH tunnel for \"{}\"", conn.name))?;
+                Some(tunnel)
+            }
+        };
+        let (host, port) = match &tunnel {
+            Some(tunnel) => ("127.0.0.1", tunnel.local_port()),
+            None => (conn.host.as_str(), conn.port),
+        };
+        let pool = open_pool(conn, host, port, password)
             .await
             .with_context(|| format!("connecting to \"{}\"", conn.name))?;
-        if let Some((_, old)) = pools.insert(conn.name.clone(), (conn.clone(), pool.clone())) {
-            old.close().await;
+        let open = Open {
+            config: conn.clone(),
+            pool: pool.clone(),
+            tunnel,
+        };
+        if let Some(old) = pools.insert(conn.name.clone(), open) {
+            old.pool.close().await;
         }
         Ok(pool)
     }
@@ -239,14 +274,25 @@ fn same_target(a: &Connection, b: &Connection) -> bool {
     a == *b
 }
 
-async fn open_pool(conn: &Connection, password: Option<String>) -> Result<Pool> {
+/// Connects to `host:port`, which is the local end of the tunnel when there is one.
+async fn open_pool(
+    conn: &Connection,
+    host: &str,
+    port: u16,
+    password: Option<String>,
+) -> Result<Pool> {
     let timeout = Duration::from_secs(10);
     Ok(match conn.adapter {
         Adapter::Postgres => {
             let mut opts = PgConnectOptions::new()
-                .host(&conn.host)
-                .port(conn.port)
-                .username(&conn.user);
+                .host(host)
+                .port(port)
+                .username(&conn.user)
+                .ssl_mode(match conn.tls {
+                    TlsMode::Prefer => PgSslMode::Prefer,
+                    TlsMode::Require => PgSslMode::Require,
+                    TlsMode::Verify => PgSslMode::VerifyFull,
+                });
             if !conn.database.is_empty() {
                 opts = opts.database(&conn.database);
             }
@@ -262,9 +308,14 @@ async fn open_pool(conn: &Connection, password: Option<String>) -> Result<Pool> 
         }
         Adapter::Mariadb | Adapter::Mysql => {
             let mut opts = MySqlConnectOptions::new()
-                .host(&conn.host)
-                .port(conn.port)
-                .username(&conn.user);
+                .host(host)
+                .port(port)
+                .username(&conn.user)
+                .ssl_mode(match conn.tls {
+                    TlsMode::Prefer => MySqlSslMode::Preferred,
+                    TlsMode::Require => MySqlSslMode::Required,
+                    TlsMode::Verify => MySqlSslMode::VerifyIdentity,
+                });
             if !conn.database.is_empty() {
                 opts = opts.database(&conn.database);
             }

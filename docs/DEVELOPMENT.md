@@ -32,5 +32,6 @@ Local databases, user `dev`, password `dev`, database `app`:
 | ---------- | ----- |
 | PostgreSQL | 55432 |
 | MariaDB    | 53306 |
+| SSH server | 52222 |
 
 `TUPLEBASE_IT_KEYCHAIN=1` also runs a round trip against the real OS credential store.
