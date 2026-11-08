@@ -18,6 +18,7 @@ fn glyph(adapter: Adapter) -> &'static [u8] {
         Adapter::Postgres => include_bytes!("../../../assets/logos/postgresql.svg"),
         Adapter::Mariadb => include_bytes!("../../../assets/logos/mariadb.svg"),
         Adapter::Mysql => include_bytes!("../../../assets/logos/mysql.svg"),
+        Adapter::Sqlite => include_bytes!("../../../assets/logos/sqlite.svg"),
     }
 }
 
@@ -30,6 +31,8 @@ fn default_color(adapter: Adapter, dark: bool) -> u32 {
         (Adapter::Mariadb, true) => 0xC0765A,
         (Adapter::Mysql, false) => 0x00758F,
         (Adapter::Mysql, true) => 0x4FB3CE,
+        (Adapter::Sqlite, false) => 0x0F80CC,
+        (Adapter::Sqlite, true) => 0x5AB3E8,
     }
 }
 

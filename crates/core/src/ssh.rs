@@ -92,7 +92,7 @@ impl Drop for Tunnel {
     }
 }
 
-fn expand_home(path: &str) -> PathBuf {
+pub(crate) fn expand_home(path: &str) -> PathBuf {
     match (path.strip_prefix("~/"), directories::BaseDirs::new()) {
         (Some(rest), Some(dirs)) => dirs.home_dir().join(rest),
         _ => PathBuf::from(path),

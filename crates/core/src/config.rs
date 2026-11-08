@@ -53,23 +53,35 @@ pub enum Adapter {
     Postgres,
     Mariadb,
     Mysql,
+    Sqlite,
 }
 
 impl Adapter {
-    pub const ALL: [Adapter; 3] = [Adapter::Postgres, Adapter::Mariadb, Adapter::Mysql];
+    pub const ALL: [Adapter; 4] = [
+        Adapter::Postgres,
+        Adapter::Mariadb,
+        Adapter::Mysql,
+        Adapter::Sqlite,
+    ];
+
+    /// Whether the database is a local file, with no server, user or password.
+    pub fn is_file(self) -> bool {
+        self == Adapter::Sqlite
+    }
 
     pub fn label(self) -> &'static str {
         match self {
             Adapter::Postgres => "PostgreSQL",
             Adapter::Mariadb => "MariaDB",
             Adapter::Mysql => "MySQL",
+            Adapter::Sqlite => "SQLite",
         }
     }
 
     /// Quotes an identifier for this database.
     pub fn quote_ident(self, ident: &str) -> String {
         match self {
-            Adapter::Postgres => format!("\"{}\"", ident.replace('"', "\"\"")),
+            Adapter::Postgres | Adapter::Sqlite => format!("\"{}\"", ident.replace('"', "\"\"")),
             Adapter::Mariadb | Adapter::Mysql => format!("`{}`", ident.replace('`', "``")),
         }
     }
@@ -87,6 +99,7 @@ impl Adapter {
         match self {
             Adapter::Postgres => 5432,
             Adapter::Mariadb | Adapter::Mysql => 3306,
+            Adapter::Sqlite => 0,
         }
     }
 }
@@ -164,15 +177,37 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Where it connects to, for display: the host, or a database file's name.
+    pub fn location(&self) -> String {
+        if self.adapter.is_file() {
+            let name = Path::new(&self.database).file_name();
+            name.map_or_else(
+                || self.database.clone(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        } else {
+            self.host.clone()
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("connection name is required");
         }
-        if self.host.trim().is_empty() {
-            bail!("host is required for \"{}\"", self.name);
-        }
-        if self.user.trim().is_empty() {
-            bail!("user is required for \"{}\"", self.name);
+        if self.adapter.is_file() {
+            if self.database.trim().is_empty() {
+                bail!("a database file is required for \"{}\"", self.name);
+            }
+            if self.ssh.is_some() {
+                bail!("SSH tunnels don't apply to database files");
+            }
+        } else {
+            if self.host.trim().is_empty() {
+                bail!("host is required for \"{}\"", self.name);
+            }
+            if self.user.trim().is_empty() {
+                bail!("user is required for \"{}\"", self.name);
+            }
         }
         let color_is_valid = self.color.is_empty()
             || (self.color.len() == 7
@@ -505,6 +540,32 @@ mod tests {
         conn.name = "b".into();
         conn.color = "blue".into();
         assert!(config.upsert(conn, None).is_err());
+    }
+
+    fn sqlite(file: &str) -> Connection {
+        Connection {
+            adapter: Adapter::Sqlite,
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+            database: file.into(),
+            ..pg("file")
+        }
+    }
+
+    #[test]
+    fn sqlite_needs_a_file_but_no_host_or_user() {
+        let mut config = Config::default();
+        assert!(config.upsert(sqlite(""), None).is_err());
+        assert!(config.upsert(sqlite("/data/app.sqlite"), None).is_ok());
+        assert_eq!(config.connections[0].location(), "app.sqlite");
+    }
+
+    #[test]
+    fn sqlite_cannot_use_a_tunnel() {
+        let mut conn = sqlite("/data/app.sqlite");
+        conn.ssh = Some(ssh());
+        assert!(Config::default().upsert(conn, None).is_err());
     }
 
     #[test]

@@ -29,13 +29,14 @@ or `mcp`.
 5. **Agents are read-only by default.** Writes need both the MCP opt-in and a writable
    connection. Never weaken the guard in `core/src/safety.rs` and `core/src/db.rs`:
    read keyword allowlist, prepared statements (one statement only), server-enforced
-   read-only transaction.
+   read-only transaction (`PRAGMA query_only` on SQLite, which has no such transaction).
 6. **Pin pre-1.0 UI dependencies exactly** (`gpui-kit = "=x.y.z"`) and upgrade them in
    a dedicated commit.
 7. **Add a crate only for a real boundary**, such as a separate binary or a reusable
    library, not to mirror folders.
 8. **Pure-Rust dependencies by default.** Avoid C libraries (prefer `rustls` over
-   OpenSSL) so all three platforms build without extra system setup.
+   OpenSSL) so all three platforms build without extra system setup. SQLite is compiled
+   into the app by `sqlx`.
 9. **Test logic in `core`.** Cover UI flows with the headless GPUI tests in `app`.
 
 ## Toolchain

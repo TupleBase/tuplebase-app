@@ -143,7 +143,7 @@ impl ConnForm {
                 }
             }
         };
-        let ssh = if self.use_ssh {
+        let ssh = if self.use_ssh && !self.adapter.is_file() {
             let Some(port) = self.ssh_port_value(cx) else {
                 self.error = Some("SSH port must be a number.".into());
                 cx.notify();
@@ -159,6 +159,7 @@ impl ConnForm {
         } else {
             None
         };
+        let uses_ssh = ssh.is_some();
         let password = text(&self.password, cx);
         let ssh_password = text(&self.ssh_password, cx);
         cx.emit(ConnFormEvent::Save {
@@ -176,7 +177,7 @@ impl ConnForm {
                 ssh,
             },
             password: (!password.is_empty()).then_some(password),
-            ssh_password: (self.use_ssh && !ssh_password.is_empty()).then_some(ssh_password),
+            ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),
             previous: self.previous.clone(),
         });
     }
@@ -375,6 +376,7 @@ fn field(label: &'static str, control: impl IntoElement) -> Div {
 
 impl Render for ConnForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_file = self.adapter.is_file();
         let title = if self.previous.is_some() {
             "Edit connection"
         } else {
@@ -409,46 +411,52 @@ impl Render for ConnForm {
                                     .collect::<Vec<_>>(),
                             ),
                         ))
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .child(field("Host", Input::new(&self.host).id("conn-host")))
-                                .child(
-                                    div().w(px(120.)).child(field(
+                        .when(is_file, |el| {
+                            el.child(field(
+                                "Database file",
+                                Input::new(&self.database).id("conn-database"),
+                            ))
+                        })
+                        .when(!is_file, |el| {
+                            el.child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(field("Host", Input::new(&self.host).id("conn-host")))
+                                    .child(div().w(px(120.)).child(field(
                                         "Port",
                                         Input::new(&self.port).id("conn-port"),
-                                    )),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .child(field(
-                                    "Database",
-                                    Input::new(&self.database).id("conn-database"),
-                                ))
-                                .child(field("User", Input::new(&self.user).id("conn-user"))),
-                        )
-                        .child(field(
-                            "Password",
-                            Input::new(&self.password).id("conn-password").mask_toggle(),
-                        ))
-                        .child(field(
-                            "Encryption",
-                            h_flex()
-                                .gap_2()
-                                .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
-                        ))
-                        .child(
-                            Checkbox::new("use-ssh")
-                                .label("Connect through an SSH tunnel")
-                                .checked(self.use_ssh)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.use_ssh = *checked;
-                                    cx.notify();
-                                })),
-                        )
-                        .when(self.use_ssh, |el| el.child(self.render_ssh(cx)))
+                                    ))),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .child(field(
+                                        "Database",
+                                        Input::new(&self.database).id("conn-database"),
+                                    ))
+                                    .child(field("User", Input::new(&self.user).id("conn-user"))),
+                            )
+                            .child(field(
+                                "Password",
+                                Input::new(&self.password).id("conn-password").mask_toggle(),
+                            ))
+                            .child(field(
+                                "Encryption",
+                                h_flex()
+                                    .gap_2()
+                                    .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
+                            ))
+                            .child(
+                                Checkbox::new("use-ssh")
+                                    .label("Connect through an SSH tunnel")
+                                    .checked(self.use_ssh)
+                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                        this.use_ssh = *checked;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(self.use_ssh, |el| el.child(self.render_ssh(cx)))
+                        })
                         .child(
                             Checkbox::new("readonly")
                                 .label("Read-only: block writes from the app and from agents")

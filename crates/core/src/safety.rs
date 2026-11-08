@@ -45,6 +45,7 @@ pub fn trim_statement(sql: &str) -> &str {
 /// PostgreSQL dollar quotes. Comment-only pieces are dropped.
 pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
     let postgres = adapter == Adapter::Postgres;
+    let mysql = matches!(adapter, Adapter::Mariadb | Adapter::Mysql);
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let (mut start, mut i, mut has_content) = (0, 0, false);
@@ -65,7 +66,7 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
                 i += rest.find('\n').unwrap_or(rest.len());
                 continue;
             }
-            b'#' if !postgres => {
+            b'#' if mysql => {
                 i += rest.find('\n').unwrap_or(rest.len());
                 continue;
             }
@@ -82,7 +83,7 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
                     && i > 0
                     && bytes[i - 1].eq_ignore_ascii_case(&b'e')
                     && (i == 1 || !is_word(bytes[i - 2]));
-                let backslashes = quote != b'`' && (!postgres || escape_string);
+                let backslashes = quote != b'`' && (mysql || escape_string);
                 i += quoted_len(&bytes[i..], quote, backslashes);
             }
             b'$' if postgres && (i == 0 || !is_word(bytes[i - 1])) => {
@@ -280,6 +281,12 @@ mod tests {
             split(Adapter::Postgres, r"select E'a\';b'; select 2").len(),
             2
         );
+    }
+
+    #[test]
+    fn sqlite_has_no_backslash_escapes_or_hash_comments() {
+        assert_eq!(split(Adapter::Sqlite, r"select 'a\'; select 2").len(), 2);
+        assert_eq!(split(Adapter::Sqlite, "select `a;b`; select 2").len(), 2);
     }
 
     #[test]

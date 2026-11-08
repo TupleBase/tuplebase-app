@@ -1275,7 +1275,7 @@ impl Workspace {
                     .truncate()
                     .text_xs()
                     .text_color(muted)
-                    .child(conn.host.clone()),
+                    .child(conn.location()),
             )
             .on_drag(
                 DraggedConnection {
@@ -1765,6 +1765,22 @@ mod tests {
         });
         cx.run_until_parked();
         result.unwrap()
+    }
+
+    #[gpui_kit::test]
+    fn sqlite_only_asks_for_a_file(cx: &mut TestAppContext) {
+        let (handle, _) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-host").is_some());
+            window.click("adapter-SQLite", cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("conn-host").is_none());
+            assert!(window.try_find("conn-password").is_none());
+            assert!(window.try_find("use-ssh").is_none());
+            assert!(window.try_find("conn-database").is_some());
+        });
     }
 
     #[gpui_kit::test]

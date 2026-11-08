@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgSslMode};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement, TypeInfo, ValueRef};
@@ -68,6 +69,7 @@ pub struct ExecOptions {
 enum Pool {
     Pg(PgPool),
     My(MySqlPool),
+    Sqlite(SqlitePool),
 }
 
 impl Pool {
@@ -75,6 +77,7 @@ impl Pool {
         match self {
             Pool::Pg(p) => p.close().await,
             Pool::My(p) => p.close().await,
+            Pool::Sqlite(p) => p.close().await,
         }
     }
 }
@@ -116,6 +119,7 @@ impl Db {
         match self.pool(conn).await? {
             Pool::Pg(p) => p.execute("SELECT 1").await.map(drop)?,
             Pool::My(p) => p.execute("SELECT 1").await.map(drop)?,
+            Pool::Sqlite(p) => p.execute("SELECT 1").await.map(drop)?,
         }
         Ok(())
     }
@@ -141,6 +145,12 @@ impl Db {
         let statement = safety::trim_statement(sql);
         if statement.is_empty() {
             bail!("nothing to run");
+        }
+        // SQLite will run several statements from one call, unlike the server databases.
+        if (opts.read_only || conn.readonly)
+            && safety::split_statements(conn.adapter, statement).len() > 1
+        {
+            bail!("read-only: run one statement at a time");
         }
         Ok(self.run(conn, &[statement], opts).await?.result)
     }
@@ -179,14 +189,14 @@ impl Db {
         let mut changed = false;
 
         macro_rules! run_all {
-            ($pool:expr, $begin:literal, $decode:ident) => {{
+            ($pool:expr, $begin:literal, $end:literal, $decode:ident) => {{
                 let mut c = $pool.acquire().await?;
                 for (index, sql) in statements.iter().copied().enumerate() {
                     if read_only {
                         c.execute($begin).await?;
                     }
                     let out = run!(&mut *c, sql, opts.max_rows, $decode);
-                    if read_only && c.execute("ROLLBACK").await.is_err() {
+                    if read_only && c.execute($end).await.is_err() {
                         c.close_on_drop();
                     }
                     let result = if total > 1 {
@@ -202,8 +212,17 @@ impl Db {
             }};
         }
         match self.pool(conn).await? {
-            Pool::Pg(pool) => run_all!(pool, "BEGIN READ ONLY", pg_value),
-            Pool::My(pool) => run_all!(pool, "START TRANSACTION READ ONLY", my_value),
+            Pool::Pg(pool) => run_all!(pool, "BEGIN READ ONLY", "ROLLBACK", pg_value),
+            Pool::My(pool) => {
+                run_all!(pool, "START TRANSACTION READ ONLY", "ROLLBACK", my_value)
+            }
+            // SQLite has no read-only transactions; this switch makes it refuse writes.
+            Pool::Sqlite(pool) => run_all!(
+                pool,
+                "PRAGMA query_only = ON",
+                "PRAGMA query_only = OFF",
+                sqlite_value
+            ),
         }
 
         let mut result = shown.expect("callers pass at least one statement");
@@ -237,6 +256,15 @@ impl Db {
                 .fetch_all(&p)
                 .await?
             }
+            Pool::Sqlite(p) => {
+                sqlx::query_as(
+                    "SELECT DISTINCT p.name FROM sqlite_master m \
+                     JOIN pragma_table_info(m.name) p \
+                     WHERE m.type IN ('table', 'view') ORDER BY 1 LIMIT 5000",
+                )
+                .fetch_all(&p)
+                .await?
+            }
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
@@ -260,6 +288,16 @@ impl Db {
                      WHERE table_schema NOT IN \
                      ('mysql', 'information_schema', 'performance_schema', 'sys') \
                      ORDER BY 1, 2",
+                )
+                .fetch_all(&p)
+                .await?
+            }
+            Pool::Sqlite(p) => {
+                sqlx::query_as(
+                    "SELECT 'main', name, \
+                     CASE type WHEN 'view' THEN 'VIEW' ELSE 'BASE TABLE' END \
+                     FROM sqlite_master \
+                     WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
                 )
                 .fetch_all(&p)
                 .await?
@@ -302,6 +340,20 @@ impl Db {
                 .bind(table)
                 .fetch_all(&p)
                 .await?
+            }
+            Pool::Sqlite(p) => {
+                let columns: Vec<(String, String, i64)> =
+                    sqlx::query_as("SELECT name, type, \"notnull\" FROM pragma_table_info(?)")
+                        .bind(table)
+                        .fetch_all(&p)
+                        .await?;
+                columns
+                    .into_iter()
+                    .map(|(name, data_type, not_null)| {
+                        let nullable = if not_null == 0 { "YES" } else { "NO" };
+                        (name, data_type, nullable.to_owned())
+                    })
+                    .collect()
             }
         };
         if rows.is_empty() {
@@ -360,7 +412,11 @@ impl Db {
 async fn connect(conn: &Connection) -> Result<Open> {
     let name = conn.name.clone();
     // Keychain access can block (or show an OS prompt), so keep it off the runtime.
-    let password = tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??;
+    let password = if conn.adapter.is_file() {
+        None
+    } else {
+        tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??
+    };
     let tunnel = match &conn.ssh {
         None => None,
         Some(config) => {
@@ -426,6 +482,17 @@ async fn open_pool(
                 .connect_with(opts)
                 .await?;
             Pool::Pg(pool)
+        }
+        Adapter::Sqlite => {
+            let opts = SqliteConnectOptions::new()
+                .filename(ssh::expand_home(&conn.database))
+                .read_only(conn.readonly);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(4)
+                .acquire_timeout(timeout)
+                .connect_with(opts)
+                .await?;
+            Pool::Sqlite(pool)
         }
         Adapter::Mariadb | Adapter::Mysql => {
             let mut opts = MySqlConnectOptions::new()
@@ -564,6 +631,21 @@ fn pg_value(row: &PgRow, i: usize) -> Value {
         DateTime<Utc> => text,
         NaiveDate => text,
         NaiveTime => text,
+        Vec<u8> => bytes,
+    );
+    fallback(row, i, &type_name)
+}
+
+fn sqlite_value(row: &SqliteRow, i: usize) -> Value {
+    let type_name = match row.try_get_raw(i) {
+        Ok(raw) if raw.is_null() => return Value::Null,
+        Ok(raw) => raw.type_info().name().to_owned(),
+        Err(e) => return Value::String(format!("<{e}>")),
+    };
+    decode_first!(row, i;
+        i64 => |v: i64| json!(v),
+        f64 => |v: f64| json!(v),
+        String => Value::String,
         Vec<u8> => bytes,
     );
     fallback(row, i, &type_name)
