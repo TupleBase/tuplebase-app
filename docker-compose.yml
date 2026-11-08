@@ -1,0 +1,27 @@
+# Local databases for development and integration tests.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: dev
+      POSTGRES_DB: app
+    ports: ["55432:5432"]
+    volumes: ["./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U dev -d app -c 'select 1 from users limit 1'"]
+      interval: 2s
+      retries: 30
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_USER: dev
+      MARIADB_PASSWORD: dev
+      MARIADB_DATABASE: app
+      MARIADB_ROOT_PASSWORD: root
+    ports: ["53306:3306"]
+    volumes: ["./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -udev -pdev app -e 'select 1 from users limit 1'"]
+      interval: 2s
+      retries: 30
