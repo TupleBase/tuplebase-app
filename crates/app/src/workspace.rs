@@ -2955,7 +2955,8 @@ mod tests {
         cx.update(|cx| assert!(!workspace.read(cx).config.check_for_updates));
         window_action(handle, cx, |window, cx| {
             assert_eq!(window.find("check-updates").checked(), Some(false));
-            window.click("close", cx);
+            // Scoped: on Windows the title bar has a "close" button too.
+            window.within("surface").click("close", cx);
         });
         window_action(handle, cx, |window, cx| {
             assert!(!window.has_active_dialog(cx));
