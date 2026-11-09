@@ -3,7 +3,7 @@
 Used only to show which database a connection is. PostgreSQL, MariaDB, MySQL and SQLite names and
 logos are trademarks of their owners; TupleBase is not affiliated with or endorsed by them.
 
-Unmodified single marks, tinted by the app:
+Unmodified single marks, which the app draws in one color on a colored tile:
 
 - `postgresql.svg`: "plain" mark from [devicon](https://github.com/devicons/devicon) v2.18.0 (MIT)
 - `mariadb.svg`: [Simple Icons](https://simpleicons.org) v16.37.0 (CC0)

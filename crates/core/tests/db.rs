@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use tuplebase_core::config::{Adapter, Connection};
-use tuplebase_core::db::{Db, ExecOptions};
+use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
 
 const READ: ExecOptions = ExecOptions {
     read_only: true,
@@ -273,4 +273,207 @@ async fn schema_inspection() {
         assert!(db.describe_table(&conn, None, "nope").await.is_err());
     })
     .await;
+}
+
+fn listed(objects: &[ObjectInfo], kind: ObjectKind, name: &str) -> Option<String> {
+    objects
+        .iter()
+        .find(|o| o.kind == kind && o.name == name)
+        .map(|o| o.detail.clone())
+}
+
+#[tokio::test]
+async fn postgres_objects_beyond_tables_are_listed() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Postgres));
+    let drop = [
+        "DROP FUNCTION IF EXISTS it_fn(int)",
+        "DROP PROCEDURE IF EXISTS it_proc()",
+        "DROP SEQUENCE IF EXISTS it_seq",
+        "DROP TYPE IF EXISTS it_mood",
+        "DROP EXTENSION IF EXISTS citext",
+    ];
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    for sql in [
+        "CREATE FUNCTION it_fn(a int) RETURNS int LANGUAGE sql AS 'SELECT a'",
+        "CREATE PROCEDURE it_proc() LANGUAGE sql AS 'SELECT 1'",
+        "CREATE SEQUENCE it_seq",
+        "CREATE TYPE it_mood AS ENUM ('happy')",
+        "CREATE EXTENSION citext",
+    ] {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let objects = db.list_objects(&conn).await.unwrap();
+    let cleanup = async {
+        for sql in drop {
+            db.execute(&conn, sql, WRITE).await.unwrap();
+        }
+    };
+    cleanup.await;
+    assert_eq!(
+        listed(&objects, ObjectKind::Function, "it_fn").as_deref(),
+        Some("a integer")
+    );
+    assert!(listed(&objects, ObjectKind::Procedure, "it_proc").is_some());
+    assert_eq!(
+        listed(&objects, ObjectKind::Sequence, "it_seq").as_deref(),
+        Some("bigint")
+    );
+    assert_eq!(
+        listed(&objects, ObjectKind::Type, "it_mood").as_deref(),
+        Some("enum")
+    );
+    assert!(listed(&objects, ObjectKind::Extension, "citext").is_some());
+    assert!(
+        !objects
+            .iter()
+            .any(|o| o.kind == ObjectKind::Function && o.name.starts_with("citext")),
+        "an extension's own functions must stay out of the list"
+    );
+    assert!(!objects.iter().any(|o| o.name == "plpgsql"));
+}
+
+#[tokio::test]
+async fn mariadb_objects_beyond_tables_are_listed() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Mariadb));
+    let drop = [
+        "DROP FUNCTION IF EXISTS it_fn",
+        "DROP PROCEDURE IF EXISTS it_proc",
+        "DROP EVENT IF EXISTS it_evt",
+        "DROP TABLE IF EXISTS it_objs",
+    ];
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    for sql in [
+        "CREATE TABLE it_objs (id INT)",
+        "CREATE FUNCTION it_fn(a INT) RETURNS INT DETERMINISTIC RETURN a",
+        "CREATE PROCEDURE it_proc() SELECT 1",
+        "CREATE TRIGGER it_trg BEFORE INSERT ON it_objs FOR EACH ROW SET NEW.id = NEW.id",
+        "CREATE EVENT it_evt ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+    ] {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let objects = db.list_objects(&conn).await.unwrap();
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    assert_eq!(
+        listed(&objects, ObjectKind::Function, "it_fn").as_deref(),
+        Some("int(11)")
+    );
+    assert!(listed(&objects, ObjectKind::Procedure, "it_proc").is_some());
+    assert_eq!(
+        listed(&objects, ObjectKind::Trigger, "it_trg").as_deref(),
+        Some("BEFORE INSERT on it_objs")
+    );
+    assert_eq!(
+        listed(&objects, ObjectKind::Event, "it_evt").as_deref(),
+        Some("ENABLED")
+    );
+}
+
+fn sqlite_connection(dir: &tempfile::TempDir, name: &str) -> Connection {
+    let path = dir.path().join(format!("{name}.db"));
+    std::fs::File::create(&path).unwrap();
+    Connection {
+        name: name.into(),
+        folder: String::new(),
+        adapter: Adapter::Sqlite,
+        host: String::new(),
+        port: 0,
+        database: path.to_string_lossy().into_owned(),
+        user: String::new(),
+        readonly: false,
+        color: String::new(),
+        tls: Default::default(),
+        ssh: None,
+    }
+}
+
+#[tokio::test]
+async fn a_disconnected_connection_stays_closed_until_allowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = sqlite_connection(&dir, "closing");
+    let db = Db::new();
+    assert!(db.open_connections().await.is_empty());
+    db.test(&conn).await.unwrap();
+    assert!(db.open_connections().await.contains("closing"));
+
+    db.disconnect("closing").await;
+    assert!(db.open_connections().await.is_empty());
+    assert!(db.list_tables(&conn).await.is_err(), "must not reopen");
+    assert!(db.open_connections().await.is_empty());
+
+    db.allow_connecting("closing");
+    db.test(&conn).await.unwrap();
+    assert!(db.open_connections().await.contains("closing"));
+}
+
+#[tokio::test]
+async fn disconnecting_one_connection_leaves_the_others_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (first, second) = (
+        sqlite_connection(&dir, "first"),
+        sqlite_connection(&dir, "second"),
+    );
+    let db = Db::new();
+    db.test(&first).await.unwrap();
+    db.test(&second).await.unwrap();
+    db.disconnect("first").await;
+    let open = db.open_connections().await;
+    assert!(!open.contains("first"));
+    assert!(open.contains("second"));
+}
+
+#[tokio::test]
+async fn a_check_that_fails_closes_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = sqlite_connection(&dir, "gone");
+    let db = Db::new();
+    db.test(&conn).await.unwrap();
+    db.disconnect("gone").await;
+    db.allow_connecting("gone");
+    let missing = Connection {
+        database: dir
+            .path()
+            .join("no/such/dir.db")
+            .to_string_lossy()
+            .into_owned(),
+        ..conn
+    };
+    assert!(db.check(&missing).await.is_err());
+    assert!(db.open_connections().await.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_indexes_and_triggers_are_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = sqlite_connection(&dir, "it-sqlite-objects");
+    let db = Db::new();
+    for sql in [
+        "CREATE TABLE t (a INTEGER)",
+        "CREATE INDEX t_a ON t (a)",
+        "CREATE TRIGGER t_trg BEFORE INSERT ON t BEGIN SELECT 1; END",
+    ] {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let objects = db.list_objects(&conn).await.unwrap();
+    assert_eq!(
+        listed(&objects, ObjectKind::Index, "t_a").as_deref(),
+        Some("on t")
+    );
+    assert_eq!(
+        listed(&objects, ObjectKind::Trigger, "t_trg").as_deref(),
+        Some("on t")
+    );
 }

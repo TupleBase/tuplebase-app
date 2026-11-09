@@ -10,9 +10,9 @@ mod schema;
 mod theme;
 mod workspace;
 
-use gpui_kit::component::{Theme, TitleBar};
+use gpui_kit::component::{GlobalState, Theme, TitleBar};
 use gpui_kit::*;
-use workspace::Workspace;
+use workspace::{About, AddMcpToAgents, CheckForUpdates, OpenSettings, Workspace};
 
 actions!(tuplebase, [Quit]);
 
@@ -20,6 +20,18 @@ actions!(tuplebase, [Quit]);
 const QUIT_KEY: &str = "cmd-q";
 #[cfg(not(target_os = "macos"))]
 const QUIT_KEY: &str = "ctrl-q";
+
+fn app_menus() -> Vec<Menu> {
+    vec![Menu::new(tuplebase_core::PRODUCT_NAME).items([
+        MenuItem::action("About TupleBase", About),
+        MenuItem::action("Check for Updates…", CheckForUpdates),
+        MenuItem::separator(),
+        MenuItem::action("Settings…", OpenSettings),
+        MenuItem::action("Add MCP Server to Agents", AddMcpToAgents),
+        MenuItem::separator(),
+        MenuItem::action("Quit TupleBase", Quit),
+    ])]
+}
 
 fn main() {
     gpui_kit::application()
@@ -32,8 +44,10 @@ fn main() {
             workspace::bind_keys(cx);
             cx.bind_keys([KeyBinding::new(QUIT_KEY, Quit, None)]);
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.set_menus([Menu::new(tuplebase_core::PRODUCT_NAME)
-                .items([MenuItem::action("Quit TupleBase", Quit)])]);
+            cx.set_menus(app_menus());
+            // Windows and Linux have no native menu bar; the title bar draws these.
+            GlobalState::global_mut(cx)
+                .set_app_menus(app_menus().into_iter().map(Menu::owned).collect());
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -56,7 +70,9 @@ fn main() {
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);
-                cx.new(|cx| Workspace::new(window, cx))
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                workspace::register_menu_actions(&workspace, window.window_handle(), cx);
+                workspace
             })
             .expect("failed to open window");
             cx.activate(true);

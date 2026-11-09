@@ -246,12 +246,17 @@ impl ConnForm {
             .border_1()
             .border_color(border)
             .cursor_pointer()
-            .child(logos::icon(adapter, "", 18., cx))
+            .child(logos::icon(adapter, 18.))
             .child(div().text_sm().child(adapter.label()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.adapter = adapter;
                 cx.notify();
             }))
+    }
+
+    /// The name of the saved connection being edited, if any.
+    pub fn editing(&self) -> Option<&str> {
+        self.previous.as_deref()
     }
 
     fn render_swatch(
@@ -262,7 +267,7 @@ impl ConnForm {
     ) -> impl IntoElement + use<> {
         let selected = self.color == value;
         let ring = cx.theme().foreground;
-        let fill = logos::color_of(self.adapter, value, cx);
+        let fill = logos::color_of(self.adapter, value);
         div()
             .id(SharedString::from(format!("color-{index}")))
             .test_support()

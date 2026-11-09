@@ -8,7 +8,13 @@ OS credential store, so agent configs hold no secrets. It works with the app clo
 
 [Install](INSTALL.md) first, and save a connection in the app.
 
-Claude Code:
+**In the app:** open **Settings**, and under **AI agents** click **Add to all agents**.
+The app menu has the same action. It finds Claude Code, Claude Desktop, Cursor, Windsurf,
+VS Code and Codex, and adds the server to their config files. Everything else in those
+files stays as it was, and a file it can't parse (for example JSON with comments) is left
+alone and reported. Restart the agent afterwards.
+
+**By hand**, Claude Code:
 
 ```sh
 claude mcp add tuplebase -- ~/.local/bin/tuplebase-mcp
@@ -27,6 +33,9 @@ Other clients, using an absolute path:
   }
 }
 ```
+
+The **MCP** indicator at the bottom of the sidebar is green while an agent has the server
+running. Agents start it when they need it, so grey is normal when none is active.
 
 ## Tools
 

@@ -3,7 +3,7 @@
 //! Async API; callers provide a Tokio runtime. One pool per connection, cached by
 //! name and rebuilt when the connection's settings change.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,133 @@ pub struct TableInfo {
     pub name: String,
     pub kind: String,
 }
+
+/// What a database has besides tables and views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ObjectKind {
+    Function,
+    Procedure,
+    Sequence,
+    Type,
+    Extension,
+    Trigger,
+    Event,
+    Index,
+}
+
+impl ObjectKind {
+    pub fn plural(self) -> &'static str {
+        match self {
+            Self::Function => "Functions",
+            Self::Procedure => "Procedures",
+            Self::Sequence => "Sequences",
+            Self::Type => "Types",
+            Self::Extension => "Extensions",
+            Self::Trigger => "Triggers",
+            Self::Event => "Events",
+            Self::Index => "Indexes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectInfo {
+    pub schema: String,
+    pub kind: ObjectKind,
+    pub name: String,
+    /// A short note shown beside the name, such as a function's arguments.
+    pub detail: String,
+}
+
+/// Each query returns schema, name and detail.
+const PG_OBJECTS: &[(ObjectKind, &str)] = &[
+    (
+        ObjectKind::Function,
+        "SELECT n.nspname::text, p.proname::text, pg_get_function_identity_arguments(p.oid)::text \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.prokind = 'f' AND n.nspname NOT LIKE 'pg\\_%' \
+         AND n.nspname <> 'information_schema' AND NOT EXISTS \
+         (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e') \
+         ORDER BY 1, 2, 3",
+    ),
+    (
+        ObjectKind::Procedure,
+        "SELECT n.nspname::text, p.proname::text, pg_get_function_identity_arguments(p.oid)::text \
+         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE p.prokind = 'p' AND n.nspname NOT LIKE 'pg\\_%' \
+         AND n.nspname <> 'information_schema' AND NOT EXISTS \
+         (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e') \
+         ORDER BY 1, 2, 3",
+    ),
+    (
+        ObjectKind::Sequence,
+        "SELECT sequence_schema::text, sequence_name::text, data_type::text \
+         FROM information_schema.sequences \
+         WHERE sequence_schema NOT LIKE 'pg\\_%' AND sequence_schema <> 'information_schema' \
+         ORDER BY 1, 2",
+    ),
+    (
+        ObjectKind::Type,
+        "SELECT n.nspname::text, t.typname::text, \
+         CASE t.typtype WHEN 'e' THEN 'enum' WHEN 'd' THEN 'domain' WHEN 'r' THEN 'range' \
+         ELSE 'composite' END::text \
+         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+         WHERE (t.typtype IN ('e', 'd', 'r') OR (t.typtype = 'c' AND EXISTS \
+         (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'))) \
+         AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' AND NOT EXISTS \
+         (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid AND d.deptype = 'e') \
+         ORDER BY 1, 2",
+    ),
+    (
+        ObjectKind::Extension,
+        "SELECT n.nspname::text, e.extname::text, e.extversion::text \
+         FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
+         WHERE n.nspname NOT LIKE 'pg\\_%' ORDER BY 1, 2",
+    ),
+];
+
+const MY_OBJECTS: &[(ObjectKind, &str)] = &[
+    (
+        ObjectKind::Function,
+        "SELECT CAST(routine_schema AS CHAR), CAST(routine_name AS CHAR), \
+         CAST(COALESCE(dtd_identifier, '') AS CHAR) FROM information_schema.routines \
+         WHERE routine_type = 'FUNCTION' AND routine_schema NOT IN \
+         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
+    ),
+    (
+        ObjectKind::Procedure,
+        "SELECT CAST(routine_schema AS CHAR), CAST(routine_name AS CHAR), CAST('' AS CHAR) \
+         FROM information_schema.routines \
+         WHERE routine_type = 'PROCEDURE' AND routine_schema NOT IN \
+         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
+    ),
+    (
+        ObjectKind::Trigger,
+        "SELECT CAST(trigger_schema AS CHAR), CAST(trigger_name AS CHAR), \
+         CAST(CONCAT(action_timing, ' ', event_manipulation, ' on ', event_object_table) AS CHAR) \
+         FROM information_schema.triggers WHERE trigger_schema NOT IN \
+         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
+    ),
+    (
+        ObjectKind::Event,
+        "SELECT CAST(event_schema AS CHAR), CAST(event_name AS CHAR), CAST(status AS CHAR) \
+         FROM information_schema.events WHERE event_schema NOT IN \
+         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
+    ),
+];
+
+const SQLITE_OBJECTS: &[(ObjectKind, &str)] = &[
+    (
+        ObjectKind::Trigger,
+        "SELECT 'main', name, 'on ' || tbl_name FROM sqlite_master \
+         WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ),
+    (
+        ObjectKind::Index,
+        "SELECT 'main', name, 'on ' || tbl_name FROM sqlite_master \
+         WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ),
+];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnInfo {
@@ -107,6 +234,8 @@ pub struct Db {
     /// Each connection has its own lock, so one that's slow or unreachable can't hold up
     /// the others. The outer lock is only held to look a slot up.
     slots: Mutex<HashMap<String, Arc<Mutex<Slot>>>>,
+    /// Closed on purpose: nothing may open these until [`Db::allow_connecting`].
+    disconnected: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Db {
@@ -122,6 +251,51 @@ impl Db {
             Pool::Sqlite(p) => p.execute("SELECT 1").await.map(drop)?,
         }
         Ok(())
+    }
+
+    /// Like [`Db::test`], but closes a connection that no longer works.
+    pub async fn check(&self, conn: &Connection) -> Result<()> {
+        let result = self.test(conn).await;
+        if result.is_err() {
+            self.forget(&conn.name).await;
+        }
+        result
+    }
+
+    /// The connections open right now.
+    pub async fn open_connections(&self) -> HashSet<String> {
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .await
+            .iter()
+            .map(|(name, slot)| (name.clone(), slot.clone()))
+            .collect();
+        let mut open = HashSet::new();
+        for (name, slot) in slots {
+            let is_open = slot
+                .lock()
+                .await
+                .open
+                .as_ref()
+                .is_some_and(|open| open.tunnel.as_ref().is_none_or(Tunnel::is_alive));
+            if is_open {
+                open.insert(name);
+            }
+        }
+        open
+    }
+
+    /// Closes a connection and its SSH tunnel, and keeps it closed until
+    /// [`Db::allow_connecting`], so work already under way can't quietly reopen it.
+    pub async fn disconnect(&self, name: &str) {
+        self.disconnected.lock().unwrap().insert(name.to_owned());
+        self.forget(name).await;
+    }
+
+    /// Undoes [`Db::disconnect`]. Doesn't block, so it's safe on the UI thread.
+    pub fn allow_connecting(&self, name: &str) {
+        self.disconnected.lock().unwrap().remove(name);
     }
 
     /// Closes and drops the cached pool, e.g. after the connection was edited.
@@ -309,6 +483,48 @@ impl Db {
             .collect())
     }
 
+    /// What the database has besides tables and views. Each kind is best effort: a user
+    /// who can't read one catalog still sees the rest.
+    pub async fn list_objects(&self, conn: &Connection) -> Result<Vec<ObjectInfo>> {
+        type Rows = Vec<(String, String, String)>;
+        let mut objects = Vec::new();
+        let mut add = |kind: ObjectKind, rows: Rows| {
+            objects.extend(rows.into_iter().map(|(schema, name, detail)| ObjectInfo {
+                schema,
+                kind,
+                name,
+                detail,
+            }));
+        };
+        match self.pool(conn).await? {
+            Pool::Pg(p) => {
+                for &(kind, sql) in PG_OBJECTS {
+                    add(
+                        kind,
+                        sqlx::query_as(sql).fetch_all(&p).await.unwrap_or_default(),
+                    );
+                }
+            }
+            Pool::My(p) => {
+                for &(kind, sql) in MY_OBJECTS {
+                    add(
+                        kind,
+                        sqlx::query_as(sql).fetch_all(&p).await.unwrap_or_default(),
+                    );
+                }
+            }
+            Pool::Sqlite(p) => {
+                for &(kind, sql) in SQLITE_OBJECTS {
+                    add(
+                        kind,
+                        sqlx::query_as(sql).fetch_all(&p).await.unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        Ok(objects)
+    }
+
     /// Columns of `table`; `schema` defaults to `public` (PostgreSQL) or the
     /// connection's database (MariaDB/MySQL).
     pub async fn describe_table(
@@ -379,6 +595,9 @@ impl Db {
             .or_default()
             .clone();
         let mut slot = slot.lock().await;
+        if self.disconnected.lock().unwrap().contains(&conn.name) {
+            bail!("\"{}\" is disconnected", conn.name);
+        }
         if let Some(open) = &slot.open
             && open.is_usable_for(conn)
         {

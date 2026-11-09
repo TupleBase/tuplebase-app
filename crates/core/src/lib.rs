@@ -1,7 +1,9 @@
 //! TupleBase core: database logic with no UI dependencies.
 
+pub mod agents;
 pub mod config;
 pub mod db;
+pub mod mcp_status;
 pub mod safety;
 pub mod secrets;
 pub mod ssh;

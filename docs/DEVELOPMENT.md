@@ -44,3 +44,19 @@ cargo run -p tuplebase-core --example add_test_connections
 It only touches your own config, and is safe to run again.
 
 `TUPLEBASE_IT_KEYCHAIN=1` also runs a round trip against the real OS credential store.
+
+## Trying changes without touching your installed app
+
+`cargo run` builds into `target/` and never replaces the installed app. Point it at its own
+config, and don't run `scripts/install.sh`, which does replace it:
+
+```sh
+TUPLEBASE_CONFIG_DIR=/tmp/tb-dev cargo run -p tuplebase-app
+```
+
+Passwords are not isolated: the OS credential store is shared and keyed by connection name, so
+saving or deleting a password on a connection named like a real one changes the real one.
+
+Adding the MCP server to agents is off in development builds, so real agents never point at
+`target/`. To try it, run `cargo build --workspace` and set `TUPLEBASE_AGENTS_HOME` to a folder
+holding fake agent folders (`.cursor`, `.claude`, ...).

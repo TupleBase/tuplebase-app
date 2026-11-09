@@ -2,6 +2,7 @@
 
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 use tuplebase_core::db::QueryResult;
@@ -83,6 +84,20 @@ impl TableDelegate for ResultsDelegate {
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
         self.columns[col_ix].clone()
+    }
+
+    /// Stripes here rather than with `DataTable::stripe`, which also pads a short result
+    /// with blank striped rows.
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> Stateful<Div> {
+        let stripe = cx.theme().tokens.table_even;
+        div()
+            .id(("row", row_ix))
+            .when(row_ix.is_multiple_of(2), |row| row.bg(stripe))
     }
 
     fn render_td(

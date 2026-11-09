@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::component::{Icon, Sizable as _};
 use gpui_kit::*;
 use tuplebase_core::config::Adapter;
 
@@ -22,36 +22,70 @@ fn glyph(adapter: Adapter) -> &'static [u8] {
     }
 }
 
-/// Each database's own color, in a shade that reads on the current theme.
-fn default_color(adapter: Adapter, dark: bool) -> u32 {
-    match (adapter, dark) {
-        (Adapter::Postgres, false) => 0x336791,
-        (Adapter::Postgres, true) => 0x7AA7E0,
-        (Adapter::Mariadb, false) => 0x003545,
-        (Adapter::Mariadb, true) => 0xC0765A,
-        (Adapter::Mysql, false) => 0x00758F,
-        (Adapter::Mysql, true) => 0x4FB3CE,
-        (Adapter::Sqlite, false) => 0x0F80CC,
-        (Adapter::Sqlite, true) => 0x5AB3E8,
+/// Each database's brand color, deep enough to carry a white mark on either theme.
+fn database_color(adapter: Adapter) -> u32 {
+    match adapter {
+        Adapter::Postgres => 0x336791,
+        Adapter::Mariadb => 0xA0522D,
+        Adapter::Mysql => 0x00758F,
+        Adapter::Sqlite => 0x0F80CC,
     }
 }
 
-/// The color a connection shows: its own choice, or else its database's color.
-pub fn color_of(adapter: Adapter, color: &str, cx: &App) -> Hsla {
-    let chosen = color
-        .strip_prefix('#')
-        .and_then(|hex| u32::from_str_radix(hex, 16).ok());
-    rgb(chosen.unwrap_or_else(|| default_color(adapter, cx.theme().mode.is_dark()))).into()
+fn parse_color(color: &str) -> Option<u32> {
+    u32::from_str_radix(color.strip_prefix('#')?, 16).ok()
 }
 
-/// A database's icon, shown small and inline like a file icon in an editor.
-pub fn icon(adapter: Adapter, color: &str, size: f32, cx: &App) -> Icon {
-    Icon::default()
-        .data(glyph(adapter))
-        .with_size(px(size))
-        .text_color(color_of(adapter, color, cx))
+/// The color the user picked for a connection, if any.
+pub fn picked_color(color: &str) -> Option<Hsla> {
+    parse_color(color).map(|value| rgb(value).into())
+}
+
+/// The color a connection shows: its own choice, or else its database's color.
+pub fn color_of(adapter: Adapter, color: &str) -> Hsla {
+    rgb(parse_color(color).unwrap_or_else(|| database_color(adapter))).into()
+}
+
+/// A database's icon: its mark on a tile of its brand color. A connection's own color
+/// never changes it, so the icon always says which database this is.
+pub fn icon(adapter: Adapter, size: f32) -> Div {
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded(px(size * 0.22))
+        .bg(rgb(database_color(adapter)))
+        .child(
+            Icon::default()
+                .data(glyph(adapter))
+                .with_size(px((size * 0.78).round()))
+                .text_color(white()),
+        )
 }
 
 pub fn brand(size: f32) -> Img {
     img(BRAND.clone()).size(px(size))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{color_of, picked_color};
+    use gpui_kit::{Hsla, rgb};
+    use tuplebase_core::config::Adapter;
+
+    #[test]
+    fn a_connection_color_replaces_the_database_color() {
+        let chosen: Hsla = rgb(0x3E8BD6).into();
+        let database: Hsla = rgb(0x0F80CC).into();
+        assert_eq!(color_of(Adapter::Sqlite, "#3E8BD6"), chosen);
+        assert_eq!(color_of(Adapter::Sqlite, ""), database);
+    }
+
+    #[test]
+    fn only_a_picked_color_counts_as_picked() {
+        assert!(picked_color("#3E8BD6").is_some());
+        assert!(picked_color("").is_none());
+    }
 }

@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tuplebase_core::config::{self, Config, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
+use tuplebase_core::mcp_status::Heartbeat;
 
 const DEFAULT_MAX_ROWS: usize = 200;
 
@@ -181,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
             "read-only"
         }
     );
+    // Best effort: the app's status icon matters less than serving the agent.
+    let _heartbeat = Heartbeat::start().ok();
     let service = Server::new(allow_writes, max_rows).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

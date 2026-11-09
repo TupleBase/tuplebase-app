@@ -9,17 +9,21 @@ use std::time::Duration;
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
+use gpui_kit::component::menu::{
+    AppMenuBar, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem,
+};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tuplebase_core::agents::{self, AgentState, AgentStatus};
 use tuplebase_core::config::{
     Adapter, Config, Connection, FolderNode, folder_name, parent_of, rebase_folder,
 };
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
-use tuplebase_core::{secrets, updates};
+use tuplebase_core::{mcp_status, secrets, updates};
 
 use crate::completions::{SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
@@ -36,7 +40,11 @@ actions!(
         TreeDown,
         TreeCollapse,
         TreeExpand,
-        TreeOpen
+        TreeOpen,
+        OpenSettings,
+        CheckForUpdates,
+        About,
+        AddMcpToAgents
     ]
 );
 
@@ -44,6 +52,10 @@ actions!(
 const RUN_KEY: &str = "cmd-enter";
 #[cfg(not(target_os = "macos"))]
 const RUN_KEY: &str = "ctrl-enter";
+#[cfg(target_os = "macos")]
+const SETTINGS_KEY: &str = "cmd-,";
+#[cfg(not(target_os = "macos"))]
+const SETTINGS_KEY: &str = "ctrl-,";
 #[cfg(target_os = "macos")]
 const RUN_HINT: &str = "Run query (⌘↵)";
 #[cfg(not(target_os = "macos"))]
@@ -60,9 +72,49 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("left", TreeCollapse, Some(TREE_CONTEXT)),
         KeyBinding::new("right", TreeExpand, Some(TREE_CONTEXT)),
         KeyBinding::new("enter", TreeOpen, Some(TREE_CONTEXT)),
+        KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
     ]);
 }
 
+/// Menu items must work whatever has focus, so their actions are global and go to the
+/// app's one workspace.
+pub fn register_menu_actions(workspace: &Entity<Workspace>, window: AnyWindowHandle, cx: &mut App) {
+    fn on<A: Action>(
+        workspace: &Entity<Workspace>,
+        window: AnyWindowHandle,
+        cx: &mut App,
+        run: fn(&mut Workspace, &mut Window, &mut Context<Workspace>),
+    ) {
+        let workspace = workspace.downgrade();
+        cx.on_action(move |_: &A, cx| {
+            let workspace = workspace.clone();
+            // Dispatching holds the window, so it can only be updated afterwards.
+            cx.defer(move |cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |this, cx| run(this, window, cx)).ok();
+                    })
+                    .ok();
+            });
+        });
+    }
+    on::<OpenSettings>(workspace, window, cx, |this, window, cx| {
+        this.open_settings(window, cx);
+    });
+    on::<About>(workspace, window, cx, |this, window, cx| {
+        this.open_about(window, cx);
+    });
+    on::<CheckForUpdates>(workspace, window, cx, |this, window, cx| {
+        this.check_for_updates_now(window, cx);
+    });
+    on::<AddMcpToAgents>(workspace, window, cx, |this, window, cx| {
+        this.add_mcp_to_agents(window, cx);
+    });
+}
+
+const STATUS_POLL: Duration = Duration::from_secs(5);
+
+const UNPLUG_ICON: &[u8] = include_bytes!("../../../assets/icons/unplug.svg");
 const EDIT_ICON: &[u8] = include_bytes!("../../../assets/icons/square-pen.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
 const NEW_FOLDER_ICON: &[u8] = include_bytes!("../../../assets/icons/folder-plus.svg");
@@ -108,7 +160,6 @@ struct FolderEdit {
 struct DraggedConnection {
     name: String,
     adapter: Adapter,
-    color: String,
 }
 
 /// A folder being dragged into another one.
@@ -146,7 +197,7 @@ impl Render for DraggedConnection {
             .bg(theme.popover)
             .text_color(theme.popover_foreground)
             .text_sm()
-            .child(logos::icon(self.adapter, &self.color, 16., cx))
+            .child(logos::icon(self.adapter, 16.))
             .child(self.name.clone())
     }
 }
@@ -183,12 +234,18 @@ pub struct Workspace {
     _session_save: Option<Task<()>>,
     schema: Entity<SchemaPanel>,
     _schema_subscription: Subscription,
+    app_menu: Entity<AppMenuBar>,
+    /// MCP servers that agents have running.
+    /// Connections with an open pool.
+    connected: HashSet<String>,
+    mcp_servers: usize,
+    /// `None` until Settings has looked for them.
+    agents: Option<Vec<AgentStatus>>,
     tree_focus: FocusHandle,
     tree_scroll: ScrollHandle,
     /// The row arrow keys act on.
     cursor: Option<TreeRow>,
     tree_focused: bool,
-    settings_open: bool,
     folder_edit: Option<FolderEdit>,
     _folder_edit_subscription: Option<Subscription>,
     /// Folders closed in the sidebar.
@@ -211,6 +268,8 @@ impl Workspace {
         .detach();
         let mut this = Self::with_config(config, status, window, cx);
         this.session = SessionState::load();
+        this.watch_mcp_servers(cx);
+        this.watch_connections(cx);
         if this.config.check_for_updates {
             this.check_for_updates(cx);
         }
@@ -234,6 +293,205 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Notices what changes on its own, such as an SSH tunnel dropping. Only asks the local
+    /// pools, so it adds no traffic to the databases.
+    fn watch_connections(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            while this
+                .update(cx, |this, cx| this.refresh_connected(cx))
+                .is_ok()
+            {
+                cx.background_executor().timer(STATUS_POLL).await;
+            }
+        })
+        .detach();
+    }
+
+    fn refresh_connected(&self, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            let open = io(async move { Ok(db.open_connections().await) })
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                if this.connected != open {
+                    this.connected = open;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Closes a connection. The open one also leaves the screen: staying on it would let
+    /// the next query quietly connect again.
+    fn disconnect(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(name.as_str()) {
+            if self.pending_editor_text.is_none() {
+                self.remember_draft(cx);
+            }
+            self.selected = None;
+            self.status = Status::Idle;
+            self.schema
+                .update(cx, |schema, cx| schema.set_connection(None, cx));
+            self.results.update(cx, |table, cx| {
+                table.delegate_mut().clear();
+                table.refresh(cx);
+            });
+        }
+        self.connected.remove(&name);
+        cx.notify();
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            io(async move {
+                db.disconnect(&name).await;
+                Ok(())
+            })
+            .await
+            .ok();
+            this.update(cx, |this, cx| this.refresh_connected(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// A failed query can mean the server has gone: if so, stop showing it as connected.
+    fn check_still_connected(&self, conn: Connection, cx: &mut Context<Self>) {
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            io(async move {
+                db.check(&conn).await.ok();
+                Ok(())
+            })
+            .await
+            .ok();
+            this.update(cx, |this, cx| this.refresh_connected(cx)).ok();
+        })
+        .detach();
+    }
+
+    fn watch_mcp_servers(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                let running = blocking(mcp_status::running_servers).await.unwrap_or(0);
+                let updated = this.update(cx, |this, cx| {
+                    if this.mcp_servers != running {
+                        this.mcp_servers = running;
+                        cx.notify();
+                    }
+                });
+                if updated.is_err() {
+                    return;
+                }
+                cx.background_executor().timer(STATUS_POLL).await;
+            }
+        })
+        .detach();
+    }
+
+    fn refresh_agents(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let statuses = blocking(|| Ok(agents::statuses()))
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.agents = Some(statuses);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn add_mcp_to_agents(&self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            let statuses = blocking(|| Ok(agents::add_to_all()))
+                .await
+                .unwrap_or_default();
+            this.update_in(cx, |this, window, cx| {
+                this.finish_adding_mcp(statuses, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_adding_mcp(
+        &mut self,
+        statuses: Vec<AgentStatus>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Settings lists each agent's result itself; the menu has nowhere else to say it.
+        if !window.has_active_dialog(cx) {
+            window.push_notification(mcp_added_note(&statuses), cx);
+        }
+        self.agents = Some(statuses);
+        cx.notify();
+    }
+
+    /// The menu's check: unlike the one at startup, it always answers.
+    fn check_for_updates_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(note) = self.update_in_progress() {
+            window.push_notification(Notification::info(note), cx);
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = blocking(|| updates::check(env!("CARGO_PKG_VERSION"))).await;
+            this.update_in(cx, |this, window, cx| {
+                this.finish_update_check(result, window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// What the sidebar is already showing about an update, if anything.
+    fn update_in_progress(&self) -> Option<String> {
+        Some(match self.update_state.as_ref()? {
+            UpdateState::Available { version, .. } => {
+                format!("TupleBase {version} is available. Update from the sidebar.")
+            }
+            UpdateState::Downloading { version, .. } => {
+                format!("Downloading TupleBase {version}…")
+            }
+            UpdateState::Ready { download, .. } => {
+                format!(
+                    "TupleBase {} is ready. Restart from the sidebar.",
+                    download.version
+                )
+            }
+        })
+    }
+
+    fn finish_update_check(
+        &mut self,
+        result: anyhow::Result<Option<String>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let note = match result {
+            Ok(Some(version)) => {
+                let note = format!("TupleBase {version} is available. Update from the sidebar.");
+                if self.update_state.is_none() {
+                    self.update_state = Some(UpdateState::Available {
+                        version,
+                        error: None,
+                    });
+                }
+                Notification::info(note)
+            }
+            Ok(None) => Notification::success(concat!(
+                "TupleBase ",
+                env!("CARGO_PKG_VERSION"),
+                " is up to date."
+            )),
+            Err(e) => Notification::error(format!("Could not check for updates: {e:#}")),
+        };
+        window.push_notification(note, cx);
+        cx.notify();
     }
 
     fn set_check_for_updates(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -444,6 +702,10 @@ impl Workspace {
             db,
             schema,
             _schema_subscription,
+            app_menu: AppMenuBar::new(cx),
+            connected: HashSet::new(),
+            mcp_servers: 0,
+            agents: None,
             config,
             selected: None,
             form: None,
@@ -458,7 +720,6 @@ impl Workspace {
             tree_scroll: ScrollHandle::new(),
             cursor: None,
             tree_focused: false,
-            settings_open: false,
             folder_edit: None,
             _folder_edit_subscription: None,
             collapsed: HashSet::new(),
@@ -474,12 +735,12 @@ impl Workspace {
 
     fn select(&mut self, name: String, cx: &mut Context<Self>) {
         self.form = None;
-        self.settings_open = false;
         if self.pending_editor_text.is_none() {
             self.remember_draft(cx);
         }
         self.pending_editor_text =
             Some(self.session.drafts.get(&name).cloned().unwrap_or_default());
+        self.db.allow_connecting(&name);
         self.selected = Some(name);
         self.results.update(cx, |table, cx| {
             table.delegate_mut().clear();
@@ -496,8 +757,9 @@ impl Workspace {
         let db = self.db.clone();
         cx.spawn(async move |this, cx| {
             let name = conn.name.clone();
-            let result = io(async move { db.test(&conn).await }).await;
+            let result = io(async move { db.check(&conn).await }).await;
             this.update(cx, |this, cx| {
+                this.refresh_connected(cx);
                 // The user may have moved on to another connection by now.
                 if this.selected.as_deref() != Some(name.as_str()) {
                     return;
@@ -511,6 +773,11 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    fn edit_connection(&mut self, conn: Connection, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = conn.folder.clone();
+        self.open_form(Some(conn), folder, window, cx);
     }
 
     /// Opens the connection form; a new connection is saved into `folder`.
@@ -542,7 +809,6 @@ impl Workspace {
             }
         }));
         self.form = Some(form);
-        self.settings_open = false;
         cx.notify();
     }
 
@@ -610,38 +876,44 @@ impl Workspace {
         .detach();
     }
 
-    fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(conn) = self.selected_connection() else {
-            return;
-        };
+    fn confirm_delete(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let this = this.clone();
+            let (this, target) = (this.clone(), name.clone());
             alert
-                .title(format!("Delete “{}”?", conn.name))
+                .title(format!("Delete “{name}”?"))
                 .description("Its saved password is removed from the keychain.")
                 .confirm()
                 .ok_text("Delete")
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.delete_selected(cx)).ok();
+                    this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
+                        .ok();
                     true
                 })
         });
     }
 
-    fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(name) = self.selected.take() else {
-            return;
-        };
-        self.schema
-            .update(cx, |schema, cx| schema.set_connection(None, cx));
+    fn delete_connection(&mut self, name: String, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(name.as_str()) {
+            self.selected = None;
+            self.status = Status::Idle;
+            self.schema
+                .update(cx, |schema, cx| schema.set_connection(None, cx));
+        }
+        if self
+            .form
+            .as_ref()
+            .is_some_and(|form| form.read(cx).editing() == Some(name.as_str()))
+        {
+            self.form = None;
+        }
+        self.connected.remove(&name);
         self.config.remove(&name);
         self.session.remove_connection(&name);
         self.schedule_session_save(cx);
         let config = self.config.clone();
         let db = self.db.clone();
-        self.status = Status::Idle;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let forget_name = name.clone();
@@ -672,7 +944,7 @@ impl Workspace {
         let Some(conn) = self.selected_connection() else {
             return;
         };
-        if self.form.is_some() || self.settings_open || matches!(self.status, Status::Busy(_)) {
+        if self.form.is_some() || matches!(self.status, Status::Busy(_)) {
             return;
         }
         let sql = {
@@ -694,9 +966,13 @@ impl Workspace {
             max_rows: MAX_ROWS,
         };
         let name = conn.name.clone();
+        let checked = conn.clone();
         cx.spawn(async move |this, cx| {
             let result = io(async move { db.execute_script(&conn, &sql, opts).await }).await;
             this.update(cx, |this, cx| {
+                if result.is_err() {
+                    this.check_still_connected(checked, cx);
+                }
                 // Rows from a connection the user has left must not show under another.
                 if this.selected.as_deref() != Some(name.as_str()) {
                     return;
@@ -1074,93 +1350,207 @@ impl Workspace {
                     .border_color(border)
                     .children(self.render_update(cx))
                     .child(
-                        h_flex().child(
-                            Button::new("open-settings")
-                                .ghost()
-                                .small()
-                                .icon(IconName::Settings)
-                                .label("Settings")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.form = None;
-                                    this.settings_open = true;
-                                    cx.notify();
-                                })),
-                        ),
+                        h_flex()
+                            .justify_between()
+                            .child(
+                                Button::new("open-settings")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Settings)
+                                    .label("Settings")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_settings(window, cx);
+                                    })),
+                            )
+                            .child(self.render_mcp_status(cx)),
                     ),
             )
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
-        div().id("settings").size_full().overflow_y_scroll().child(
-            v_flex().w_full().items_center().child(
+    /// Shows Settings in a dialog, leaving whatever is on screen in place underneath.
+    fn open_settings(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        self.refresh_agents(cx);
+        let this = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let Some(workspace) = this.upgrade() else {
+                return dialog;
+            };
+            dialog
+                .title("Settings")
+                .w(px(520.))
+                .child(Self::settings_content(workspace, cx))
+        });
+    }
+
+    fn open_about(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        window.open_dialog(cx, |dialog, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            dialog.w(px(320.)).child(
                 v_flex()
-                    .w(px(520.))
-                    .pt(px(56.))
-                    .pb_8()
-                    .gap_6()
-                    .child(div().text_xl().font_semibold().child("Settings"))
+                    .id("about")
+                    .test_support()
+                    .items_center()
+                    .gap_2()
+                    .py_2()
+                    .child(logos::brand(72.))
                     .child(
-                        v_flex()
-                            .gap_2()
-                            .child(div().font_medium().child("Updates"))
-                            .child(
-                                Checkbox::new("check-updates")
-                                    .label("Check for updates at startup")
-                                    .checked(self.config.check_for_updates)
-                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                        this.set_check_for_updates(*checked, cx);
-                                    })),
-                            )
-                            .child(div().text_sm().text_color(muted).child(
-                                "Asks GitHub whether a newer version exists. \
-                                 Sends no connection details or queries.",
-                            )),
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child(tuplebase_core::PRODUCT_NAME),
                     )
                     .child(
-                        v_flex()
-                            .gap_2()
-                            .child(div().font_medium().child("Query history"))
-                            .child(div().text_sm().text_color(muted).child(
-                                "Your queries and unsaved SQL are kept on this computer only.",
-                            ))
-                            .child(
-                                h_flex().child(
-                                    Button::new("clear-history")
-                                        .small()
-                                        .label("Clear query history")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.session.history.clear();
-                                            this.schedule_session_save(cx);
-                                            cx.notify();
-                                        })),
-                                ),
-                            ),
-                    )
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                    ),
+            )
+        });
+    }
+
+    fn render_agents(workspace: &Entity<Self>, cx: &App) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (muted, danger) = (theme.muted_foreground, theme.danger);
+        let statuses = workspace.read(cx).agents.clone().unwrap_or_default();
+        let looked = workspace.read(cx).agents.is_some();
+        let can_add = statuses.iter().any(|s| s.state != AgentState::Added);
+        let empty = looked && statuses.is_empty();
+        let workspace = workspace.downgrade();
+        v_flex()
+            .gap_2()
+            .child(div().font_medium().child("AI agents"))
+            .child(div().text_sm().text_color(muted).child(
+                "Adds the MCP server to your agents so they can query saved connections. \
+                 They stay read-only unless you allow writes.",
+            ))
+            .when(empty, |el| {
+                el.child(
+                    div()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("No supported agents found on this computer."),
+                )
+            })
+            .children(statuses.into_iter().map(move |status| {
+                let (text, color): (SharedString, Hsla) = match status.state {
+                    AgentState::Added => ("Added".into(), muted),
+                    AgentState::NotAdded => ("Not added".into(), muted),
+                    AgentState::Failed(reason) => (reason.into(), danger),
+                };
+                h_flex()
+                    .justify_between()
+                    .gap_4()
+                    .text_sm()
+                    .child(div().flex_none().child(status.name))
+                    .child(div().min_w_0().text_right().text_color(color).child(text))
+            }))
+            .when(can_add, move |el| {
+                el.child(
+                    h_flex().child(
+                        Button::new("add-mcp")
+                            .small()
+                            .label("Add to all agents")
+                            .on_click(move |_, window, cx| {
+                                workspace
+                                    .update(cx, |this, cx| this.add_mcp_to_agents(window, cx))
+                                    .ok();
+                            }),
+                    ),
+                )
+            })
+    }
+
+    fn settings_content(workspace: Entity<Self>, cx: &App) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let check_for_updates = workspace.read(cx).config.check_for_updates;
+        let toggled = workspace.clone();
+        let agents_section = Self::render_agents(&workspace, cx);
+        v_flex()
+            .gap_6()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().font_medium().child("Updates"))
                     .child(
-                        v_flex()
-                            .gap_1()
-                            .child(div().font_medium().child("About"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .child(concat!("TupleBase ", env!("CARGO_PKG_VERSION"))),
-                            ),
+                        Checkbox::new("check-updates")
+                            .label("Check for updates at startup")
+                            .checked(check_for_updates)
+                            .on_click(move |checked: &bool, _, cx| {
+                                toggled.update(cx, |this, cx| {
+                                    this.set_check_for_updates(*checked, cx);
+                                });
+                            }),
+                    )
+                    .child(div().text_sm().text_color(muted).child(
+                        "Asks GitHub whether a newer version exists. \
+                         Sends no connection details or queries.",
+                    )),
+            )
+            .child(agents_section)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().font_medium().child("Query history"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Your queries and unsaved SQL are kept on this computer only."),
                     )
                     .child(
                         h_flex().child(
-                            Button::new("close-settings")
-                                .primary()
-                                .label("Done")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.settings_open = false;
-                                    cx.notify();
-                                })),
+                            Button::new("clear-history")
+                                .small()
+                                .label("Clear query history")
+                                .on_click(move |_, _, cx| {
+                                    workspace.update(cx, |this, cx| {
+                                        this.session.history.clear();
+                                        this.schedule_session_save(cx);
+                                        cx.notify();
+                                    });
+                                }),
                         ),
                     ),
-            ),
-        )
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().font_medium().child("About"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(concat!("TupleBase ", env!("CARGO_PKG_VERSION"))),
+                    ),
+            )
+    }
+
+    fn render_mcp_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let dot = if self.mcp_servers == 0 {
+            cx.theme().muted_foreground
+        } else {
+            cx.theme().success
+        };
+        Button::new("mcp-status")
+            .ghost()
+            .small()
+            .tooltip(mcp_status_text(self.mcp_servers))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(div().size(px(8.)).rounded_full().bg(dot))
+                    .child("MCP"),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_settings(window, cx);
+            }))
     }
 
     fn is_cursor(&self, row: &TreeRow) -> bool {
@@ -1373,6 +1763,7 @@ impl Workspace {
                 this.tree_focus.focus(window, cx);
                 this.toggle_folder(toggle.clone(), cx);
             }))
+            .context_menu(self.folder_menu(folder, cx))
     }
 
     fn render_connection(
@@ -1389,17 +1780,23 @@ impl Workspace {
             theme.ring,
         );
         let selected = self.selected.as_deref() == Some(conn.name.as_str());
+        let connected = self.connected.contains(&conn.name);
+        let success = cx.theme().success;
+        let row_group = SharedString::from(format!("conn-row-{}", conn.name));
         let name = conn.name.clone();
         let folder = conn.folder.clone();
+        let closing = conn.name.clone();
         h_flex()
             .id(SharedString::from(format!("conn-{}", conn.name)))
             .test_support()
+            .group(row_group.clone())
             .border_1()
             .border_color(if self.is_cursor(&TreeRow::Connection(conn.name.clone())) {
                 ring
             } else {
                 transparent_black()
             })
+            .relative()
             .h(px(32.))
             .gap_2()
             .pr_2()
@@ -1408,7 +1805,18 @@ impl Workspace {
             .cursor_pointer()
             .when(selected, |d| d.bg(active))
             .hover(move |s| s.bg(active))
-            .child(logos::icon(conn.adapter, &conn.color, 18., cx))
+            .when_some(logos::picked_color(&conn.color), |row, color| {
+                row.child(
+                    h_flex()
+                        .id(SharedString::from(format!("conn-color-{}", conn.name)))
+                        .test_support()
+                        .absolute()
+                        .left(px(2. + depth as f32 * TREE_INDENT))
+                        .h_full()
+                        .child(div().w(px(3.)).h(px(16.)).rounded_full().bg(color)),
+                )
+            })
+            .child(logos::icon(conn.adapter, 18.))
             .child(
                 div()
                     .max_w(px(170.))
@@ -1425,11 +1833,40 @@ impl Workspace {
                     .text_color(muted)
                     .child(conn.location()),
             )
+            .when(connected, |row| {
+                row.child(
+                    div()
+                        .id(SharedString::from(format!("conn-status-{}", conn.name)))
+                        .test_support()
+                        .flex_none()
+                        .size(px(8.))
+                        .rounded_full()
+                        .bg(success)
+                        .group_hover(row_group.clone(), |s| s.invisible()),
+                )
+                .child(
+                    h_flex()
+                        .absolute()
+                        .right_1()
+                        .invisible()
+                        .group_hover(row_group, |s| s.visible())
+                        .child(
+                            Button::new(SharedString::from(format!("disconnect-{}", conn.name)))
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::default().data(UNPLUG_ICON))
+                                .tooltip("Disconnect")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.disconnect(closing.clone(), cx);
+                                })),
+                        ),
+                )
+            })
             .on_drag(
                 DraggedConnection {
                     name: conn.name.clone(),
                     adapter: conn.adapter,
-                    color: conn.color.clone(),
                 },
                 |dragged, _, _, cx| cx.new(|_| dragged.clone()),
             )
@@ -1444,6 +1881,89 @@ impl Workspace {
                 this.tree_focus.focus(window, cx);
                 this.select(name.clone(), cx);
             }))
+            .context_menu(self.connection_menu(conn, cx))
+    }
+
+    fn connection_menu(
+        &self,
+        conn: &Connection,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
+    {
+        let this = cx.entity().downgrade();
+        let conn = conn.clone();
+        let connected = self.connected.contains(&conn.name);
+        move |menu, _, _| {
+            let (edited, name, closing) = (conn.clone(), conn.name.clone(), conn.name.clone());
+            let menu = if connected {
+                menu.item(
+                    PopupMenuItem::new("Disconnect")
+                        .on_click(menu_click(&this, move |this, _, cx| {
+                            this.disconnect(closing.clone(), cx)
+                        })),
+                )
+                .separator()
+            } else {
+                menu
+            };
+            menu.item(
+                PopupMenuItem::new("Edit").on_click(menu_click(&this, move |this, window, cx| {
+                    this.edit_connection(edited.clone(), window, cx)
+                })),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new("Delete")
+                    .on_click(menu_click(&this, move |this, window, cx| {
+                        this.confirm_delete(name.clone(), window, cx)
+                    })),
+            )
+        }
+    }
+
+    fn folder_menu(
+        &self,
+        folder: &str,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
+    {
+        let this = cx.entity().downgrade();
+        let folder = folder.to_owned();
+        move |menu, _, _| {
+            let (add_in, new_in, rename, remove) = (
+                folder.clone(),
+                folder.clone(),
+                folder.clone(),
+                folder.clone(),
+            );
+            menu.item(
+                PopupMenuItem::new("New connection")
+                    .on_click(menu_click(&this, move |this, window, cx| {
+                        this.open_form(None, add_in.clone(), window, cx)
+                    })),
+            )
+            .item(
+                PopupMenuItem::new("New folder").on_click(menu_click(
+                    &this,
+                    move |this, window, cx| {
+                        this.begin_folder_edit(new_in.clone(), None, window, cx)
+                    },
+                )),
+            )
+            .separator()
+            .item(PopupMenuItem::new("Rename").on_click(menu_click(
+                &this,
+                move |this, window, cx| {
+                    this.begin_folder_edit(String::new(), Some(rename.clone()), window, cx);
+                },
+            )))
+            .item(
+                PopupMenuItem::new("Delete")
+                    .on_click(menu_click(&this, move |this, window, cx| {
+                        this.confirm_remove_folder(remove.clone(), window, cx)
+                    })),
+            )
+        }
     }
 
     fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1490,6 +2010,15 @@ impl Workspace {
         v_flex()
             .size_full()
             .child(
+                div()
+                    .id("connection-color")
+                    .test_support()
+                    .w_full()
+                    .h(px(3.))
+                    .flex_none()
+                    .bg(logos::color_of(conn.adapter, &conn.color)),
+            )
+            .child(
                 h_flex()
                     .h(px(WINDOW_TOP_STRIP + 8.))
                     .flex_none()
@@ -1498,7 +2027,7 @@ impl Workspace {
                     .gap_2()
                     .border_b_1()
                     .border_color(border)
-                    .child(logos::icon(conn.adapter, &conn.color, 20., cx))
+                    .child(logos::icon(conn.adapter, 20.))
                     .child(div().font_semibold().child(conn.name.clone()))
                     .when_some(folder_label, |el, name| {
                         el.child(chip(name, muted, muted_bg))
@@ -1540,6 +2069,19 @@ impl Workspace {
                                 menu
                             })
                     })
+                    .when(self.connected.contains(&conn.name), |el| {
+                        let name = conn.name.clone();
+                        el.child(
+                            Button::new("disconnect")
+                                .ghost()
+                                .small()
+                                .icon(Icon::default().data(UNPLUG_ICON))
+                                .tooltip("Disconnect")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.disconnect(name.clone(), cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("edit")
                             .ghost()
@@ -1547,12 +2089,9 @@ impl Workspace {
                             .icon(Icon::default().data(EDIT_ICON))
                             .tooltip("Edit connection")
                             .on_click(cx.listener(|this, _, window, cx| {
-                                let existing = this.selected_connection();
-                                let folder = existing
-                                    .as_ref()
-                                    .map(|c| c.folder.clone())
-                                    .unwrap_or_default();
-                                this.open_form(existing, folder, window, cx);
+                                if let Some(conn) = this.selected_connection() {
+                                    this.edit_connection(conn, window, cx);
+                                }
                             })),
                     )
                     .child(
@@ -1561,9 +2100,11 @@ impl Workspace {
                             .small()
                             .icon(Icon::default().data(DELETE_ICON))
                             .tooltip("Delete connection")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.confirm_delete(window, cx)),
-                            ),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if let Some(name) = this.selected.clone() {
+                                    this.confirm_delete(name, window, cx);
+                                }
+                            })),
                     )
                     .child(
                         Button::new("run")
@@ -1668,12 +2209,9 @@ impl Render for Workspace {
             self.editor
                 .update(cx, |editor, cx| editor.set_value(text, window, cx));
         }
-        let has_toolbar =
-            self.form.is_none() && !self.settings_open && self.selected_connection().is_some();
+        let has_toolbar = self.form.is_none() && self.selected_connection().is_some();
         let main = if let Some(form) = self.form.clone() {
             div().size_full().child(form).into_any_element()
-        } else if self.settings_open {
-            self.render_settings(cx).into_any_element()
         } else if let Some(conn) = self.selected_connection() {
             self.render_query_view(&conn, cx).into_any_element()
         } else {
@@ -1684,7 +2222,7 @@ impl Render for Workspace {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .when(cfg!(not(target_os = "macos")), |el| {
-                el.child(TitleBar::new())
+                el.child(TitleBar::new().child(self.app_menu.clone()))
             })
             .child(
                 h_flex()
@@ -1711,6 +2249,45 @@ impl Render for Workspace {
                             }),
                     ),
             )
+    }
+}
+
+fn menu_click(
+    this: &WeakEntity<Workspace>,
+    run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+    let this = this.clone();
+    move |_, window, cx| {
+        this.update(cx, |this, cx| run(this, window, cx)).ok();
+    }
+}
+
+fn mcp_added_note(statuses: &[AgentStatus]) -> Notification {
+    if statuses.is_empty() {
+        return Notification::warning("No supported agents found on this computer.");
+    }
+    let failures: Vec<String> = statuses
+        .iter()
+        .filter_map(|status| match &status.state {
+            AgentState::Failed(reason) => Some(format!("{}: {reason}", status.name)),
+            _ => None,
+        })
+        .collect();
+    if !failures.is_empty() {
+        return Notification::error(failures.join("\n"));
+    }
+    let names: Vec<&str> = statuses.iter().map(|status| status.name).collect();
+    Notification::success(format!(
+        "MCP server added to {}. Restart them to use it.",
+        names.join(", ")
+    ))
+}
+
+fn mcp_status_text(running: usize) -> String {
+    match running {
+        0 => "MCP server not running. Agents start it when they need it.".to_owned(),
+        1 => "MCP server running for 1 agent".to_owned(),
+        n => format!("MCP server running for {n} agents"),
     }
 }
 
@@ -1748,7 +2325,11 @@ fn history_label(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
-    use super::{Config, Connection, Status, TreeRow, Workspace, bind_keys};
+    use super::{
+        About, AgentState, AgentStatus, Config, Connection, OpenSettings, Status, TreeRow,
+        UpdateState, Workspace, bind_keys, register_menu_actions,
+    };
+    use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds,
@@ -1770,7 +2351,10 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| Workspace::with_config(config, Status::Idle, window, cx))
+                let workspace =
+                    cx.new(|cx| Workspace::with_config(config, Status::Idle, window, cx));
+                register_menu_actions(&workspace, window.window_handle(), cx);
+                workspace
             })
             .expect("open test window")
         })
@@ -1794,6 +2378,259 @@ mod tests {
         };
         config.upsert(conn, None).unwrap();
         config
+    }
+
+    #[test]
+    fn mcp_status_text_counts_agents() {
+        assert!(super::mcp_status_text(0).contains("not running"));
+        assert_eq!(super::mcp_status_text(1), "MCP server running for 1 agent");
+        assert_eq!(super::mcp_status_text(3), "MCP server running for 3 agents");
+    }
+
+    #[gpui_kit::test]
+    fn settings_offers_to_add_the_server_while_an_agent_lacks_it(cx: &mut TestAppContext) {
+        let status = |state| AgentStatus {
+            name: "Cursor",
+            state,
+        };
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("open-settings", cx));
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.agents = Some(vec![status(AgentState::NotAdded)]);
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("add-mcp").visible());
+            workspace.update(cx, |this, cx| {
+                this.finish_adding_mcp(vec![status(AgentState::Added)], window, cx);
+            });
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("add-mcp").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_connection_color_shows_above_an_open_connection(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("connection-color").is_none());
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("connection-color").visible());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn right_clicking_a_connection_edits_it_without_selecting_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.form.as_ref().unwrap().read(cx).editing(), Some("db"));
+            assert_eq!(this.selected, None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn right_clicking_a_connection_can_delete_it_after_asking(cx: &mut TestAppContext) {
+        let (handle, _) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.click(2usize, cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.has_active_dialog(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn right_clicking_a_folder_renames_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.right_click("folder-Production", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click(3usize, cx));
+        cx.update(|cx| assert!(workspace.read(cx).folder_edit.is_some()));
+    }
+
+    #[gpui_kit::test]
+    fn deleting_another_connection_keeps_the_open_one(cx: &mut TestAppContext) {
+        let mut config = config_with_connection();
+        let other = Connection {
+            name: "other".into(),
+            ..config.find("db").unwrap().clone()
+        };
+        config.upsert(other, None).unwrap();
+        let (_, workspace) = open(config, cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.status = Status::Failed("kept".into());
+                this.delete_connection("other".into(), cx);
+                assert_eq!(this.selected.as_deref(), Some("db"));
+                assert!(matches!(this.status, Status::Failed(_)));
+                assert!(this.config.find("other").is_none());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn deleting_a_connection_closes_its_edit_form(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| this.delete_connection("db".into(), cx));
+            assert!(workspace.read(cx).form.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_short_result_shows_no_blank_rows(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                let result = QueryResult {
+                    columns: vec!["id".into()],
+                    rows: vec![vec![json!(1)], vec![json!(2)]],
+                    truncated: false,
+                    rows_affected: None,
+                    elapsed_ms: 1,
+                };
+                this.results.update(cx, |table, cx| {
+                    table.delegate_mut().set(&result);
+                    table.refresh(cx);
+                });
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |_, _| {});
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find(("row", 1usize)).is_some());
+            assert!(window.try_find(("row", 2usize)).is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn only_a_connection_with_a_picked_color_shows_the_dash(cx: &mut TestAppContext) {
+        let mut config = config_with_connection();
+        let colored = Connection {
+            name: "colored".into(),
+            color: "#E5484D".into(),
+            ..config.find("db").unwrap().clone()
+        };
+        config.upsert(colored, None).unwrap();
+        let (handle, _) = open(config, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("conn-color-colored").visible());
+            assert!(window.try_find("conn-color-db").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_light_shows_only_on_connected_connections(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("conn-status-db").is_none());
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.connected.insert("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("conn-status-db").visible());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn disconnecting_the_open_connection_leaves_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.connected.insert("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |_, _| {});
+        window_action(handle, cx, |window, cx| window.click("disconnect", cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.selected, None);
+            assert!(this.connected.is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn disconnecting_another_connection_keeps_the_open_one(cx: &mut TestAppContext) {
+        let mut config = config_with_connection();
+        let other = Connection {
+            name: "other".into(),
+            ..config.find("db").unwrap().clone()
+        };
+        config.upsert(other, None).unwrap();
+        let (_, workspace) = open(config, cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.connected
+                    .extend(["db".to_string(), "other".to_string()]);
+                this.disconnect("other".into(), cx);
+                assert_eq!(this.selected.as_deref(), Some("db"));
+                assert!(this.connected.contains("db"));
+                assert!(!this.connected.contains("other"));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_right_click_menu_offers_disconnect_when_connected(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.connected.insert("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |_, _| {});
+        window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        cx.update(|cx| assert!(workspace.read(cx).connected.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn no_disconnect_button_without_a_connection(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |_, _| {});
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("disconnect").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_mcp_status_opens_settings(cx: &mut TestAppContext) {
+        let (handle, _) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("mcp-status", cx));
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("check-updates").visible());
+        });
     }
 
     #[test]
@@ -2105,20 +2942,113 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn settings_panel_opens_and_closes(cx: &mut TestAppContext) {
+    fn settings_opens_in_a_dialog_and_its_close_icon_closes_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("check-updates").is_none());
             window.click("open-settings", cx);
         });
         window_action(handle, cx, |window, cx| {
-            assert!(window.find("check-updates").visible());
+            assert_eq!(window.find("check-updates").checked(), Some(true));
             window.click("check-updates", cx);
         });
         cx.update(|cx| assert!(!workspace.read(cx).config.check_for_updates));
-        window_action(handle, cx, |window, cx| window.click("close-settings", cx));
+        window_action(handle, cx, |window, cx| {
+            assert_eq!(window.find("check-updates").checked(), Some(false));
+            window.click("close", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_menu_and_shortcut_open_one_settings_dialog(cx: &mut TestAppContext) {
+        let (handle, _) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-,", cx));
+        window_action(handle, cx, |window, cx| {
+            window.dispatch_action(Box::new(OpenSettings), cx);
+        });
         window_action(handle, cx, |window, _| {
-            assert!(window.try_find("check-updates").is_none());
+            assert_eq!(window.find_all("check-updates").len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_menu_opens_about(cx: &mut TestAppContext) {
+        let (handle, _) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.dispatch_action(Box::new(About), cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("about").visible());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_menu_check_that_finds_a_version_offers_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.finish_update_check(Ok(Some("9.9.9".into())), window, cx);
+            });
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("download-update").visible());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_menu_check_does_not_disturb_a_download(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.update_state = Some(UpdateState::Downloading {
+                    version: "9.9.9".into(),
+                    percent: Default::default(),
+                });
+                this.finish_update_check(Ok(Some("9.9.10".into())), window, cx);
+            });
+        });
+        cx.update(|cx| {
+            assert!(matches!(
+                workspace.read(cx).update_state,
+                Some(UpdateState::Downloading { .. })
+            ));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn settings_leaves_an_open_form_in_place(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("open-settings", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+        cx.update(|cx| assert!(workspace.read(cx).form.is_some()));
+    }
+
+    #[gpui_kit::test]
+    fn the_run_shortcut_does_nothing_behind_the_settings_dialog(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("sql-editor", cx));
+        window_action(handle, cx, |window, cx| window.click("open-settings", cx));
+        window_action(handle, cx, |window, cx| {
+            window.press("secondary-enter", cx);
+        });
+        cx.update(|cx| {
+            assert!(!matches!(workspace.read(cx).status, Status::Busy(_)));
         });
     }
 
