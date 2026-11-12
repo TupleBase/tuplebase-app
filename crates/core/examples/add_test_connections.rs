@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
                 color: String::new(),
                 tls: TlsMode::default(),
                 ssh: None,
+                auth: None,
             };
             config.upsert(connection, None)?;
         }

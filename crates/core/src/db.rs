@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{Adapter, Connection, TlsMode};
 use crate::ssh::{self, Tunnel};
-use crate::{safety, secrets};
+use crate::{aws, safety, secrets};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
@@ -630,11 +630,16 @@ impl Db {
 /// Opens the SSH tunnel, if any, and then the connection pool.
 async fn connect(conn: &Connection) -> Result<Open> {
     let name = conn.name.clone();
-    // Keychain access can block (or show an OS prompt), so keep it off the runtime.
-    let password = if conn.adapter.is_file() {
-        None
+    // What to connect to: a secret in AWS can name the user and host as well.
+    let (target, password) = if conn.adapter.is_file() {
+        (conn.clone(), None)
+    } else if let Some(auth) = &conn.auth {
+        let (target, password) = aws::resolve(conn, auth).await?;
+        (target, Some(password))
     } else {
-        tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??
+        // Keychain access can block (or show an OS prompt), so keep it off the runtime.
+        let password = tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??;
+        (conn.clone(), password)
     };
     let tunnel = match &conn.ssh {
         None => None,
@@ -642,7 +647,7 @@ async fn connect(conn: &Connection) -> Result<Open> {
             let name = conn.name.clone();
             let secret =
                 tokio::task::spawn_blocking(move || secrets::get_ssh_password(&name)).await??;
-            let tunnel = ssh::open(conn, config, secret)
+            let tunnel = ssh::open(&target, config, secret)
                 .await
                 .with_context(|| format!("opening the SSH tunnel for \"{}\"", conn.name))?;
             Some(tunnel)
@@ -650,9 +655,9 @@ async fn connect(conn: &Connection) -> Result<Open> {
     };
     let (host, port) = match &tunnel {
         Some(tunnel) => ("127.0.0.1", tunnel.local_port()),
-        None => (conn.host.as_str(), conn.port),
+        None => (target.host.as_str(), target.port),
     };
-    let pool = open_pool(conn, host, port, password)
+    let pool = open_pool(&target, host, port, password)
         .await
         .with_context(|| format!("connecting to \"{}\"", conn.name))?;
     Ok(Open {

@@ -52,6 +52,41 @@ and CI. `<NAME>` is the connection name upper-cased, with every non-alphanumeric
 character replaced by `_`: connection `app-db` reads `TUPLEBASE_SECRET_APP_DB_PASSWORD`.
 `TUPLEBASE_SECRET_<NAME>_SSH_PASSWORD` does the same for the SSH password or passphrase.
 
+## Credentials kept in AWS
+
+A connection can take its credentials from AWS instead of the credential store. In the
+connection form, set **Credentials** to **AWS Secrets Manager** or **AWS Parameter Store**.
+
+`connections.json` then holds only where to look, never the value:
+
+```json
+"auth": { "type": "aws_secret", "profile": "prod-sso", "region": "eu-west-1", "name": "prod/orders-db", "use_secret_host": true }
+```
+
+| Field             | Meaning                                                                      |
+| ----------------- | ---------------------------------------------------------------------------- |
+| `type`            | `aws_secret` (Secrets Manager) or `aws_parameter` (Parameter Store)          |
+| `profile`         | A profile from `~/.aws/config`. Leave out to use your default AWS credentials |
+| `region`          | Leave out to use the profile's region                                        |
+| `name`            | Secret name or ARN, or parameter name                                        |
+| `use_secret_host` | Also take the host, port and database from the secret                        |
+
+The value is read from AWS every time the connection opens and is kept in memory only, so a
+rotated password needs nothing from you. It can be:
+
+- JSON in the shape RDS writes: `username`, `password`, and optionally `host`, `port` and
+  `dbname`. The secret's `username` replaces the connection's user. A database set on the
+  connection wins over `dbname`.
+- Any other text, which is used as the password. The connection then needs a user.
+
+Your AWS identity needs `secretsmanager:GetSecretValue` on the secret, or `ssm:GetParameter` on
+the parameter, plus `kms:Decrypt` when it is encrypted with your own KMS key.
+
+Signing in to AWS stays outside the app. When an SSO session has expired, run
+`aws sso login --profile <name>` and connect again.
+
+The MCP server reads these the same way, with the AWS profile of the user it runs as.
+
 ## Removing everything
 
 Deleting a connection in the app removes its settings and its password.

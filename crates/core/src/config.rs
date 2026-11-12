@@ -151,6 +151,45 @@ fn default_ssh_port() -> u16 {
     22
 }
 
+/// The AWS service that holds a connection's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AwsStore {
+    #[serde(rename = "aws_secret")]
+    SecretsManager,
+    #[serde(rename = "aws_parameter")]
+    ParameterStore,
+}
+
+impl AwsStore {
+    pub const ALL: [AwsStore; 2] = [AwsStore::SecretsManager, AwsStore::ParameterStore];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AwsStore::SecretsManager => "AWS Secrets Manager",
+            AwsStore::ParameterStore => "AWS Parameter Store",
+        }
+    }
+}
+
+/// Take the credentials from AWS on every connect, instead of the OS credential store.
+/// Only this pointer is saved; see [`crate::aws`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsAuth {
+    #[serde(rename = "type")]
+    pub store: AwsStore,
+    /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    /// Empty means the profile's region.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region: String,
+    /// Secret name or ARN, or parameter name.
+    pub name: String,
+    /// Also take the host, port and database from the secret.
+    #[serde(default)]
+    pub use_secret_host: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     /// Unique name; also the keychain account for this connection's password.
@@ -174,10 +213,14 @@ pub struct Connection {
     pub tls: TlsMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
+    /// `None` means a password from the OS credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AwsAuth>,
 }
 
 impl Connection {
-    /// Where it connects to, for display: the host, or a database file's name.
+    /// Where it connects to, for display: the host, a database file's name, or the
+    /// secret that names the host.
     pub fn location(&self) -> String {
         if self.adapter.is_file() {
             let name = Path::new(&self.database).file_name();
@@ -185,6 +228,8 @@ impl Connection {
                 || self.database.clone(),
                 |n| n.to_string_lossy().into_owned(),
             )
+        } else if let Some(auth) = self.auth.as_ref().filter(|a| a.use_secret_host) {
+            auth.name.clone()
         } else {
             self.host.clone()
         }
@@ -200,6 +245,20 @@ impl Connection {
             }
             if self.ssh.is_some() {
                 bail!("SSH tunnels don't apply to database files");
+            }
+            if self.auth.is_some() {
+                bail!("AWS credentials don't apply to database files");
+            }
+        } else if let Some(auth) = &self.auth {
+            // The user can come from the secret, and so can the host.
+            if auth.name.trim().is_empty() {
+                bail!(
+                    "a secret or parameter name is required for \"{}\"",
+                    self.name
+                );
+            }
+            if !auth.use_secret_host && self.host.trim().is_empty() {
+                bail!("host is required for \"{}\"", self.name);
             }
         } else {
             if self.host.trim().is_empty() {
@@ -508,6 +567,7 @@ mod tests {
             color: String::new(),
             tls: TlsMode::default(),
             ssh: None,
+            auth: None,
         }
     }
 
@@ -593,7 +653,56 @@ mod tests {
     #[test]
     fn default_tls_and_no_ssh_are_not_written() {
         let json = serde_json::to_string(&pg("a")).unwrap();
-        assert!(!json.contains("tls") && !json.contains("ssh"));
+        assert!(!json.contains("tls") && !json.contains("ssh") && !json.contains("auth"));
+    }
+
+    fn aws(name: &str) -> AwsAuth {
+        AwsAuth {
+            store: AwsStore::SecretsManager,
+            profile: "prod-sso".into(),
+            region: String::new(),
+            name: name.into(),
+            use_secret_host: false,
+        }
+    }
+
+    #[test]
+    fn aws_auth_is_saved_as_a_pointer() {
+        let mut conn = pg("a");
+        conn.auth = Some(aws("prod/orders"));
+        let json = serde_json::to_value(&conn).unwrap();
+        assert_eq!(
+            json["auth"],
+            serde_json::json!({
+                "type": "aws_secret",
+                "profile": "prod-sso",
+                "name": "prod/orders",
+                "use_secret_host": false,
+            })
+        );
+        assert_eq!(serde_json::from_value::<Connection>(json).unwrap(), conn);
+    }
+
+    #[test]
+    fn aws_auth_needs_a_name_and_can_supply_the_user_and_host() {
+        let mut config = Config::default();
+        let mut conn = pg("a");
+        conn.auth = Some(aws(""));
+        assert!(config.upsert(conn.clone(), None).is_err());
+
+        conn.auth = Some(aws("prod/orders"));
+        conn.user.clear();
+        assert!(config.upsert(conn.clone(), None).is_ok());
+
+        conn.host.clear();
+        assert!(config.upsert(conn.clone(), Some("a")).is_err());
+        conn.auth.as_mut().unwrap().use_secret_host = true;
+        assert!(config.upsert(conn.clone(), Some("a")).is_ok());
+        assert_eq!(conn.location(), "prod/orders");
+
+        let mut file = sqlite("/data/app.sqlite");
+        file.auth = Some(aws("prod/orders"));
+        assert!(config.upsert(file, None).is_err());
     }
 
     #[test]

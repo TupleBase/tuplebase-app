@@ -34,6 +34,11 @@ Local databases, user `dev`, password `dev`, database `app`:
 | PostgreSQL | 55432 |
 | MariaDB    | 53306 |
 | SSH server | 52222 |
+| Fake AWS   | 54566 |
+
+The fake AWS serves Secrets Manager and Parameter Store. To use it from the app or the AWS
+CLI, set `AWS_ENDPOINT_URL=http://127.0.0.1:54566`, `AWS_ACCESS_KEY_ID=test` and
+`AWS_SECRET_ACCESS_KEY=test`.
 
 To get these in the app, in a "Local test databases" folder that needs no passwords:
 

@@ -48,6 +48,7 @@ async fn database() -> (tempfile::TempDir, Connection) {
         color: String::new(),
         tls: Default::default(),
         ssh: None,
+        auth: None,
     };
     (dir, conn)
 }
