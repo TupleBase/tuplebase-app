@@ -9,6 +9,7 @@ mod results;
 mod runtime;
 mod schema;
 mod theme;
+mod tree_nav;
 mod workspace;
 
 use gpui_kit::component::{GlobalState, Theme, TitleBar};
