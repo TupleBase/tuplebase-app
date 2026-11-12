@@ -12,7 +12,6 @@ pub struct ResultsDelegate {
     columns: Vec<Column>,
     rows: Vec<Vec<String>>,
     /// What the database returned, for the row detail panel.
-    names: Vec<String>,
     values: Vec<Vec<Value>>,
     ran: bool,
 }
@@ -20,7 +19,6 @@ pub struct ResultsDelegate {
 impl ResultsDelegate {
     pub fn set(&mut self, result: &QueryResult) {
         self.ran = true;
-        self.names = result.columns.clone();
         self.values = result.rows.clone();
         self.rows = result
             .rows
@@ -52,20 +50,14 @@ impl ResultsDelegate {
     /// A row's fields as the database returned them, by column name.
     pub fn row(&self, row_ix: usize) -> Option<Vec<(String, Value)>> {
         let values = self.values.get(row_ix)?;
-        Some(
-            self.names
-                .iter()
-                .cloned()
-                .zip(values.iter().cloned())
-                .collect(),
-        )
+        let names = self.columns.iter().map(|column| column.name.to_string());
+        Some(names.zip(values.iter().cloned()).collect())
     }
 
     pub fn clear(&mut self) {
         self.ran = false;
         self.columns.clear();
         self.rows.clear();
-        self.names.clear();
         self.values.clear();
     }
 }
@@ -106,7 +98,7 @@ impl TableDelegate for ResultsDelegate {
     }
 
     /// Stripes here rather than with `DataTable::stripe`, which also pads a short result
-    /// with blank striped rows.
+    /// with blank striped rows. A click on a row opens its detail panel, hence the hand.
     fn render_tr(
         &mut self,
         row_ix: usize,
@@ -116,6 +108,7 @@ impl TableDelegate for ResultsDelegate {
         let stripe = cx.theme().tokens.table_even;
         div()
             .id(("row", row_ix))
+            .cursor_pointer()
             .when(row_ix.is_multiple_of(2), |row| row.bg(stripe))
     }
 
