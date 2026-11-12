@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -321,10 +322,21 @@ pub struct Config {
     /// Ask GitHub for a newer version at startup.
     #[serde(default = "enabled")]
     pub check_for_updates: bool,
+    /// Size of the app's text, in pixels.
+    #[serde(default = "default_font_size")]
+    pub font_size: u8,
 }
+
+pub const DEFAULT_FONT_SIZE: u8 = 16;
+/// The smallest and largest text the app offers.
+pub const FONT_SIZES: RangeInclusive<u8> = 10..=28;
 
 fn enabled() -> bool {
     true
+}
+
+fn default_font_size() -> u8 {
+    DEFAULT_FONT_SIZE
 }
 
 impl Default for Config {
@@ -334,6 +346,7 @@ impl Default for Config {
             folders: Vec::new(),
             connections: Vec::new(),
             check_for_updates: true,
+            font_size: DEFAULT_FONT_SIZE,
         }
     }
 }
@@ -380,16 +393,26 @@ impl Config {
         }
         let text =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         if config.version != 1 {
             bail!("unsupported config version {}", config.version);
         }
+        config.resize_font(0);
         Ok(config)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         write_atomic(path, &serde_json::to_string_pretty(self)?)
+    }
+
+    /// Makes the app's text `steps` pixels larger, or smaller for a negative number,
+    /// staying within [`FONT_SIZES`].
+    pub fn resize_font(&mut self, steps: i8) {
+        self.font_size = self
+            .font_size
+            .saturating_add_signed(steps)
+            .clamp(*FONT_SIZES.start(), *FONT_SIZES.end());
     }
 
     /// Every folder path, parents before their children.
@@ -908,6 +931,34 @@ mod tests {
     fn update_check_defaults_to_on_for_existing_files() {
         let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
         assert!(config.check_for_updates);
+    }
+
+    #[test]
+    fn font_size_defaults_for_existing_files() {
+        let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
+        assert_eq!(config.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn resizing_the_font_stops_at_the_limits() {
+        let mut config = Config::default();
+        config.resize_font(2);
+        assert_eq!(config.font_size, DEFAULT_FONT_SIZE + 2);
+        config.resize_font(i8::MAX);
+        assert_eq!(config.font_size, *FONT_SIZES.end());
+        config.resize_font(i8::MIN);
+        assert_eq!(config.font_size, *FONT_SIZES.start());
+    }
+
+    #[test]
+    fn a_font_size_out_of_range_in_the_file_is_brought_back_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, r#"{ "version": 1, "font_size": 200 }"#).unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().font_size,
+            *FONT_SIZES.end()
+        );
     }
 
     #[test]

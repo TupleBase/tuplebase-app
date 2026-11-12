@@ -48,6 +48,12 @@ It uses the connections saved in the app and is read-only by default.
 Add it to your installed agents in one click from Settings or the app menu. An indicator in the
 sidebar shows when an agent has it running.
 
+## Appearance
+
+- Make all text larger or smaller with `Cmd` and `+` or `-` on macOS, `Ctrl` on Windows and
+  Linux, or from the View menu. `Cmd+0` or `Ctrl+0` brings back the default size.
+- The size is kept between launches.
+
 ## Updates
 
 The app offers new versions in the sidebar and installs them in the background. You can also
