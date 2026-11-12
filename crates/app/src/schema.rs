@@ -375,7 +375,6 @@ impl SchemaPanel {
                     .id(SharedString::from(id.clone()))
                     .test_support()
                     .group(group.clone())
-                    .relative()
                     .pl(px(14.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
@@ -394,8 +393,7 @@ impl SchemaPanel {
                     })
                     .child(
                         h_flex()
-                            .absolute()
-                            .right_0()
+                            .flex_none()
                             .invisible()
                             .group_hover(group, |s| s.visible())
                             .child(
