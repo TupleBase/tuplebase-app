@@ -268,6 +268,7 @@ enum Panel {
     Sidebar,
     Schema,
     Editor,
+    Chat,
 }
 
 impl Panel {
@@ -276,6 +277,7 @@ impl Panel {
             Panel::Sidebar => 300.,
             Panel::Schema => 270.,
             Panel::Editor => 220.,
+            Panel::Chat => 380.,
         }
     }
 
@@ -284,6 +286,7 @@ impl Panel {
             Panel::Sidebar => px(200.)..px(520.),
             Panel::Schema => px(180.)..px(380.),
             Panel::Editor => px(80.)..px(900.),
+            Panel::Chat => px(280.)..px(720.),
         }
     }
 
@@ -293,6 +296,16 @@ impl Panel {
             Panel::Sidebar => "sidebar",
             Panel::Schema => "schema",
             Panel::Editor => "editor",
+            Panel::Chat => "chat",
+        }
+    }
+
+    /// Where it sits in its group: the chat is third, after the sidebar and the main
+    /// area; the others come first.
+    fn index(self) -> usize {
+        match self {
+            Panel::Chat => 2,
+            _ => 0,
         }
     }
 }
@@ -1117,7 +1130,7 @@ impl Workspace {
     }
 
     /// A panel that opens where it was last dragged to and keeps that size when the
-    /// window resizes. It must be the first panel of its group.
+    /// window resizes.
     fn sized_panel(&self, panel: Panel) -> ResizablePanel {
         let saved = self.session.panels.get(panel.key());
         resizable_panel()
@@ -1126,20 +1139,23 @@ impl Workspace {
             .fixed()
     }
 
-    /// Keeps the size the first panel of a group was dragged to.
-    fn remember_panel_size(
+    /// Keeps the sizes these panels of one group were dragged to. One that is not shown
+    /// keeps the size it had.
+    fn remember_panel_sizes(
         &self,
-        panel: Panel,
+        panels: &'static [Panel],
         cx: &mut Context<Self>,
     ) -> impl Fn(&Entity<ResizableState>, &mut Window, &mut App) + 'static {
         let this = cx.entity().downgrade();
         move |state, _, cx| {
-            let Some(size) = state.read(cx).sizes().first().copied() else {
-                return;
-            };
+            let sizes = state.read(cx).sizes().clone();
             this.update(cx, |this, cx| {
-                let size = size.as_f32().round() as u32;
-                this.session.panels.insert(panel.key().into(), size);
+                for panel in panels {
+                    if let Some(size) = sizes.get(panel.index()) {
+                        let size = size.as_f32().round() as u32;
+                        this.session.panels.insert(panel.key().into(), size);
+                    }
+                }
                 this.schedule_session_save(cx);
             })
             .ok();
@@ -2027,7 +2043,7 @@ impl Workspace {
         };
         let folder_label = (!conn.folder.is_empty()).then(|| conn.folder.replace('/', " / "));
         let editor_and_results = v_resizable("editor-panels")
-            .on_resize(self.remember_panel_size(Panel::Editor, cx))
+            .on_resize(self.remember_panel_sizes(&[Panel::Editor], cx))
             .child(
                 self.sized_panel(Panel::Editor).child(
                     div()
@@ -2172,7 +2188,7 @@ impl Workspace {
             .child(
                 div().flex_1().min_h_0().child(
                     h_resizable("query-panels")
-                        .on_resize(self.remember_panel_size(Panel::Schema, cx))
+                        .on_resize(self.remember_panel_sizes(&[Panel::Schema], cx))
                         .child(self.sized_panel(Panel::Schema).child(self.schema.clone()))
                         .child(
                             resizable_panel().child(
@@ -2256,43 +2272,42 @@ impl Render for Workspace {
                 el.child(TitleBar::new().child(self.app_menu.clone()))
             })
             .child(
-                h_flex()
+                div()
                     .flex_1()
                     .min_h_0()
                     .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_query(cx)))
                     .child(
-                        // The chat keeps its width; the panels beside it share the rest.
-                        div().flex_1().h_full().min_w_0().child(
-                            h_resizable("workspace-panels")
-                                .on_resize(self.remember_panel_size(Panel::Sidebar, cx))
-                                .child(
-                                    self.sized_panel(Panel::Sidebar)
-                                        .child(self.render_sidebar(cx)),
-                                )
-                                .child(
-                                    resizable_panel()
-                                        .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
-                                        .child(
-                                            div()
-                                                .relative()
-                                                .size_full()
-                                                .min_w_0()
-                                                .child(main)
-                                                .when(!has_toolbar, |el| {
-                                                    el.child(
-                                                        drag_area()
-                                                            .absolute()
-                                                            .top_0()
-                                                            .left_0()
-                                                            .w_full()
-                                                            .h(px(WINDOW_TOP_STRIP)),
-                                                    )
-                                                }),
+                        h_resizable("workspace-panels")
+                            .on_resize(
+                                self.remember_panel_sizes(&[Panel::Sidebar, Panel::Chat], cx),
+                            )
+                            .child(
+                                self.sized_panel(Panel::Sidebar)
+                                    .child(self.render_sidebar(cx)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
+                                    .child(
+                                        div().relative().size_full().min_w_0().child(main).when(
+                                            !has_toolbar,
+                                            |el| {
+                                                el.child(
+                                                    drag_area()
+                                                        .absolute()
+                                                        .top_0()
+                                                        .left_0()
+                                                        .w_full()
+                                                        .h(px(WINDOW_TOP_STRIP)),
+                                                )
+                                            },
                                         ),
-                                ),
-                        ),
-                    )
-                    .when(self.chat_open, |el| el.child(self.chat.clone())),
+                                    ),
+                            )
+                            .when(self.chat_open, |el| {
+                                el.child(self.sized_panel(Panel::Chat).child(self.chat.clone()))
+                            }),
+                    ),
             )
     }
 }
@@ -2710,7 +2725,7 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn a_chat_suggestion_is_asked_and_a_new_chat_forgets_it(cx: &mut TestAppContext) {
+    fn a_chat_suggestion_is_asked_and_clearing_forgets_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| window.click("toggle-chat", cx));
         window_action(handle, cx, |window, cx| {
@@ -2721,7 +2736,7 @@ mod tests {
             assert_eq!(chat.asked(), ["Which connections can you see?"]);
             assert!(chat.is_busy());
             assert!(window.find("chat-busy").visible());
-            window.click("chat-new", cx);
+            window.click("chat-clear", cx);
         });
         cx.update(|cx| {
             let chat = workspace.read(cx).chat.read(cx);
@@ -3184,6 +3199,30 @@ mod tests {
         });
         assert_eq!(handle_left(cx), before + px(80.));
         cx.update(|cx| assert_eq!(workspace.read(cx).session.panels["sidebar"], 380));
+    }
+
+    #[gpui_kit::test]
+    fn the_chat_opens_at_its_saved_width_and_dragging_its_edge_resizes_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        workspace.update(cx, |this, _| {
+            this.session.panels.insert("chat".into(), 420);
+        });
+        window_action(handle, cx, |window, cx| window.click("toggle-chat", cx));
+        let chat = window_action(handle, cx, |window, _| window.find("chat-panel").bounds());
+        assert_eq!(chat.size.width, px(420.));
+        let edge = point(chat.left(), px(400.));
+        window_action(handle, cx, |window, cx| {
+            window.drag(edge, edge - point(px(60.), px(0.)), cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert_eq!(window.find("chat-panel").bounds().size.width, px(480.));
+        });
+        cx.update(|cx| {
+            let panels = &workspace.read(cx).session.panels;
+            assert_eq!(panels["chat"], 480);
+            // The sidebar was not dragged, so it keeps its width.
+            assert_eq!(panels["sidebar"], 300);
+        });
     }
 
     #[gpui_kit::test]

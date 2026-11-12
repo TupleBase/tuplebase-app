@@ -12,12 +12,14 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::agents::server_next_to;
-use crate::config::{CONFIG_DIR_ENV, config_dir};
+use crate::config::{CONFIG_DIR_ENV, config_dir, write_atomic};
 
 pub const AGENT_NAME: &str = "Claude Code";
 
 const SERVER_NAME: &str = "tuplebase";
 const TOOL_PREFIX: &str = "mcp__tuplebase__";
+/// Tells the agent where our server is. Kept next to the app's config.
+const MCP_CONFIG_FILE: &str = "chat-mcp.json";
 /// The server's opt-in for writes. The panel never gives it.
 const ALLOW_WRITES_ENV: &str = "TUPLEBASE_MCP_ALLOW_WRITES";
 /// The agent prints its whole input; the panel shows this much of it.
@@ -64,11 +66,17 @@ pub fn ask(
         .and_then(|exe| server_next_to(&exe))
         .context("the MCP server is missing next to the app")?;
 
+    // In a file, not on the command line: Windows can't pass JSON's quotes to an agent
+    // that was installed as a batch file.
+    let config_dir = config_dir()?;
+    let servers = config_dir.join(MCP_CONFIG_FILE);
+    write_atomic(&servers, &mcp_config(&server, &config_dir))?;
+
     let mut command = Command::new(agent);
     command
         .args(["--print", "--verbose", "--output-format", "stream-json"])
         .args(["--strict-mcp-config", "--mcp-config"])
-        .arg(mcp_config(&server, &config_dir()?))
+        .arg(servers)
         // No tools of its own, and ours need no asking: the server guards itself.
         .args(["--tools", ""])
         .arg("--allowedTools")

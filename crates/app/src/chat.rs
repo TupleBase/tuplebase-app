@@ -15,7 +15,7 @@ use tuplebase_core::chat::{self, AGENT_NAME, Event};
 
 use crate::runtime::blocking;
 
-const PANEL_WIDTH: f32 = 380.;
+const CLEAR_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
 /// How often the panel shows what the agent has done so far.
 const STREAM_POLL: Duration = Duration::from_millis(150);
 /// One click asks these; they double as a check that the agent reaches the server.
@@ -306,11 +306,7 @@ impl Render for ChatPanel {
         v_flex()
             .id("chat-panel")
             .test_support()
-            .w(px(PANEL_WIDTH))
-            .h_full()
-            .flex_none()
-            .border_l_1()
-            .border_color(border)
+            .size_full()
             .child(
                 h_flex()
                     .p_2()
@@ -323,12 +319,13 @@ impl Render for ChatPanel {
                         h_flex()
                             .gap_1()
                             .child(
-                                Button::new("chat-new")
+                                Button::new("chat-clear")
                                     .cursor_pointer()
                                     .ghost()
                                     .xsmall()
-                                    .icon(IconName::Plus)
-                                    .tooltip("New chat")
+                                    .icon(Icon::default().data(CLEAR_ICON))
+                                    .tooltip("Clear chat")
+                                    .disabled(self.entries.is_empty())
                                     .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
                             )
                             .child(
