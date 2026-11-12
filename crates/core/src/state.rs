@@ -1,4 +1,4 @@
-//! Working state kept between launches: unsaved SQL and query history.
+//! Working state kept between launches: unsaved SQL, query history and panel sizes.
 //!
 //! Stored next to the connections file. It never holds passwords, but query text can
 //! contain any value someone typed into it.
@@ -28,6 +28,9 @@ pub struct SessionState {
     /// Oldest first.
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    /// Sizes the user dragged panels to, in whole pixels, by panel name.
+    #[serde(default)]
+    pub panels: BTreeMap<String, u32>,
 }
 
 impl SessionState {
@@ -162,6 +165,7 @@ mod tests {
         let path = dir.path().join(STATE_FILE);
         let mut state = SessionState::default();
         state.set_draft("a", "select 1");
+        state.panels.insert("sidebar".into(), 340);
         state.save_to(&path).unwrap();
         assert_eq!(SessionState::load_from(&path), state);
         std::fs::write(&path, "not json").unwrap();

@@ -1,6 +1,7 @@
 //! Main window: connection sidebar, SQL editor, results table.
 
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -12,6 +13,9 @@ use gpui_kit::component::menu::{
     AppMenuBar, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem,
 };
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::resizable::{
+    ResizablePanel, ResizableState, h_resizable, resizable_panel, v_resizable,
+};
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -159,7 +163,9 @@ const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
 
 const HISTORY_MENU_SIZE: usize = 20;
 const TREE_CONTEXT: &str = "ConnectionTree";
-const SIDEBAR_WIDTH: f32 = 300.;
+/// The least room the sidebar leaves beside it. It fits the schema panel at its widest
+/// next to an editor that is still usable.
+const MAIN_MIN_WIDTH: f32 = 480.;
 /// Sidebar indent per folder level.
 const TREE_INDENT: f32 = 16.;
 /// Empty space at the top of the window, where the traffic lights sit on macOS.
@@ -253,6 +259,41 @@ enum UpdateState {
         download: updates::Download,
         installation: updates::Installation,
     },
+}
+
+/// A panel whose edge can be dragged. Its size is kept between launches.
+#[derive(Clone, Copy)]
+enum Panel {
+    Sidebar,
+    Schema,
+    Editor,
+}
+
+impl Panel {
+    fn default_size(self) -> f32 {
+        match self {
+            Panel::Sidebar => 300.,
+            Panel::Schema => 270.,
+            Panel::Editor => 220.,
+        }
+    }
+
+    fn size_range(self) -> Range<Pixels> {
+        match self {
+            Panel::Sidebar => px(200.)..px(520.),
+            Panel::Schema => px(180.)..px(380.),
+            Panel::Editor => px(80.)..px(900.),
+        }
+    }
+
+    /// The name its size is saved under.
+    fn key(self) -> &'static str {
+        match self {
+            Panel::Sidebar => "sidebar",
+            Panel::Schema => "schema",
+            Panel::Editor => "editor",
+        }
+    }
 }
 
 pub struct Workspace {
@@ -1057,6 +1098,36 @@ impl Workspace {
         }
     }
 
+    /// A panel that opens where it was last dragged to and keeps that size when the
+    /// window resizes. It must be the first panel of its group.
+    fn sized_panel(&self, panel: Panel) -> ResizablePanel {
+        let saved = self.session.panels.get(panel.key());
+        resizable_panel()
+            .size(px(saved.map_or(panel.default_size(), |size| *size as f32)))
+            .size_range(panel.size_range())
+            .fixed()
+    }
+
+    /// Keeps the size the first panel of a group was dragged to.
+    fn remember_panel_size(
+        &self,
+        panel: Panel,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&Entity<ResizableState>, &mut Window, &mut App) + 'static {
+        let this = cx.entity().downgrade();
+        move |state, _, cx| {
+            let Some(size) = state.read(cx).sizes().first().copied() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                let size = size.as_f32().round() as u32;
+                this.session.panels.insert(panel.key().into(), size);
+                this.schedule_session_save(cx);
+            })
+            .ok();
+        }
+    }
+
     /// Saves shortly after the last change, so typing doesn't write on every keystroke.
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
         self._session_save = Some(cx.spawn(async move |this, cx| {
@@ -1327,12 +1398,8 @@ impl Workspace {
         let theme = cx.theme();
         let (border, bg) = (theme.sidebar_border, theme.sidebar);
         v_flex()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
-            .flex_none()
+            .size_full()
             .bg(bg)
-            .border_r_1()
-            .border_color(border)
             .when(cfg!(target_os = "macos"), |el| {
                 el.child(drag_area().w_full().h(px(WINDOW_TOP_STRIP)).flex_none())
             })
@@ -1910,6 +1977,34 @@ impl Workspace {
                 .child(text)
         };
         let folder_label = (!conn.folder.is_empty()).then(|| conn.folder.replace('/', " / "));
+        let editor_and_results = v_resizable("editor-panels")
+            .on_resize(self.remember_panel_size(Panel::Editor, cx))
+            .child(
+                self.sized_panel(Panel::Editor).child(
+                    div()
+                        .id("sql-editor")
+                        .test_support()
+                        .size_full()
+                        .child(Editor::new(&self.editor).appearance(false).h_full()),
+                ),
+            )
+            .child(
+                resizable_panel().child(
+                    div().size_full().min_w_0().child(match placeholder {
+                        Some(text) => h_flex()
+                            .size_full()
+                            .justify_center()
+                            .text_sm()
+                            .text_color(muted)
+                            .child(text)
+                            .into_any_element(),
+                        None => DataTable::new(&self.results)
+                            .small()
+                            .bordered(false)
+                            .into_any_element(),
+                    }),
+                ),
+            );
         v_flex()
             .size_full()
             .child(
@@ -2021,42 +2116,20 @@ impl Workspace {
                     ),
             )
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.schema.clone())
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(
-                                div()
-                                    .id("sql-editor")
-                                    .test_support()
-                                    .h(px(220.))
-                                    .flex_none()
-                                    .border_b_1()
-                                    .border_color(border)
-                                    .child(Editor::new(&self.editor).appearance(false).h_full()),
-                            )
-                            .child(
-                                div().flex_1().min_h_0().child(match placeholder {
-                                    Some(text) => h_flex()
-                                        .size_full()
-                                        .justify_center()
-                                        .text_sm()
-                                        .text_color(muted)
-                                        .child(text)
-                                        .into_any_element(),
-                                    None => DataTable::new(&self.results)
-                                        .small()
-                                        .bordered(false)
-                                        .into_any_element(),
-                                }),
-                            )
-                            .child(self.render_status(cx)),
-                    ),
+                div().flex_1().min_h_0().child(
+                    h_resizable("query-panels")
+                        .on_resize(self.remember_panel_size(Panel::Schema, cx))
+                        .child(self.sized_panel(Panel::Schema).child(self.schema.clone()))
+                        .child(
+                            resizable_panel().child(
+                                v_flex()
+                                    .size_full()
+                                    .min_w_0()
+                                    .child(div().flex_1().min_h_0().child(editor_and_results))
+                                    .child(self.render_status(cx)),
+                            ),
+                        ),
+                ),
             )
     }
 
@@ -2128,28 +2201,36 @@ impl Render for Workspace {
                 el.child(TitleBar::new().child(self.app_menu.clone()))
             })
             .child(
-                h_flex()
+                div()
                     .flex_1()
                     .min_h_0()
                     .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_query(cx)))
-                    .child(self.render_sidebar(cx))
                     .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .child(main)
-                            .when(!has_toolbar, |el| {
-                                el.child(
-                                    drag_area()
-                                        .absolute()
-                                        .top_0()
-                                        .left_0()
-                                        .w_full()
-                                        .h(px(WINDOW_TOP_STRIP)),
-                                )
-                            }),
+                        h_resizable("workspace-panels")
+                            .on_resize(self.remember_panel_size(Panel::Sidebar, cx))
+                            .child(
+                                self.sized_panel(Panel::Sidebar)
+                                    .child(self.render_sidebar(cx)),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
+                                    .child(
+                                        div().relative().size_full().min_w_0().child(main).when(
+                                            !has_toolbar,
+                                            |el| {
+                                                el.child(
+                                                    drag_area()
+                                                        .absolute()
+                                                        .top_0()
+                                                        .left_0()
+                                                        .w_full()
+                                                        .h(px(WINDOW_TOP_STRIP)),
+                                                )
+                                            },
+                                        ),
+                                    ),
+                            ),
                     ),
             )
     }
@@ -2236,7 +2317,7 @@ mod tests {
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds,
-        WindowOptions, px, size,
+        WindowOptions, point, px, size,
     };
     use serde_json::json;
     use tuplebase_core::config::{Adapter, AwsAuth, AwsStore};
@@ -2931,6 +3012,51 @@ mod tests {
         window_action(handle, cx, |window, _| {
             assert_eq!(window.find_all("check-updates").len(), 1);
         });
+    }
+
+    #[gpui_kit::test]
+    fn dragging_the_sidebar_edge_resizes_it_and_keeps_the_size(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        let handle_left = |cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, _| {
+                window.find(("resizable-handle", 0usize)).bounds().left()
+            })
+        };
+        let before = handle_left(cx);
+        let edge = point(px(300.), px(400.));
+        window_action(handle, cx, |window, cx| {
+            window.drag(edge, edge + point(px(80.), px(0.)), cx);
+        });
+        assert_eq!(handle_left(cx), before + px(80.));
+        cx.update(|cx| assert_eq!(workspace.read(cx).session.panels["sidebar"], 380));
+    }
+
+    #[gpui_kit::test]
+    fn panels_open_at_their_saved_size(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        workspace.update(cx, |this, cx| {
+            this.session.panels.insert("editor".into(), 400);
+            this.select("db".into(), cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert_eq!(window.find("sql-editor").bounds().size.height, px(400.));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn dragging_below_the_editor_resizes_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        workspace.update(cx, |this, cx| this.select("db".into(), cx));
+        let editor = window_action(handle, cx, |window, _| window.find("sql-editor").bounds());
+        let edge = point(editor.center().x, editor.bottom());
+        window_action(handle, cx, |window, cx| {
+            window.drag(edge, edge + point(px(0.), px(60.)), cx);
+        });
+        window_action(handle, cx, |window, _| {
+            let height = window.find("sql-editor").bounds().size.height;
+            assert_eq!(height, editor.size.height + px(60.));
+        });
+        cx.update(|cx| assert_eq!(workspace.read(cx).session.panels["editor"], 280));
     }
 
     #[gpui_kit::test]

@@ -17,7 +17,6 @@ use crate::completions::SchemaNames;
 use crate::runtime::io;
 
 const TABLE_ICON: &[u8] = include_bytes!("../../../assets/icons/table-2.svg");
-const PANEL_WIDTH: f32 = 270.;
 const ROW_HEIGHT: f32 = 30.;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -488,7 +487,7 @@ impl Render for SchemaPanel {
             &self.expanded,
         ));
         let theme = cx.theme();
-        let (border, muted) = (theme.border, theme.muted_foreground);
+        let muted = theme.muted_foreground;
         let message = match self.load {
             Load::Idle => Some(""),
             Load::Loading if self.tables.is_empty() => Some("Loading…"),
@@ -498,11 +497,7 @@ impl Render for SchemaPanel {
             _ => None,
         };
         v_flex()
-            .w(px(PANEL_WIDTH))
-            .h_full()
-            .flex_none()
-            .border_r_1()
-            .border_color(border)
+            .size_full()
             .child(
                 h_flex()
                     .p_2()

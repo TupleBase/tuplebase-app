@@ -53,6 +53,8 @@ sidebar shows when an agent has it running.
 - Make all text larger or smaller with `Cmd` and `+` or `-` on macOS, `Ctrl` on Windows and
   Linux, or from the View menu. `Cmd+0` or `Ctrl+0` brings back the default size.
 - The size is kept between launches.
+- Drag the edge of the sidebar, the schema browser or the editor to resize it. The sizes are
+  kept between launches.
 
 ## Updates
 
