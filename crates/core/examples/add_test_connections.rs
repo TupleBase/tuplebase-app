@@ -2,7 +2,7 @@
 //! They need no passwords, so nothing is written to the OS credential store.
 //! Safe to run again: anything already there is left alone.
 //!
-//! With `AWS_ENDPOINT_URL` set, as `make dev-fake-aws` does, it also stores a secret in that
+//! With `AWS_ENDPOINT_URL` set, as `make dev` does, it also stores a secret in that
 //! fake AWS and adds a connection that takes its credentials from it. Without the variable
 //! nothing is sent to AWS, so a real account is never written to.
 
