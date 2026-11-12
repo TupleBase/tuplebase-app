@@ -1461,7 +1461,11 @@ impl Workspace {
                 v_flex()
                     .id("connections")
                     .track_focus(&self.tree_focus)
-                    .key_context(tree_nav::CONTEXT)
+                    // The folder name field sits inside the tree and passes on keys it has
+                    // no use for, such as Enter; they must not reach the tree.
+                    .when(self.folder_edit.is_none(), |el| {
+                        el.key_context(tree_nav::CONTEXT)
+                    })
                     .track_scroll(&self.tree_scroll)
                     .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.move_cursor(-1, cx)))
                     .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.move_cursor(1, cx)))
@@ -3370,6 +3374,42 @@ mod tests {
             assert!(window.find("folder-Local").visible());
         });
         cx.update(|cx| assert_eq!(workspace.read(cx).config.folders(), ["Local"]));
+    }
+
+    #[gpui_kit::test]
+    fn enter_in_the_folder_field_leaves_the_tree_alone(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.press("up", cx));
+        window_action(handle, cx, |window, cx| window.click("add-folder", cx));
+        window_action(handle, cx, |window, cx| {
+            window.input("Local", cx);
+            window.press("enter", cx);
+        });
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert!(this.config.folders().contains(&"Local".to_owned()));
+            assert!(this.collapsed.is_empty());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_filter_keeps_schemas_from_folding_unseen(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_tables(&workspace, &["users"], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("schema-filter", cx);
+            window.input("us", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("schema-public", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("schema-filter", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("table-public-users").visible());
+        });
     }
 
     #[gpui_kit::test]

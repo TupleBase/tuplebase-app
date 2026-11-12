@@ -300,7 +300,16 @@ impl SchemaPanel {
         self.connection.as_ref().is_some_and(|c| c.name == name)
     }
 
+    /// A filter shows every match whatever is closed, so nothing folds while one is set:
+    /// the change would only show up, unasked, once the filter is cleared.
+    fn is_filtering(&self, cx: &App) -> bool {
+        !self.filter_text(cx).trim().is_empty()
+    }
+
     fn toggle_schema(&mut self, schema: &str, cx: &mut Context<Self>) {
+        if self.is_filtering(cx) {
+            return;
+        }
         if !self.collapsed.remove(schema) {
             self.collapsed.insert(schema.to_owned());
         }
@@ -308,6 +317,9 @@ impl SchemaPanel {
     }
 
     fn toggle_group(&mut self, schema: String, kind: ObjectKind, cx: &mut Context<Self>) {
+        if self.is_filtering(cx) {
+            return;
+        }
         let key = (schema, kind);
         if !self.open_groups.remove(&key) {
             self.open_groups.insert(key);
@@ -423,8 +435,7 @@ impl SchemaPanel {
 
     /// Left arrow: closes what is open, otherwise jumps to the schema above.
     fn collapse_cursor(&mut self, cx: &mut Context<Self>) {
-        // A filter shows every match, so there is nothing to close while one is set.
-        let can_close = self.filter_text(cx).trim().is_empty();
+        let can_close = !self.is_filtering(cx);
         match self.cursor_row(cx) {
             Some(Row::Schema {
                 name,
