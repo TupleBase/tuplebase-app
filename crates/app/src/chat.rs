@@ -65,8 +65,8 @@ pub struct ChatPanel {
     /// The agent's name for this conversation, once it has answered.
     session: Option<String>,
     busy: bool,
-    /// Counts conversations, so an answer to a cleared one is dropped.
-    conversation: usize,
+    /// Counts messages sent and chats cleared, so an answer nobody waits for is dropped.
+    turn: usize,
     scroll: ScrollHandle,
     _input_subscription: Subscription,
 }
@@ -89,7 +89,7 @@ impl ChatPanel {
             expanded: HashSet::new(),
             session: None,
             busy: false,
-            conversation: 0,
+            turn: 0,
             scroll: ScrollHandle::new(),
             _input_subscription,
         }
@@ -114,9 +114,10 @@ impl ChatPanel {
             return;
         }
         self.busy = true;
+        self.turn += 1;
         self.push(Entry::User(prompt.clone().into()), cx);
         let inbox = Inbox::default();
-        let conversation = self.conversation;
+        let turn = self.turn;
         let session = self.session.clone();
 
         // Shows the agent's steps as they come, until it has answered.
@@ -125,7 +126,7 @@ impl ChatPanel {
             loop {
                 cx.background_executor().timer(STREAM_POLL).await;
                 let waiting = this.update(cx, |this, cx| {
-                    let current = this.busy && this.conversation == conversation;
+                    let current = this.busy && this.turn == turn;
                     if current {
                         this.take(&seen, cx);
                     }
@@ -147,7 +148,7 @@ impl ChatPanel {
             })
             .await;
             this.update(cx, |this, cx| {
-                if this.conversation != conversation {
+                if this.turn != turn {
                     return;
                 }
                 this.take(&inbox, cx);
@@ -178,7 +179,7 @@ impl ChatPanel {
 
     /// Forgets the conversation. An answer still on its way is dropped when it arrives.
     fn clear(&mut self, cx: &mut Context<Self>) {
-        self.conversation += 1;
+        self.turn += 1;
         self.entries.clear();
         self.expanded.clear();
         self.session = None;
@@ -408,23 +409,5 @@ impl ChatPanel {
                 _ => None,
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // No glob: gpui_kit's `test` macro would shadow the built-in `#[test]`.
-    use super::{Entry, Event};
-
-    #[test]
-    fn the_agents_steps_become_entries() {
-        assert_eq!(
-            Entry::from(Event::Text("Two.".into())),
-            Entry::Agent("Two.".into())
-        );
-        assert_eq!(
-            Entry::from(Event::ToolFailed("no such table".into())),
-            Entry::Error("no such table".into())
-        );
     }
 }

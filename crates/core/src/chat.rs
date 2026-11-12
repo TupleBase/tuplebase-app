@@ -4,12 +4,11 @@
 //! once, headless, with our MCP server as its only tool, so it can do here exactly what
 //! the server allows and nothing else on this computer. Only Claude Code for now.
 
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::agents::server_next_to;
@@ -19,6 +18,8 @@ pub const AGENT_NAME: &str = "Claude Code";
 
 const SERVER_NAME: &str = "tuplebase";
 const TOOL_PREFIX: &str = "mcp__tuplebase__";
+/// The server's opt-in for writes. The panel never gives it.
+const ALLOW_WRITES_ENV: &str = "TUPLEBASE_MCP_ALLOW_WRITES";
 /// The agent prints its whole input; the panel shows this much of it.
 const MAX_INPUT_CHARS: usize = 300;
 const INSTRUCTIONS: &str = "You are answering in the chat panel of TupleBase, a database client. \
@@ -79,6 +80,8 @@ pub fn ask(
         command.args(["--resume", session]);
     }
     let mut child = command
+        // The server inherits our environment, and writes are never on here.
+        .env_remove(ALLOW_WRITES_ENV)
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -87,9 +90,10 @@ pub fn ask(
         .with_context(|| format!("starting {AGENT_NAME}"))?;
 
     // The prompt goes in by stdin, so one that starts with a dash is never read as a flag.
-    let mut stdin = child.stdin.take().context("no stdin")?;
-    stdin.write_all(prompt.as_bytes())?;
-    drop(stdin);
+    // An agent that has already stopped can't take it; its own error says why, below.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
     // Read on the side, so a chatty stderr can't fill its pipe and stall the agent.
     let mut stderr = child.stderr.take().context("no stderr")?;
     let errors = std::thread::spawn(move || {
@@ -100,8 +104,9 @@ pub fn ask(
 
     let mut session = session.map(str::to_owned);
     let mut failure = None;
-    for line in BufReader::new(child.stdout.take().context("no stdout")?).lines() {
-        let line = parse_line(&line?);
+    let output = BufReader::new(child.stdout.take().context("no stdout")?);
+    for line in output.lines().map_while(Result::ok) {
+        let line = parse_line(&line);
         line.events.into_iter().for_each(&mut on_event);
         session = line.session.or(session);
         failure = line.error.or(failure);
@@ -138,7 +143,7 @@ fn mcp_config(server: &Path, config_dir: &Path) -> String {
 
 /// An app started from the desktop doesn't get the shell's `PATH`, so the usual install
 /// folders are tried too.
-fn find_agent() -> Result<PathBuf> {
+fn find_agent() -> Option<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| std::env::split_paths(&path).collect())
         .unwrap_or_default();
@@ -156,20 +161,13 @@ fn find_agent() -> Result<PathBuf> {
     } else {
         &["claude"]
     };
-    find_in(&dirs, names).ok_or_else(|| anyhow!("no `claude` in {}", show(&dirs)))
+    find_in(&dirs, names)
 }
 
 fn find_in(dirs: &[PathBuf], names: &[&str]) -> Option<PathBuf> {
     dirs.iter()
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
         .find(|path| path.is_file())
-}
-
-fn show(dirs: &[PathBuf]) -> String {
-    std::env::join_paths(dirs)
-        .unwrap_or_else(|_| OsString::new())
-        .to_string_lossy()
-        .into_owned()
 }
 
 /// Lines we don't know are skipped: the agent adds new kinds over time.
