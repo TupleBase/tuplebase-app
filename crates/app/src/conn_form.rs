@@ -35,6 +35,8 @@ pub enum ConnFormEvent {
 pub struct ConnForm {
     previous: Option<String>,
     adapter: Adapter,
+    /// A new connection asks for the database first and shows the rest once it is chosen.
+    chosen: bool,
     pub(crate) folder: String,
     name: Entity<InputState>,
     host: Entity<InputState>,
@@ -117,6 +119,7 @@ impl ConnForm {
         Self {
             previous: existing.map(|c| c.name.clone()),
             adapter: existing.map_or(Adapter::Postgres, |c| c.adapter),
+            chosen: existing.is_some(),
             folder,
             name,
             host,
@@ -271,7 +274,7 @@ impl ConnForm {
 
     fn render_adapter(&self, adapter: Adapter, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let selected = self.adapter == adapter;
+        let selected = self.chosen && self.adapter == adapter;
         let border = if selected {
             theme.foreground
         } else {
@@ -289,8 +292,18 @@ impl ConnForm {
             .cursor_pointer()
             .child(logos::icon(adapter, 18.))
             .child(div().text_sm().child(adapter.label()))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.adapter = adapter;
+                // The first choice reveals the rest of the form, so move on to it.
+                if !this.chosen {
+                    this.chosen = true;
+                    let first = if adapter.is_file() {
+                        &this.database
+                    } else {
+                        &this.host
+                    };
+                    first.update(cx, |input, cx| input.focus(window, cx));
+                }
                 cx.notify();
             }))
     }
@@ -350,7 +363,6 @@ impl ConnForm {
     }
 
     fn render_aws(&self, store: AwsStore, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
         let name_label = match store {
             AwsStore::SecretsManager => "Secret name or ARN",
             AwsStore::ParameterStore => "Parameter name",
@@ -366,19 +378,25 @@ impl ConnForm {
                     .child(field(
                         "AWS profile",
                         Input::new(&self.aws_profile).id("conn-aws-profile"),
+                        cx,
                     ))
                     .child(field(
                         "Region",
                         Input::new(&self.aws_region).id("conn-aws-region"),
+                        cx,
                     )),
             )
             .child(
-                field(name_label, Input::new(&self.aws_name).id("conn-aws-name")).child(
-                    div().text_xs().text_color(muted).child(
-                        "Read from AWS each time you connect and never saved here. JSON with \
-                         \"username\" and \"password\", or just the password.",
-                    ),
-                ),
+                field(
+                    name_label,
+                    Input::new(&self.aws_name).id("conn-aws-name"),
+                    cx,
+                )
+                .child(hint(
+                    "Read from AWS each time you connect and never saved here. JSON with \
+                     \"username\" and \"password\", or just the password.",
+                    cx,
+                )),
             )
             .child(
                 Checkbox::new("use-secret-host")
@@ -392,7 +410,6 @@ impl ConnForm {
     }
 
     fn render_ssh(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let muted = cx.theme().muted_foreground;
         v_flex()
             .gap_3()
             .pl_4()
@@ -404,25 +421,30 @@ impl ConnForm {
                     .child(field(
                         "SSH host",
                         Input::new(&self.ssh_host).id("conn-ssh-host"),
+                        cx,
                     ))
                     .child(div().w(px(120.)).child(field(
                         "SSH port",
                         Input::new(&self.ssh_port).id("conn-ssh-port"),
+                        cx,
                     ))),
             )
             .child(field(
                 "SSH user",
                 Input::new(&self.ssh_user).id("conn-ssh-user"),
+                cx,
             ))
             .child(field(
                 "Private key file (leave blank to use a password)",
                 Input::new(&self.ssh_key).id("conn-ssh-key"),
+                cx,
             ))
             .child(field(
                 "SSH password or key passphrase",
                 Input::new(&self.ssh_password)
                     .id("conn-ssh-password")
                     .mask_toggle(),
+                cx,
             ))
             .child(
                 field(
@@ -442,11 +464,133 @@ impl ConnForm {
                                     this.fetch_fingerprint(window, cx);
                                 })),
                         ),
+                    cx,
                 )
-                .child(div().text_xs().text_color(muted).child(
+                .child(hint(
                     "Compare this with your server's key before saving. \
                      It proves you reached the right machine.",
+                    cx,
                 )),
+            )
+    }
+
+    fn render_database(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .gap_3()
+            .when(!self.chosen, |el| {
+                el.child(hint("Choose the database you want to connect to.", cx))
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .children(Adapter::ALL.map(|a| self.render_adapter(a, cx))),
+            )
+            .when(self.chosen, |el| el.child(self.render_name(cx)))
+    }
+
+    fn render_server(&self, cx: &App) -> Div {
+        let from_secret = self.host_from_secret();
+        v_flex()
+            .gap_3()
+            .when(from_secret, |el| {
+                el.child(hint("The host and port come from the secret.", cx))
+            })
+            .child(
+                h_flex()
+                    .gap_3()
+                    .when(!from_secret, |el| {
+                        el.child(field("Host", Input::new(&self.host).id("conn-host"), cx))
+                            .child(div().w(px(90.)).child(field(
+                                "Port",
+                                Input::new(&self.port).id("conn-port"),
+                                cx,
+                            )))
+                    })
+                    .child(field(
+                        "Database",
+                        Input::new(&self.database).id("conn-database"),
+                        cx,
+                    )),
+            )
+    }
+
+    fn render_credentials(&self, cx: &mut Context<Self>) -> Div {
+        let aws_store = self.aws_store;
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(self.render_auth(None, cx))
+                    .children(AwsStore::ALL.map(|s| self.render_auth(Some(s), cx))),
+            )
+            .when_some(aws_store, |el, store| el.child(self.render_aws(store, cx)))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(field("User", Input::new(&self.user).id("conn-user"), cx))
+                    .when(aws_store.is_none(), |el| {
+                        el.child(field(
+                            "Password",
+                            Input::new(&self.password).id("conn-password").mask_toggle(),
+                            cx,
+                        ))
+                    }),
+            )
+    }
+
+    fn render_security(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .gap_3()
+            .when(!self.adapter.is_file(), |el| {
+                el.child(field(
+                    "Encryption",
+                    h_flex()
+                        .gap_2()
+                        .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
+                    cx,
+                ))
+                .child(
+                    Checkbox::new("use-ssh")
+                        .label("Connect through an SSH tunnel")
+                        .checked(self.use_ssh)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.use_ssh = *checked;
+                            cx.notify();
+                        })),
+                )
+                .when(self.use_ssh, |el| el.child(self.render_ssh(cx)))
+            })
+            .child(
+                Checkbox::new("readonly")
+                    .label("Read-only: block writes from the app and from agents")
+                    .checked(self.readonly)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.readonly = *checked;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// What the sidebar shows for the connection.
+    fn render_name(&self, cx: &mut Context<Self>) -> Div {
+        h_flex()
+            .gap_3()
+            .items_start()
+            .child(field("Name", Input::new(&self.name).id("conn-name"), cx))
+            .child(
+                field(
+                    "Color",
+                    h_flex().h_8().gap_1().children(
+                        COLORS
+                            .iter()
+                            .enumerate()
+                            .map(|(index, value)| self.render_swatch(index, value, cx))
+                            .collect::<Vec<_>>(),
+                    ),
+                    cx,
+                )
+                .flex_none(),
             )
     }
 }
@@ -478,140 +622,132 @@ fn choice(
         .child(label)
 }
 
-fn field(label: &'static str, control: impl IntoElement) -> Div {
+/// A labelled control. The label is quieter than its section's title.
+fn field(label: &'static str, control: impl IntoElement, cx: &App) -> Div {
     v_flex()
         .flex_1()
         .gap_1()
-        .child(div().text_sm().font_medium().child(label))
+        .child(
+            div()
+                .text_xs()
+                .font_medium()
+                .text_color(cx.theme().muted_foreground)
+                .child(label),
+        )
         .child(control)
+}
+
+fn hint(text: &'static str, cx: &App) -> Div {
+    div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
+/// A numbered step of the form: a card with its title above its fields.
+fn section(step: usize, title: &'static str, body: Div, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .gap_3()
+        .p_4()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .size(px(20.))
+                        .justify_center()
+                        .rounded_full()
+                        .bg(theme.muted)
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(step.to_string()),
+                )
+                .child(div().text_sm().font_semibold().child(title)),
+        )
+        .child(body)
 }
 
 impl Render for ConnForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_file = self.adapter.is_file();
-        let aws_store = self.aws_store;
-        let host_from_secret = self.host_from_secret();
+        let chosen = self.chosen;
         let title = if self.previous.is_some() {
             "Edit connection"
         } else {
             "New connection"
         };
-        div()
-            .id("conn-form")
-            .test_support()
+        // In the order shown; each is numbered by its place.
+        let mut sections = vec![("Database", self.render_database(cx))];
+        if chosen {
+            if self.adapter.is_file() {
+                let file = Input::new(&self.database).id("conn-database");
+                sections.push(("File", field("Database file", file, cx)));
+            } else {
+                sections.push(("Server", self.render_server(cx)));
+                sections.push(("Credentials", self.render_credentials(cx)));
+            }
+            sections.push(("Security", self.render_security(cx)));
+        }
+        let sections: Vec<_> = sections
+            .into_iter()
+            .enumerate()
+            .map(|(index, (title, body))| section(index + 1, title, body, cx))
+            .collect();
+        let column = || v_flex().w(px(560.)).gap_4();
+        v_flex()
             .size_full()
-            .overflow_y_scroll()
             .child(
-                v_flex().w_full().items_center().child(
-                    v_flex()
-                        .w(px(520.))
-                        .pt(px(56.))
-                        .pb_8()
-                        .gap_4()
-                        .child(div().text_xl().font_semibold().child(title))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .children(Adapter::ALL.map(|a| self.render_adapter(a, cx))),
-                        )
-                        .child(field("Name", Input::new(&self.name).id("conn-name")))
-                        .child(field(
-                            "Color",
-                            h_flex().gap_1().children(
-                                COLORS
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, value)| self.render_swatch(index, value, cx))
-                                    .collect::<Vec<_>>(),
-                            ),
-                        ))
-                        .when(is_file, |el| {
-                            el.child(field(
-                                "Database file",
-                                Input::new(&self.database).id("conn-database"),
-                            ))
-                        })
-                        .when(!is_file, |el| {
-                            el.child(field(
-                                "Credentials",
-                                h_flex()
-                                    .gap_2()
-                                    .child(self.render_auth(None, cx))
-                                    .children(AwsStore::ALL.map(|s| self.render_auth(Some(s), cx))),
-                            ))
-                            .when_some(aws_store, |el, store| el.child(self.render_aws(store, cx)))
-                            .when(!host_from_secret, |el| {
-                                el.child(
-                                    h_flex()
-                                        .gap_3()
-                                        .child(field(
-                                            "Host",
-                                            Input::new(&self.host).id("conn-host"),
-                                        ))
-                                        .child(div().w(px(120.)).child(field(
-                                            "Port",
-                                            Input::new(&self.port).id("conn-port"),
-                                        ))),
-                                )
-                            })
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .child(field(
-                                        "Database",
-                                        Input::new(&self.database).id("conn-database"),
-                                    ))
-                                    .child(field("User", Input::new(&self.user).id("conn-user"))),
-                            )
-                            .when(aws_store.is_none(), |el| {
-                                el.child(field(
-                                    "Password",
-                                    Input::new(&self.password).id("conn-password").mask_toggle(),
-                                ))
-                            })
-                            .child(field(
-                                "Encryption",
-                                h_flex()
-                                    .gap_2()
-                                    .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
-                            ))
-                            .child(
-                                Checkbox::new("use-ssh")
-                                    .label("Connect through an SSH tunnel")
-                                    .checked(self.use_ssh)
-                                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                        this.use_ssh = *checked;
-                                        cx.notify();
-                                    })),
-                            )
-                            .when(self.use_ssh, |el| el.child(self.render_ssh(cx)))
-                        })
-                        .child(
-                            Checkbox::new("readonly")
-                                .label("Read-only: block writes from the app and from agents")
-                                .checked(self.readonly)
-                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                    this.readonly = *checked;
-                                    cx.notify();
-                                })),
-                        )
-                        .when_some(self.error.clone(), |el, error| {
-                            el.child(div().text_sm().text_color(cx.theme().danger).child(error))
-                        })
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("save")
-                                        .primary()
-                                        .label("Save connection")
-                                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                                )
-                                .child(Button::new("cancel").ghost().label("Cancel").on_click(
-                                    cx.listener(|_, _, _, cx| cx.emit(ConnFormEvent::Cancel)),
-                                )),
+                div()
+                    .id("conn-form")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex().w_full().items_center().child(
+                            column()
+                                .pt_8()
+                                .pb_6()
+                                .child(div().text_xl().font_semibold().child(title))
+                                .children(sections),
                         ),
-                ),
+                    ),
+            )
+            // Outside the scrolling part, so Save and any error stay in view.
+            .child(
+                v_flex()
+                    .w_full()
+                    .items_center()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        column()
+                            .gap_2()
+                            .when_some(self.error.clone(), |el, error| {
+                                el.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                            })
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .when(chosen, |el| {
+                                        el.child(
+                                            Button::new("save")
+                                                .primary()
+                                                .label("Save connection")
+                                                .on_click(
+                                                    cx.listener(|this, _, _, cx| this.save(cx)),
+                                                ),
+                                        )
+                                    })
+                                    .child(Button::new("cancel").ghost().label("Cancel").on_click(
+                                        cx.listener(|_, _, _, cx| cx.emit(ConnFormEvent::Cancel)),
+                                    )),
+                            ),
+                    ),
             )
     }
 }
