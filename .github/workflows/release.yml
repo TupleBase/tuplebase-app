@@ -1,7 +1,8 @@
 name: Release
 
 # Started by hand: gh workflow run release.yml -f version=0.2.0
-# Bumps the version on main, tags it, builds every platform, publishes a GitHub Release.
+# Bumps the version on main, tags it, builds every platform, publishes a GitHub Release,
+# then points the Homebrew cask at it.
 on:
   workflow_dispatch:
     inputs:
@@ -77,6 +78,27 @@ jobs:
             to avoid the first-launch block.
             Already downloaded the DMG? [Allow it in a few steps](https://github.com/TupleBase/tuplebase-app/blob/main/docs/INSTALL.md#macos-tuplebase-not-opened).
 
-  verify-install:
+  # The checksum only exists once the release is built, so this lands on main after the tag.
+  cask:
     needs: publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - name: Point the Homebrew cask at the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          sha=$(awk -v file="TupleBase-$VERSION-macos-arm64.dmg" '$2 == file { print $1 }' "$RUNNER_TEMP/SHA256SUMS")
+          scripts/update-cask.sh "$VERSION" "$sha"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update the Homebrew cask to $VERSION" Casks/tuplebase.rb
+          git push origin HEAD:main
+
+  verify-install:
+    needs: cask
     uses: ./.github/workflows/install-test.yml
