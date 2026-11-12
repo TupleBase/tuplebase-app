@@ -7,16 +7,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use gpui_kit::component::button::*;
-use gpui_kit::component::group_box::GroupBoxVariant;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
 use gpui_kit::component::menu::{
     AppMenuBar, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem,
 };
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::setting::{
-    SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
-};
-use gpui_kit::component::switch::Switch;
 use gpui_kit::component::table::{DataTable, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -38,6 +33,10 @@ use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme;
 
+mod settings;
+
+use settings::SettingsPage;
+
 actions!(
     tuplebase,
     [
@@ -56,13 +55,6 @@ actions!(
         ResetFontSize
     ]
 );
-
-/// The pages of Settings, in sidebar order.
-#[derive(Clone, Copy)]
-enum SettingsPage {
-    General,
-    Agents,
-}
 
 #[cfg(target_os = "macos")]
 const RUN_KEY: &str = "cmd-enter";
@@ -1424,36 +1416,6 @@ impl Workspace {
             )
     }
 
-    /// Shows Settings in a dialog, leaving whatever is on screen in place underneath.
-    fn open_settings(&self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
-        if window.has_active_dialog(cx) {
-            return;
-        }
-        self.refresh_agents(cx);
-        let this = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
-            let Some(workspace) = this.upgrade() else {
-                return dialog;
-            };
-            // The dialog is rounded and the sidebar fills its left edge.
-            let mut sidebar = div().rounded_l(cx.theme().radius_lg);
-            // The pages bring their own titles and padding.
-            dialog.w(px(760.)).p_0().child(
-                div().h(px(520.)).child(
-                    Settings::new("settings")
-                        .with_group_variant(GroupBoxVariant::Outline)
-                        .sidebar_width(px(200.))
-                        .sidebar_style(sidebar.style())
-                        .default_selected_index(SelectIndex {
-                            page_ix: page as usize,
-                            group_ix: None,
-                        })
-                        .pages(Self::settings_pages(&workspace, cx)),
-                ),
-            )
-        });
-    }
-
     fn open_about(&self, window: &mut Window, cx: &mut Context<Self>) {
         if window.has_active_dialog(cx) {
             return;
@@ -1482,146 +1444,6 @@ impl Workspace {
                     ),
             )
         });
-    }
-
-    /// The Settings pages, in the order of [`SettingsPage`]. A new setting is one more
-    /// item in a group; a new area is one more page.
-    fn settings_pages(workspace: &Entity<Self>, cx: &App) -> Vec<SettingPage> {
-        vec![
-            Self::general_settings(workspace),
-            Self::agent_settings(workspace, cx),
-        ]
-    }
-
-    fn general_settings(workspace: &Entity<Self>) -> SettingPage {
-        const CHECK_UPDATES: &str = "Check for updates at startup";
-        let updates = workspace.clone();
-        let history = workspace.clone();
-        SettingPage::new("General")
-            .icon(IconName::Settings)
-            .default_open(true)
-            .resettable(false)
-            .group(
-                SettingGroup::new().title("Updates").item(
-                    SettingItem::new(
-                        CHECK_UPDATES,
-                        SettingField::render(move |_, _, cx| {
-                            let workspace = updates.clone();
-                            Switch::new("check-updates")
-                                .accessibility_label(CHECK_UPDATES)
-                                .checked(workspace.read(cx).config.check_for_updates)
-                                .on_click(move |checked: &bool, _, cx| {
-                                    workspace.update(cx, |this, cx| {
-                                        this.set_check_for_updates(*checked, cx);
-                                    });
-                                })
-                        }),
-                    )
-                    .description(
-                        "Asks GitHub whether a newer version exists. \
-                         Sends no connection details or queries.",
-                    ),
-                ),
-            )
-            .group(
-                SettingGroup::new().title("Query history").item(
-                    SettingItem::new(
-                        "Clear query history",
-                        SettingField::render(move |_, _, _| {
-                            let workspace = history.clone();
-                            Button::new("clear-history")
-                                .small()
-                                .label("Clear")
-                                .on_click(move |_, _, cx| {
-                                    workspace.update(cx, |this, cx| {
-                                        this.session.history.clear();
-                                        this.schedule_session_save(cx);
-                                        cx.notify();
-                                    });
-                                })
-                        }),
-                    )
-                    .description("Your queries and unsaved SQL are kept on this computer only."),
-                ),
-            )
-            .group(SettingGroup::new().title("About").item(SettingItem::new(
-                tuplebase_core::PRODUCT_NAME,
-                SettingField::render(|_, _, cx| {
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(concat!("Version ", env!("CARGO_PKG_VERSION")))
-                }),
-            )))
-    }
-
-    fn agent_settings(workspace: &Entity<Self>, cx: &App) -> SettingPage {
-        let statuses = workspace.read(cx).agents.clone();
-        let looked = statuses.is_some();
-        let statuses = statuses.unwrap_or_default();
-        let can_add = statuses.iter().any(|s| s.state != AgentState::Added);
-        let mut group = SettingGroup::new();
-        if statuses.is_empty() {
-            let note = if looked {
-                "No supported agents found on this computer."
-            } else {
-                "Looking for agents…"
-            };
-            group = group.item(SettingItem::render(move |_, _, cx| {
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(note)
-            }));
-        }
-        group = group.items(statuses.into_iter().map(|status| {
-            let (text, failed): (SharedString, bool) = match status.state {
-                AgentState::Added => ("Added".into(), false),
-                AgentState::NotAdded => ("Not added".into(), false),
-                AgentState::Failed(reason) => (reason.into(), true),
-            };
-            SettingItem::new(
-                status.name,
-                SettingField::render(move |_, _, cx| {
-                    let theme = cx.theme();
-                    let color = if failed {
-                        theme.danger
-                    } else {
-                        theme.muted_foreground
-                    };
-                    div()
-                        .max_w(px(280.))
-                        .text_sm()
-                        .text_right()
-                        .text_color(color)
-                        .child(text.clone())
-                }),
-            )
-        }));
-        if can_add {
-            let workspace = workspace.downgrade();
-            group = group.footer(move |_, _| {
-                let workspace = workspace.clone();
-                h_flex().child(
-                    Button::new("add-mcp")
-                        .small()
-                        .label("Add to all agents")
-                        .on_click(move |_, window, cx| {
-                            workspace
-                                .update(cx, |this, cx| this.add_mcp_to_agents(window, cx))
-                                .ok();
-                        }),
-                )
-            });
-        }
-        SettingPage::new("AI agents")
-            .icon(IconName::Bot)
-            .resettable(false)
-            .description(
-                "Adds the MCP server to your agents so they can query saved connections. \
-                 They stay read-only unless you allow writes.",
-            )
-            .group(group)
     }
 
     fn render_mcp_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -2738,7 +2560,7 @@ mod tests {
             window.click("adapter-PostgreSQL", cx);
         });
         window_action(handle, cx, |window, cx| {
-            assert!(window.find("save").visible());
+            assert_eq!(window.find("conn-host").focused(), Some(true));
             // Blank name is rejected and the form stays open.
             window.click("save", cx);
         });
@@ -2863,17 +2685,19 @@ mod tests {
         result.unwrap()
     }
 
-    #[gpui_kit::test]
-    fn sqlite_only_asks_for_a_file(cx: &mut TestAppContext) {
-        let (handle, _) = open(Config::default(), cx);
+    /// Opens the form for a new connection and chooses PostgreSQL, which shows the rest.
+    fn open_new_form(handle: AnyWindowHandle, cx: &mut TestAppContext) {
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| {
             window.click("adapter-PostgreSQL", cx)
         });
-        window_action(handle, cx, |window, cx| {
-            assert!(window.try_find("conn-host").is_some());
-            window.click("adapter-SQLite", cx);
-        });
+    }
+
+    #[gpui_kit::test]
+    fn sqlite_only_asks_for_a_file(cx: &mut TestAppContext) {
+        let (handle, _) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("adapter-SQLite", cx));
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("conn-host").is_none());
             assert!(window.try_find("conn-password").is_none());
@@ -2885,10 +2709,7 @@ mod tests {
     #[gpui_kit::test]
     fn ssh_fields_appear_and_require_a_fingerprint(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
-        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
-        window_action(handle, cx, |window, cx| {
-            window.click("adapter-PostgreSQL", cx)
-        });
+        open_new_form(handle, cx);
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("conn-ssh-host").is_none());
             window.click("use-ssh", cx);
@@ -2914,10 +2735,7 @@ mod tests {
     #[gpui_kit::test]
     fn aws_credentials_replace_the_password_and_can_name_the_host(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
-        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
-        window_action(handle, cx, |window, cx| {
-            window.click("adapter-PostgreSQL", cx)
-        });
+        open_new_form(handle, cx);
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("conn-aws-name").is_none());
             window.click("auth-AWS Secrets Manager", cx);
@@ -3073,10 +2891,7 @@ mod tests {
     #[gpui_kit::test]
     fn a_connection_color_can_be_chosen_in_the_form(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
-        window_action(handle, cx, |window, cx| {
-            window.click("adapter-PostgreSQL", cx)
-        });
+        open_new_form(handle, cx);
         window_action(handle, cx, |window, cx| window.click("color-3", cx));
         cx.update(|cx| {
             let this = workspace.read(cx);
