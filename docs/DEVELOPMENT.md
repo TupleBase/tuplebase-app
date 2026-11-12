@@ -52,6 +52,15 @@ Local databases, user `dev`, password `dev`, database `app`:
 | SSH server | 52222 |
 | Fake AWS   | 54566 |
 
+Besides the `users` table the tests use, both databases hold demo data to try lists, filters
+and paging: about 35 tables and half a million rows, up to 150,000 in one table. PostgreSQL
+has them in the schemas `public`, `analytics`, `billing` and `audit`; MariaDB in databases of
+the same names, with `app` for `public`. Some tables have an unusual shape: `archived_orders`
+is empty, `wide_metrics` has 41 columns, `type_samples` has a column per kind of value, and one
+table has a very long name. The data is in `dev/demo-postgres.sql` and `dev/demo-mariadb.sql`,
+which run only when a database is first created. To load a changed file, run `make down`, then
+`make dev`.
+
 The fake AWS serves Secrets Manager and Parameter Store. To use it from the app or the AWS
 CLI, set `AWS_ENDPOINT_URL=http://127.0.0.1:54566`, `AWS_ACCESS_KEY_ID=test` and
 `AWS_SECRET_ACCESS_KEY=test`.
