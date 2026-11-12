@@ -6,6 +6,7 @@ mod completions;
 mod conn_form;
 mod logos;
 mod results;
+mod row_detail;
 mod runtime;
 mod schema;
 mod theme;

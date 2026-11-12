@@ -11,12 +11,17 @@ use tuplebase_core::db::QueryResult;
 pub struct ResultsDelegate {
     columns: Vec<Column>,
     rows: Vec<Vec<String>>,
+    /// What the database returned, for the row detail panel.
+    names: Vec<String>,
+    values: Vec<Vec<Value>>,
     ran: bool,
 }
 
 impl ResultsDelegate {
     pub fn set(&mut self, result: &QueryResult) {
         self.ran = true;
+        self.names = result.columns.clone();
+        self.values = result.rows.clone();
         self.rows = result
             .rows
             .iter()
@@ -44,10 +49,24 @@ impl ResultsDelegate {
         }
     }
 
+    /// A row's fields as the database returned them, by column name.
+    pub fn row(&self, row_ix: usize) -> Option<Vec<(String, Value)>> {
+        let values = self.values.get(row_ix)?;
+        Some(
+            self.names
+                .iter()
+                .cloned()
+                .zip(values.iter().cloned())
+                .collect(),
+        )
+    }
+
     pub fn clear(&mut self) {
         self.ran = false;
         self.columns.clear();
         self.rows.clear();
+        self.names.clear();
+        self.values.clear();
     }
 }
 

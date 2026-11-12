@@ -64,6 +64,7 @@ scripts/                   install, packaging, release helpers
 | `conn_form`          | the add and edit connection form                            |
 | `schema`             | the schema browser                                          |
 | `results`            | the table that shows a query result                         |
+| `row_detail`         | the panel that shows one result row field by field          |
 | `chat`               | the chat panel                                              |
 | `completions`        | SQL autocomplete                                            |
 | `tree_nav`           | keyboard navigation shared by the trees                     |
