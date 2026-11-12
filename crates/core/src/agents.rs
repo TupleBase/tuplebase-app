@@ -165,7 +165,20 @@ pub fn statuses() -> Vec<AgentStatus> {
 /// Adds the server to every installed agent. Writes files; call it off the UI thread.
 pub fn add_to_all() -> Vec<AgentStatus> {
     target().map_or_else(Vec::new, |t| {
-        add_in(&t.home, current_os(), &t.server.to_string_lossy())
+        add_in(&t.home, current_os(), &t.server.to_string_lossy(), None)
+    })
+}
+
+/// Adds the server to the one installed agent called `name` and reports every agent, so
+/// the others keep the state they had. Writes a file; call it off the UI thread.
+pub fn add_to(name: &str) -> Vec<AgentStatus> {
+    target().map_or_else(Vec::new, |t| {
+        add_in(
+            &t.home,
+            current_os(),
+            &t.server.to_string_lossy(),
+            Some(name),
+        )
     })
 }
 
@@ -177,28 +190,32 @@ fn installed(home: &Path, os: Os) -> impl Iterator<Item = Agent> {
 
 fn statuses_in(home: &Path, os: Os, server: &str) -> Vec<AgentStatus> {
     installed(home, os)
-        .map(|agent| {
-            let change =
-                read_config(&agent.config).and_then(|text| change(agent.format, &text, server));
-            let state = match change {
-                Ok(None) => AgentState::Added,
-                Ok(Some(_)) => AgentState::NotAdded,
-                Err(e) => AgentState::Failed(format!("{e:#}")),
-            };
-            AgentStatus {
-                name: agent.name,
-                state,
-            }
+        .map(|agent| AgentStatus {
+            name: agent.name,
+            state: current_state(&agent, server),
         })
         .collect()
 }
 
-fn add_in(home: &Path, os: Os, server: &str) -> Vec<AgentStatus> {
+fn current_state(agent: &Agent, server: &str) -> AgentState {
+    match read_config(&agent.config).and_then(|text| change(agent.format, &text, server)) {
+        Ok(None) => AgentState::Added,
+        Ok(Some(_)) => AgentState::NotAdded,
+        Err(e) => AgentState::Failed(format!("{e:#}")),
+    }
+}
+
+/// Adds the server to the agent called `only`, or to all of them, and reports every agent.
+fn add_in(home: &Path, os: Os, server: &str, only: Option<&str>) -> Vec<AgentStatus> {
     installed(home, os)
         .map(|agent| {
-            let state = match add(&agent, server) {
-                Ok(()) => AgentState::Added,
-                Err(e) => AgentState::Failed(format!("{e:#}")),
+            let state = if only.is_some_and(|name| name != agent.name) {
+                current_state(&agent, server)
+            } else {
+                match add(&agent, server) {
+                    Ok(()) => AgentState::Added,
+                    Err(e) => AgentState::Failed(format!("{e:#}")),
+                }
             };
             AgentStatus {
                 name: agent.name,
@@ -367,7 +384,7 @@ mod tests {
     fn adding_creates_the_config_and_is_then_reported_as_added() {
         let home = tempfile::tempdir().unwrap();
         added(home.path(), ".cursor");
-        let result = add_in(home.path(), Os::Linux, SERVER);
+        let result = add_in(home.path(), Os::Linux, SERVER, None);
         assert_eq!(state_of(&result, "Cursor"), AgentState::Added);
         let written: Value = serde_json::from_str(
             &fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap(),
@@ -376,6 +393,17 @@ mod tests {
         assert_eq!(written["mcpServers"]["tuplebase"]["command"], SERVER);
         let again = statuses_in(home.path(), Os::Linux, SERVER);
         assert_eq!(state_of(&again, "Cursor"), AgentState::Added);
+    }
+
+    #[test]
+    fn adding_to_one_agent_leaves_the_others_alone() {
+        let home = tempfile::tempdir().unwrap();
+        added(home.path(), ".cursor");
+        added(home.path(), ".codex");
+        let result = add_in(home.path(), Os::Linux, SERVER, Some("Codex"));
+        assert_eq!(state_of(&result, "Codex"), AgentState::Added);
+        assert_eq!(state_of(&result, "Cursor"), AgentState::NotAdded);
+        assert!(!home.path().join(".cursor/mcp.json").exists());
     }
 
     #[test]
@@ -434,7 +462,7 @@ mod tests {
         let config = home.path().join(".cursor/mcp.json");
         let original = "// mine\n{\"mcpServers\":{}}\n";
         fs::write(&config, original).unwrap();
-        let result = add_in(home.path(), Os::Linux, SERVER);
+        let result = add_in(home.path(), Os::Linux, SERVER, None);
         assert!(matches!(state_of(&result, "Cursor"), AgentState::Failed(_)));
         assert_eq!(fs::read_to_string(config).unwrap(), original);
     }
