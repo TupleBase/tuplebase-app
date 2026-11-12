@@ -144,9 +144,23 @@ impl ConnForm {
         }
     }
 
+    /// Whether the secret names the host, so the Host and Port fields are hidden.
+    fn host_from_secret(&self) -> bool {
+        self.aws_store.is_some() && self.use_secret_host && !self.adapter.is_file()
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
         let text = |input: &Entity<InputState>, cx: &App| input.read(cx).value().trim().to_string();
-        let port_text = text(&self.port, cx);
+        // Hidden fields are skipped, so what was typed in them can't block saving.
+        let visible = |input: &Entity<InputState>, shown: bool, cx: &App| {
+            if shown {
+                text(input, cx)
+            } else {
+                String::new()
+            }
+        };
+        let host_shown = !self.host_from_secret();
+        let port_text = visible(&self.port, host_shown, cx);
         let port = if port_text.is_empty() {
             self.adapter.default_port()
         } else {
@@ -186,25 +200,14 @@ impl ConnForm {
                 name: text(&self.aws_name, cx),
                 use_secret_host: self.use_secret_host,
             });
-        // A hidden field must not leave a stale value behind.
-        let host_from_secret = auth.as_ref().is_some_and(|a| a.use_secret_host);
-        let (host, port) = if host_from_secret {
-            (String::new(), self.adapter.default_port())
-        } else {
-            (text(&self.host, cx), port)
-        };
-        let password = if auth.is_some() {
-            String::new()
-        } else {
-            text(&self.password, cx)
-        };
+        let password = visible(&self.password, auth.is_none(), cx);
         let ssh_password = text(&self.ssh_password, cx);
         cx.emit(ConnFormEvent::Save {
             connection: Connection {
                 name: text(&self.name, cx),
                 folder: self.folder.clone(),
                 adapter: self.adapter,
-                host,
+                host: visible(&self.host, host_shown, cx),
                 port,
                 database: text(&self.database, cx),
                 user: text(&self.user, cx),
@@ -324,29 +327,12 @@ impl ConnForm {
     }
 
     fn render_tls(&self, mode: TlsMode, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        let selected = self.tls == mode;
-        let border = if selected {
-            theme.foreground
-        } else {
-            theme.input
-        };
-        div()
-            .id(SharedString::from(format!("tls-{}", mode.label())))
-            .test_support()
-            .flex_1()
-            .py_1p5()
-            .text_center()
-            .text_sm()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(border)
-            .cursor_pointer()
-            .child(mode.label())
-            .on_click(cx.listener(move |this, _, _, cx| {
+        choice("tls", mode.label(), self.tls == mode, cx).on_click(cx.listener(
+            move |this, _, _, cx| {
                 this.tls = mode;
                 cx.notify();
-            }))
+            },
+        ))
     }
 
     fn render_auth(
@@ -354,30 +340,13 @@ impl ConnForm {
         store: Option<AwsStore>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let theme = cx.theme();
-        let selected = self.aws_store == store;
-        let border = if selected {
-            theme.foreground
-        } else {
-            theme.input
-        };
         let label = store.map_or("Password", AwsStore::label);
-        div()
-            .id(SharedString::from(format!("auth-{label}")))
-            .test_support()
-            .flex_1()
-            .py_1p5()
-            .text_center()
-            .text_sm()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(border)
-            .cursor_pointer()
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
+        choice("auth", label, self.aws_store == store, cx).on_click(cx.listener(
+            move |this, _, _, cx| {
                 this.aws_store = store;
                 cx.notify();
-            }))
+            },
+        ))
     }
 
     fn render_aws(&self, store: AwsStore, cx: &mut Context<Self>) -> impl IntoElement {
@@ -482,6 +451,33 @@ impl ConnForm {
     }
 }
 
+/// One option in a row of them, with id `<group>-<label>`. The selected one stands out.
+fn choice(
+    group: &str,
+    label: &'static str,
+    selected: bool,
+    cx: &App,
+) -> impl StatefulInteractiveElement + IntoElement + use<> {
+    let theme = cx.theme();
+    let border = if selected {
+        theme.foreground
+    } else {
+        theme.input
+    };
+    div()
+        .id(SharedString::from(format!("{group}-{label}")))
+        .test_support()
+        .flex_1()
+        .py_1p5()
+        .text_center()
+        .text_sm()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(border)
+        .cursor_pointer()
+        .child(label)
+}
+
 fn field(label: &'static str, control: impl IntoElement) -> Div {
     v_flex()
         .flex_1()
@@ -494,7 +490,7 @@ impl Render for ConnForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_file = self.adapter.is_file();
         let aws_store = self.aws_store;
-        let host_from_secret = aws_store.is_some() && self.use_secret_host;
+        let host_from_secret = self.host_from_secret();
         let title = if self.previous.is_some() {
             "Edit connection"
         } else {

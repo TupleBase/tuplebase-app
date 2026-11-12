@@ -2856,6 +2856,9 @@ mod tests {
             window.input("prod-sso", cx);
             window.click("conn-aws-name", cx);
             window.input("prod/orders", cx);
+            // Left behind in a field that is about to be hidden; it must not block saving.
+            window.click("conn-port", cx);
+            window.input("not a port", cx);
             window.click("use-secret-host", cx);
         });
         let saved = std::rc::Rc::new(std::cell::RefCell::new(None));

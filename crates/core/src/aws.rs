@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use aws_config::{BehaviorVersion, SdkConfig};
-use aws_sdk_ssm::config::{ProvideCredentials, Region, SharedCredentialsProvider};
+use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_sdk_ssm::config::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_ssm::error::{ProvideErrorMetadata, SdkError};
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use aws_types::os_shim_internal::{Env, Fs};
@@ -20,6 +20,7 @@ use crate::config::{AwsAuth, AwsStore, Connection};
 const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// What a secret says about a connection.
+#[derive(Default)]
 struct Secret {
     username: Option<String>,
     password: String,
@@ -37,11 +38,8 @@ impl Secret {
                 bail!("the secret is empty");
             }
             return Ok(Self {
-                username: None,
                 password: value.to_owned(),
-                host: None,
-                port: None,
-                database: None,
+                ..Self::default()
             });
         };
         let text = |key: &str| match fields.get(key) {
@@ -86,15 +84,15 @@ impl Secret {
 /// Reads the secret `auth` points at. Returns the connection to open, with the user
 /// (and host, if asked) filled in from the secret, and its password.
 pub async fn resolve(conn: &Connection, auth: &AwsAuth) -> Result<(Connection, String)> {
-    let source = format!("reading \"{}\" from {}", auth.name, auth.store.label());
-    let value = timeout(TIMEOUT, read(auth))
+    let resolved = async {
+        let value = timeout(TIMEOUT, read(auth))
+            .await
+            .map_err(|_| anyhow!("timed out"))??;
+        Secret::parse(&value)?.apply(conn, auth.use_secret_host)
+    };
+    resolved
         .await
-        .map_err(|_| anyhow!("timed out"))
-        .flatten()
-        .with_context(|| source.clone())?;
-    Secret::parse(&value)
-        .and_then(|secret| secret.apply(conn, auth.use_secret_host))
-        .context(source)
+        .with_context(|| format!("reading \"{}\" from {}", auth.name, auth.store.label()))
 }
 
 async fn read(auth: &AwsAuth) -> Result<String> {
@@ -152,11 +150,10 @@ async fn sdk_config(auth: &AwsAuth) -> Result<SdkConfig> {
             )
         }
         Err(e) => {
-            let profile = Some(&auth.profile).filter(|p| !p.is_empty());
-            let login = profile.map_or_else(
-                || "aws sso login".to_owned(),
-                |profile| format!("aws sso login --profile {profile}"),
-            );
+            let mut login = "aws sso login".to_owned();
+            if !auth.profile.is_empty() {
+                login = format!("{login} --profile {}", auth.profile);
+            }
             bail!(
                 "no usable AWS credentials ({}). If your session expired, run `{login}`",
                 causes(&e)
@@ -281,6 +278,18 @@ mod tests {
             assert_eq!((target.user.as_str(), password.as_str()), ("me", plain));
         }
         assert!(Secret::parse("").is_err());
+    }
+
+    #[test]
+    fn causes_are_one_line_without_repeats_or_lists() {
+        let root = anyhow!("no credentials found in chain. Attempted:\n  Environment: not set");
+        let error = root
+            .context("loading credentials")
+            .context("loading credentials");
+        assert_eq!(
+            causes(error.as_ref()),
+            "loading credentials: no credentials found in chain."
+        );
     }
 
     #[test]
