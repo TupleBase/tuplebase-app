@@ -3,10 +3,9 @@
 
 use std::sync::Once;
 
-use aws_config::BehaviorVersion;
 use aws_sdk_ssm::types::ParameterType;
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
 use serde_json::json;
+use tuplebase_core::aws;
 use tuplebase_core::config::{Adapter, AwsAuth, AwsStore, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
 
@@ -37,14 +36,7 @@ fn use_fake_aws() {
 
 async fn sdk_config() -> aws_config::SdkConfig {
     use_fake_aws();
-    let http = aws_smithy_http_client::Builder::new()
-        .tls_provider(Provider::Rustls(CryptoMode::Ring))
-        .build_https();
-    aws_config::defaults(BehaviorVersion::latest())
-        .http_client(http)
-        .region("eu-west-1")
-        .load()
-        .await
+    aws::sdk_config("", "eu-west-1").await.unwrap()
 }
 
 async fn put_secret(name: &str, value: &str) {

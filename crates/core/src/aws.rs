@@ -105,7 +105,7 @@ pub async fn resolve(conn: &Connection, auth: &AwsAuth) -> Result<(Connection, S
 }
 
 async fn read(auth: &AwsAuth) -> Result<String> {
-    let config = sdk_config(auth).await?;
+    let config = sdk_config(&auth.profile, &auth.region).await?;
     match auth.store {
         AwsStore::SecretsManager => {
             let output = aws_sdk_secretsmanager::Client::new(&config)
@@ -131,19 +131,20 @@ async fn read(auth: &AwsAuth) -> Result<String> {
     }
 }
 
-/// Loads the profile and signs in once, so a missing or expired session is reported as
-/// such instead of as a failed request.
-async fn sdk_config(auth: &AwsAuth) -> Result<SdkConfig> {
+/// What AWS clients are built from. Loads the profile and signs in once, so a missing or
+/// expired session is reported as such instead of as a failed request. An empty `profile`
+/// means the default AWS credentials; an empty `region` means the profile's.
+pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
     // `ring` keeps the build free of C libraries (the SDK's default TLS is aws-lc).
     let http = aws_smithy_http_client::Builder::new()
         .tls_provider(Provider::Rustls(CryptoMode::Ring))
         .build_https();
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http);
-    if !auth.profile.is_empty() {
-        loader = loader.profile_name(&auth.profile);
+    if !profile.is_empty() {
+        loader = loader.profile_name(profile);
     }
-    if !auth.region.is_empty() {
-        loader = loader.region(Region::new(auth.region.clone()));
+    if !region.is_empty() {
+        loader = loader.region(Region::new(region.to_owned()));
     }
     let config = loader.load().await;
     let provider = config
@@ -151,17 +152,16 @@ async fn sdk_config(auth: &AwsAuth) -> Result<SdkConfig> {
         .context("no AWS credentials are set up on this machine")?;
     let credentials = match provider.provide_credentials().await {
         Ok(credentials) => credentials,
-        Err(e) if !profile_exists(&auth.profile).await => {
+        Err(e) if !profile_exists(profile).await => {
             bail!(
-                "the AWS profile \"{}\" is not in your AWS config ({})",
-                auth.profile,
+                "the AWS profile \"{profile}\" is not in your AWS config ({})",
                 causes(&e)
             )
         }
         Err(e) => {
             let mut login = "aws sso login".to_owned();
-            if !auth.profile.is_empty() {
-                login = format!("{login} --profile {}", auth.profile);
+            if !profile.is_empty() {
+                login = format!("{login} --profile {profile}");
             }
             bail!(
                 "no usable AWS credentials ({}). If your session expired, run `{login}`",

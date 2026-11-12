@@ -14,7 +14,7 @@ One command starts the local databases, adds them to the app and runs it:
 
 ```sh
 make dev            # databases up, then the app with its own config in target/dev-config
-make dev-fake-aws   # the same, with AWS pointed at the fake service
+make dev-fake-aws   # the same, plus a connection whose credentials are a secret in the fake AWS
 make down           # stop the databases
 ```
 
@@ -59,7 +59,10 @@ To get these in the app, in a "Local test databases" folder that needs no passwo
 cargo run -p tuplebase-core --example add_test_connections
 ```
 
-It only touches your own config, and is safe to run again.
+It only touches your own config, and is safe to run again. With `AWS_ENDPOINT_URL` set to the
+fake AWS, it also stores the secret `dev/mariadb` there and adds `test-mariadb-aws`, a
+connection that takes its host, user and password from that secret. `make dev-fake-aws` does
+both.
 
 `TUPLEBASE_IT_KEYCHAIN=1` also runs a round trip against the real OS credential store.
 
