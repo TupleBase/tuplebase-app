@@ -26,7 +26,8 @@ const ALLOW_WRITES_ENV: &str = "TUPLEBASE_MCP_ALLOW_WRITES";
 const MAX_INPUT_CHARS: usize = 300;
 const INSTRUCTIONS: &str = "You are answering in the chat panel of TupleBase, a database client. \
     Your only tools are TupleBase's: they reach the databases the user saved in the app. \
-    Keep answers short.";
+    Work only on the connections open in the app: call list_open_connections first, and if \
+    none is open ask the user to open one. Keep answers short.";
 
 /// Something the agent did while answering.
 #[derive(Debug, Clone, PartialEq, Eq)]

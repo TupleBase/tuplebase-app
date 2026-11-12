@@ -40,6 +40,7 @@ scripts/                   install, packaging, release helpers
 | `ssh`        | SSH tunnels                                           | `config`                                   |
 | `aws`        | credentials read from Secrets Manager and SSM         | `config`                                   |
 | `mcp_status` | heartbeat files of running MCP servers                | `config`                                   |
+| `app_status` | the file naming the connections open in the app       | `config`                                   |
 | `updates`    | the GitHub release check                              | `config`                                   |
 | `db`         | pools, queries, schema reads, the read-only guard     | `config` `secrets` `ssh` `aws` `safety`    |
 | `agents`     | the MCP server's entry in each agent's config file    | `updates`                                  |

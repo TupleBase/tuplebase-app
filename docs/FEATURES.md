@@ -46,13 +46,15 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 ## AI agents
 
 A local [MCP server](MCP.md) lets agents list connections, inspect tables and run queries.
-It uses the connections saved in the app and is read-only by default.
+It uses the connections saved in the app and is read-only by default. It can also tell an agent
+which connections are open in the app, so the agent works on those.
 Add it to your installed agents in one click from Settings or the app menu. An indicator in the
 sidebar shows when an agent has it running, and names the agents that do.
 
 Or ask from inside the app: the agent icon in the sidebar opens a chat panel that talks to your
 own Claude Code, with your account. There it can use only this MCP server, so it reaches your
-databases and nothing else on your computer. Each tool call it makes is listed; click one to see
+databases and nothing else on your computer, and it is told to work only on the connections you
+have open. Each tool call it makes is listed; click one to see
 its arguments.
 
 ## Appearance

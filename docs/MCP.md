@@ -39,12 +39,13 @@ running. Agents start it when they need it, so grey is normal when none is activ
 
 ## Tools
 
-| Tool               | Arguments                       | Returns                                              |
-| ------------------ | ------------------------------- | ---------------------------------------------------- |
-| `list_connections` | none                            | saved connections and whether agents may write       |
-| `list_tables`      | `connection`                    | tables and views with their schema                   |
-| `describe_table`   | `connection`, `table`, `schema?` | column names, types, nullability                    |
-| `run_query`        | `connection`, `sql`             | columns and rows, or the affected row count          |
+| Tool                    | Arguments                        | Returns                                                    |
+| ----------------------- | -------------------------------- | ---------------------------------------------------------- |
+| `list_connections`      | none                             | saved connections and whether agents may write             |
+| `list_open_connections` | none                             | whether the app is running, and the connections open in it |
+| `list_tables`           | `connection`                     | tables and views with their schema                         |
+| `describe_table`        | `connection`, `table`, `schema?` | column names, types, nullability                           |
+| `run_query`             | `connection`, `sql`              | columns and rows, or the affected row count                |
 
 ## Settings
 

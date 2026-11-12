@@ -1,6 +1,7 @@
 //! TupleBase core: database logic with no UI dependencies.
 
 pub mod agents;
+pub mod app_status;
 pub mod aws;
 pub mod chat;
 pub mod config;

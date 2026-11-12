@@ -222,6 +222,10 @@ impl Open {
     }
 }
 
+/// How long [`Db::open_connections`] waits for a slot in use. A slot handing out an
+/// open pool is free again at once; one still locked after this is connecting.
+const BUSY_SLOT_WAIT: Duration = Duration::from_millis(200);
+
 /// One connection's pool, and how its last attempt to connect went.
 #[derive(Default)]
 struct Slot {
@@ -273,12 +277,16 @@ impl Db {
             .collect();
         let mut open = HashSet::new();
         for (name, slot) in slots {
-            let is_open = slot
-                .lock()
+            // A slot stays locked while its connection is being opened, which can take as
+            // long as a password prompt stays up. That one isn't open, and the others
+            // must not wait for it.
+            let is_open = tokio::time::timeout(BUSY_SLOT_WAIT, slot.lock())
                 .await
-                .open
-                .as_ref()
-                .is_some_and(|open| open.tunnel.as_ref().is_none_or(Tunnel::is_alive));
+                .is_ok_and(|slot| {
+                    slot.open
+                        .as_ref()
+                        .is_some_and(|open| open.tunnel.as_ref().is_none_or(Tunnel::is_alive))
+                });
             if is_open {
                 open.insert(name);
             }
@@ -902,4 +910,19 @@ fn my_value(row: &MySqlRow, i: usize) -> Value {
         Vec<u8> => bytes,
     );
     fallback(row, i, &type_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_connection_still_opening_does_not_hold_up_the_list() {
+        let db = Db::new();
+        let slot = Arc::new(Mutex::new(Slot::default()));
+        db.slots.lock().await.insert("slow".into(), slot.clone());
+        let _connecting = slot.lock().await;
+        let open = tokio::time::timeout(Duration::from_secs(5), db.open_connections()).await;
+        assert_eq!(open, Ok(HashSet::new()));
+    }
 }
