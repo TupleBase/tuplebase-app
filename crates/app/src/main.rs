@@ -12,7 +12,10 @@ mod workspace;
 
 use gpui_kit::component::{GlobalState, Theme, TitleBar};
 use gpui_kit::*;
-use workspace::{About, AddMcpToAgents, CheckForUpdates, OpenSettings, Workspace};
+use workspace::{
+    About, AddMcpToAgents, CheckForUpdates, DecreaseFontSize, IncreaseFontSize, OpenSettings,
+    ResetFontSize, Workspace,
+};
 
 actions!(tuplebase, [Quit]);
 
@@ -22,15 +25,22 @@ const QUIT_KEY: &str = "cmd-q";
 const QUIT_KEY: &str = "ctrl-q";
 
 fn app_menus() -> Vec<Menu> {
-    vec![Menu::new(tuplebase_core::PRODUCT_NAME).items([
-        MenuItem::action("About TupleBase", About),
-        MenuItem::action("Check for Updates…", CheckForUpdates),
-        MenuItem::separator(),
-        MenuItem::action("Settings…", OpenSettings),
-        MenuItem::action("Add MCP Server to Agents", AddMcpToAgents),
-        MenuItem::separator(),
-        MenuItem::action("Quit TupleBase", Quit),
-    ])]
+    vec![
+        Menu::new(tuplebase_core::PRODUCT_NAME).items([
+            MenuItem::action("About TupleBase", About),
+            MenuItem::action("Check for Updates…", CheckForUpdates),
+            MenuItem::separator(),
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::action("Add MCP Server to Agents", AddMcpToAgents),
+            MenuItem::separator(),
+            MenuItem::action("Quit TupleBase", Quit),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Increase Font Size", IncreaseFontSize),
+            MenuItem::action("Decrease Font Size", DecreaseFontSize),
+            MenuItem::action("Reset Font Size", ResetFontSize),
+        ]),
+    ]
 }
 
 fn main() {

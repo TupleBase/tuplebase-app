@@ -19,7 +19,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::{self, AgentState, AgentStatus};
 use tuplebase_core::config::{
-    Adapter, Config, Connection, FolderNode, folder_name, parent_of, rebase_folder,
+    Adapter, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name, parent_of,
+    rebase_folder,
 };
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
@@ -31,6 +32,7 @@ use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
+use crate::theme;
 
 actions!(
     tuplebase,
@@ -44,7 +46,10 @@ actions!(
         OpenSettings,
         CheckForUpdates,
         About,
-        AddMcpToAgents
+        AddMcpToAgents,
+        IncreaseFontSize,
+        DecreaseFontSize,
+        ResetFontSize
     ]
 );
 
@@ -61,6 +66,20 @@ const RUN_HINT: &str = "Run query (⌘↵)";
 #[cfg(not(target_os = "macos"))]
 const RUN_HINT: &str = "Run query (Ctrl+Enter)";
 
+/// A key held with Cmd on macOS and Ctrl elsewhere.
+#[cfg(target_os = "macos")]
+macro_rules! secondary {
+    ($key:literal) => {
+        concat!("cmd-", $key)
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! secondary {
+    ($key:literal) => {
+        concat!("ctrl-", $key)
+    };
+}
+
 /// Call after `gpui_kit::init`, so the `Input` binding overrides the editor's own
 /// one, which would insert a newline.
 pub fn bind_keys(cx: &mut App) {
@@ -73,6 +92,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("right", TreeExpand, Some(TREE_CONTEXT)),
         KeyBinding::new("enter", TreeOpen, Some(TREE_CONTEXT)),
         KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
+        KeyBinding::new(secondary!("="), IncreaseFontSize, None),
+        // The same key with Shift held.
+        KeyBinding::new(secondary!("+"), IncreaseFontSize, None),
+        KeyBinding::new(secondary!("-"), DecreaseFontSize, None),
+        KeyBinding::new(secondary!("0"), ResetFontSize, None),
     ]);
 }
 
@@ -109,6 +133,15 @@ pub fn register_menu_actions(workspace: &Entity<Workspace>, window: AnyWindowHan
     });
     on::<AddMcpToAgents>(workspace, window, cx, |this, window, cx| {
         this.add_mcp_to_agents(window, cx);
+    });
+    on::<IncreaseFontSize>(workspace, window, cx, |this, _, cx| {
+        this.change_font_size(|config| config.resize_font(1), cx);
+    });
+    on::<DecreaseFontSize>(workspace, window, cx, |this, _, cx| {
+        this.change_font_size(|config| config.resize_font(-1), cx);
+    });
+    on::<ResetFontSize>(workspace, window, cx, |this, _, cx| {
+        this.change_font_size(|config| config.font_size = DEFAULT_FONT_SIZE, cx);
     });
 }
 
@@ -504,6 +537,15 @@ impl Workspace {
         self.save_config(cx);
     }
 
+    fn change_font_size(&mut self, change: impl FnOnce(&mut Config), cx: &mut Context<Self>) {
+        let before = self.config.font_size;
+        change(&mut self.config);
+        if self.config.font_size != before {
+            theme::set_font_size(self.config.font_size, cx);
+            self.save_config(cx);
+        }
+    }
+
     fn save_config(&self, cx: &mut Context<Self>) {
         let config = self.config.clone();
         cx.spawn(async move |this, cx| {
@@ -668,6 +710,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        theme::set_font_size(config.font_size, cx);
         let db = Arc::new(Db::new());
         let names = SchemaNames::default();
         let editor = cx.new(|cx| {
@@ -2332,7 +2375,7 @@ mod tests {
         About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, OpenSettings, Status,
         TreeRow, UpdateState, Workspace, bind_keys, register_menu_actions,
     };
-    use gpui_kit::component::WindowExt as _;
+    use gpui_kit::component::{Theme, ThemeMode, WindowExt as _};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds,
@@ -3042,6 +3085,48 @@ mod tests {
         });
         window_action(handle, cx, |window, _| {
             assert_eq!(window.find_all("check-updates").len(), 1);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn shortcuts_resize_the_text_and_reset_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        let sizes = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let theme = Theme::global(cx);
+                (
+                    workspace.read(cx).config.font_size,
+                    theme.font_size,
+                    theme.mono_font_size,
+                )
+            })
+        };
+        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
+        for _ in 0..2 {
+            window_action(handle, cx, |window, cx| window.press("secondary-=", cx));
+        }
+        assert_eq!(sizes(cx), (18, px(18.), px(16.)));
+        window_action(handle, cx, |window, _| {
+            assert_eq!(window.rem_size(), px(18.));
+        });
+        window_action(handle, cx, |window, cx| window.press("secondary--", cx));
+        assert_eq!(sizes(cx), (17, px(17.), px(15.)));
+        window_action(handle, cx, |window, cx| window.press("secondary-0", cx));
+        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
+    }
+
+    #[gpui_kit::test]
+    fn the_text_size_survives_a_switch_between_light_and_dark(cx: &mut TestAppContext) {
+        let config = Config {
+            font_size: 20,
+            ..Config::default()
+        };
+        let (_, _) = open(config, cx);
+        cx.update(|cx| {
+            Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(Theme::global(cx).font_size, px(20.));
+            Theme::change(ThemeMode::Light, None, cx);
+            assert_eq!(Theme::global(cx).font_size, px(20.));
         });
     }
 
