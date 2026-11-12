@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -25,6 +26,12 @@ pub fn publish(open: &HashSet<String>) -> Result<()> {
 }
 
 fn publish_in(dir: &Path, open: &HashSet<String>) -> Result<()> {
+    // Two writers at once would share the temp file, and one could publish it while the
+    // other had only emptied it.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut names: Vec<&String> = open.iter().collect();
     names.sort();
     write_atomic(&dir.join(FILE), &serde_json::to_string(&names)?)

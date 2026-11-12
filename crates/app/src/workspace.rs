@@ -399,12 +399,17 @@ impl Workspace {
         let db = self.db.clone();
         cx.spawn(async move |this, cx| {
             let open = io(async move {
+                // One at a time, so an older list is never written over a newer one.
+                static PUBLISHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+                let _publishing = PUBLISHING.lock().await;
                 let open = db.open_connections().await;
                 // Rewritten on every poll, changed or not: agents take a file that has
                 // stopped changing to mean the app has quit.
-                let published = open.clone();
-                let _ = tokio::task::spawn_blocking(move || app_status::publish(&published)).await;
-                Ok(open)
+                let publish = move || {
+                    let _ = app_status::publish(&open);
+                    open
+                };
+                Ok(tokio::task::spawn_blocking(publish).await?)
             })
             .await
             .unwrap_or_default();
