@@ -9,3 +9,10 @@ Unmodified single marks, which the app draws in one color on a colored tile:
 - `mariadb.svg`: [Simple Icons](https://simpleicons.org) v16.37.0 (CC0)
 - `sqlite.svg`: [Simple Icons](https://simpleicons.org) v16.37.0 (CC0)
 - `mysql.svg`: `mysql-icon` from [gilbarbara/logos](https://github.com/gilbarbara/logos) at 22f03ffc4a65 (CC0)
+
+# Agent logos
+
+Used only to show which AI agent the chat panel talks to. Claude's name and logo are trademarks
+of Anthropic; TupleBase is not affiliated with or endorsed by it.
+
+- `claude.svg`: [Simple Icons](https://simpleicons.org) v16.37.0 (CC0), unmodified

@@ -95,6 +95,7 @@ fn general(workspace: &Entity<Workspace>) -> SettingPage {
                     SettingField::render(move |_, _, _| {
                         let workspace = history.clone();
                         Button::new("clear-history")
+                            .cursor_pointer()
                             .small()
                             .label("Clear")
                             .on_click(move |_, _, cx| {
@@ -169,6 +170,7 @@ fn agents(workspace: &Entity<Workspace>, cx: &App) -> SettingPage {
             let workspace = workspace.clone();
             h_flex().child(
                 Button::new("add-mcp")
+                    .cursor_pointer()
                     .small()
                     .label("Add to all agents")
                     .on_click(move |_, window, cx| {

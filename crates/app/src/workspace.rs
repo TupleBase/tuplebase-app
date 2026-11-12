@@ -29,6 +29,7 @@ use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
 use tuplebase_core::{mcp_status, secrets, updates};
 
+use crate::chat::{ChatEvent, ChatPanel};
 use crate::completions::{SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::logos;
@@ -311,11 +312,15 @@ pub struct Workspace {
     _session_save: Option<Task<()>>,
     schema: Entity<SchemaPanel>,
     _schema_subscription: Subscription,
+    chat: Entity<ChatPanel>,
+    chat_open: bool,
+    _chat_subscription: Subscription,
     app_menu: Entity<AppMenuBar>,
     /// MCP servers that agents have running.
     /// Connections with an open pool.
     connected: HashSet<String>,
-    mcp_servers: usize,
+    /// One entry per running MCP server: its agent's name, when known.
+    mcp_servers: Vec<Option<String>>,
     /// `None` until Settings has looked for them.
     agents: Option<Vec<AgentStatus>>,
     tree_focus: FocusHandle,
@@ -452,7 +457,9 @@ impl Workspace {
     fn watch_mcp_servers(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
-                let running = blocking(mcp_status::running_servers).await.unwrap_or(0);
+                let running = blocking(mcp_status::running_servers)
+                    .await
+                    .unwrap_or_default();
                 let updated = this.update(cx, |this, cx| {
                     if this.mcp_servers != running {
                         this.mcp_servers = running;
@@ -785,13 +792,24 @@ impl Workspace {
                 }
             },
         );
+        let chat = cx.new(|cx| ChatPanel::new(window, cx));
+        let _chat_subscription =
+            cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
+                ChatEvent::Close => {
+                    this.chat_open = false;
+                    cx.notify();
+                }
+            });
         Self {
             db,
             schema,
             _schema_subscription,
+            chat,
+            chat_open: false,
+            _chat_subscription,
             app_menu: AppMenuBar::new(cx),
             connected: HashSet::new(),
-            mcp_servers: 0,
+            mcp_servers: Vec::new(),
             agents: None,
             config,
             selected: None,
@@ -1341,6 +1359,7 @@ impl Workspace {
                     })
                     .child(
                         Button::new("download-update")
+                            .cursor_pointer()
                             .primary()
                             .small()
                             .label(label)
@@ -1375,6 +1394,7 @@ impl Workspace {
                     .into_any_element()
             }
             UpdateState::Ready { download, .. } => Button::new("restart-to-update")
+                .cursor_pointer()
                 .primary()
                 .small()
                 .label("Restart to update")
@@ -1414,6 +1434,7 @@ impl Workspace {
                         h_flex()
                             .child(
                                 Button::new("add-folder")
+                                    .cursor_pointer()
                                     .ghost()
                                     .xsmall()
                                     .icon(Icon::default().data(NEW_FOLDER_ICON))
@@ -1424,6 +1445,7 @@ impl Workspace {
                             )
                             .child(
                                 Button::new("add-connection")
+                                    .cursor_pointer()
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Plus)
@@ -1470,6 +1492,7 @@ impl Workspace {
                             .justify_between()
                             .child(
                                 Button::new("open-settings")
+                                    .cursor_pointer()
                                     .ghost()
                                     .small()
                                     .icon(IconName::Settings)
@@ -1478,9 +1501,32 @@ impl Workspace {
                                         this.open_settings(SettingsPage::General, window, cx);
                                     })),
                             )
-                            .child(self.render_mcp_status(cx)),
+                            .child(
+                                h_flex()
+                                    .child(
+                                        Button::new("toggle-chat")
+                                            .cursor_pointer()
+                                            .ghost()
+                                            .small()
+                                            .selected(self.chat_open)
+                                            .icon(logos::agent())
+                                            .tooltip("Ask Claude Code about your databases")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.toggle_chat(window, cx);
+                                            })),
+                                    )
+                                    .child(self.render_mcp_status(cx)),
+                            ),
                     ),
             )
+    }
+
+    fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_open = !self.chat_open;
+        if self.chat_open {
+            self.chat.update(cx, |chat, cx| chat.focus(window, cx));
+        }
+        cx.notify();
     }
 
     fn open_about(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1514,15 +1560,16 @@ impl Workspace {
     }
 
     fn render_mcp_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let dot = if self.mcp_servers == 0 {
+        let dot = if self.mcp_servers.is_empty() {
             cx.theme().muted_foreground
         } else {
             cx.theme().success
         };
         Button::new("mcp-status")
+            .cursor_pointer()
             .ghost()
             .small()
-            .tooltip(mcp_status_text(self.mcp_servers))
+            .tooltip(mcp_status_text(&self.mcp_servers))
             .child(
                 h_flex()
                     .gap_1p5()
@@ -1630,6 +1677,7 @@ impl Workspace {
         let path = folder.to_owned();
         let action = |id: String, tooltip: &'static str| {
             Button::new(SharedString::from(id))
+                .cursor_pointer()
                 .ghost()
                 .xsmall()
                 .tooltip(tooltip)
@@ -1822,6 +1870,7 @@ impl Workspace {
                         .group_hover(row_group, |s| s.visible())
                         .child(
                             Button::new(SharedString::from(format!("disconnect-{}", conn.name)))
+                                .cursor_pointer()
                                 .ghost()
                                 .xsmall()
                                 .icon(Icon::default().data(UNPLUG_ICON))
@@ -2043,6 +2092,7 @@ impl Workspace {
                             .collect();
                         let this = cx.entity().downgrade();
                         Button::new("history")
+                            .cursor_pointer()
                             .ghost()
                             .small()
                             .icon(Icon::default().data(HISTORY_ICON))
@@ -2071,6 +2121,7 @@ impl Workspace {
                         let name = conn.name.clone();
                         el.child(
                             Button::new("disconnect")
+                                .cursor_pointer()
                                 .ghost()
                                 .small()
                                 .icon(Icon::default().data(UNPLUG_ICON))
@@ -2082,6 +2133,7 @@ impl Workspace {
                     })
                     .child(
                         Button::new("edit")
+                            .cursor_pointer()
                             .ghost()
                             .small()
                             .icon(Icon::default().data(EDIT_ICON))
@@ -2094,6 +2146,7 @@ impl Workspace {
                     )
                     .child(
                         Button::new("delete")
+                            .cursor_pointer()
                             .ghost()
                             .small()
                             .icon(Icon::default().data(DELETE_ICON))
@@ -2106,6 +2159,7 @@ impl Workspace {
                     )
                     .child(
                         Button::new("run")
+                            .cursor_pointer()
                             .primary()
                             .small()
                             .icon(IconName::Play)
@@ -2153,6 +2207,7 @@ impl Workspace {
                     ))
                     .child(
                         Button::new("empty-add")
+                            .cursor_pointer()
                             .primary()
                             .label("Add connection")
                             .on_click(cx.listener(|this, _, window, cx| {
@@ -2201,37 +2256,43 @@ impl Render for Workspace {
                 el.child(TitleBar::new().child(self.app_menu.clone()))
             })
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_h_0()
                     .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_query(cx)))
                     .child(
-                        h_resizable("workspace-panels")
-                            .on_resize(self.remember_panel_size(Panel::Sidebar, cx))
-                            .child(
-                                self.sized_panel(Panel::Sidebar)
-                                    .child(self.render_sidebar(cx)),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
-                                    .child(
-                                        div().relative().size_full().min_w_0().child(main).when(
-                                            !has_toolbar,
-                                            |el| {
-                                                el.child(
-                                                    drag_area()
-                                                        .absolute()
-                                                        .top_0()
-                                                        .left_0()
-                                                        .w_full()
-                                                        .h(px(WINDOW_TOP_STRIP)),
-                                                )
-                                            },
+                        // The chat keeps its width; the panels beside it share the rest.
+                        div().flex_1().h_full().min_w_0().child(
+                            h_resizable("workspace-panels")
+                                .on_resize(self.remember_panel_size(Panel::Sidebar, cx))
+                                .child(
+                                    self.sized_panel(Panel::Sidebar)
+                                        .child(self.render_sidebar(cx)),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
+                                        .child(
+                                            div()
+                                                .relative()
+                                                .size_full()
+                                                .min_w_0()
+                                                .child(main)
+                                                .when(!has_toolbar, |el| {
+                                                    el.child(
+                                                        drag_area()
+                                                            .absolute()
+                                                            .top_0()
+                                                            .left_0()
+                                                            .w_full()
+                                                            .h(px(WINDOW_TOP_STRIP)),
+                                                    )
+                                                }),
                                         ),
-                                    ),
-                            ),
-                    ),
+                                ),
+                        ),
+                    )
+                    .when(self.chat_open, |el| el.child(self.chat.clone())),
             )
     }
 }
@@ -2267,11 +2328,19 @@ fn mcp_added_note(statuses: &[AgentStatus]) -> Notification {
     ))
 }
 
-fn mcp_status_text(running: usize) -> String {
-    match running {
-        0 => "MCP server not running. Agents start it when they need it.".to_owned(),
+fn mcp_status_text(servers: &[Option<String>]) -> String {
+    let count = match servers.len() {
+        0 => return "MCP server not running. Agents start it when they need it.".to_owned(),
         1 => "MCP server running for 1 agent".to_owned(),
         n => format!("MCP server running for {n} agents"),
+    };
+    // An agent with several sessions runs several servers; name it once.
+    let mut names: Vec<&str> = servers.iter().flatten().map(String::as_str).collect();
+    names.dedup();
+    if names.is_empty() {
+        count
+    } else {
+        format!("{count}: {}", names.join(", "))
     }
 }
 
@@ -2367,9 +2436,29 @@ mod tests {
 
     #[test]
     fn mcp_status_text_counts_agents() {
-        assert!(super::mcp_status_text(0).contains("not running"));
-        assert_eq!(super::mcp_status_text(1), "MCP server running for 1 agent");
-        assert_eq!(super::mcp_status_text(3), "MCP server running for 3 agents");
+        assert!(super::mcp_status_text(&[]).contains("not running"));
+        assert_eq!(
+            super::mcp_status_text(&[None]),
+            "MCP server running for 1 agent"
+        );
+        assert_eq!(
+            super::mcp_status_text(&[None, None, None]),
+            "MCP server running for 3 agents"
+        );
+    }
+
+    #[test]
+    fn mcp_status_text_names_each_agent_once() {
+        let named = |name: &str| Some(name.to_owned());
+        assert_eq!(
+            super::mcp_status_text(&[
+                None,
+                named("claude-code"),
+                named("claude-code"),
+                named("codex")
+            ]),
+            "MCP server running for 4 agents: claude-code, codex"
+        );
     }
 
     #[gpui_kit::test]
@@ -2601,6 +2690,72 @@ mod tests {
             assert!(window.has_active_dialog(cx));
             // It opens on the agents page, not the general one.
             assert!(window.try_find("check-updates").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_chat_button_opens_the_panel_and_its_close_icon_closes_it(cx: &mut TestAppContext) {
+        let (handle, _) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("chat-panel").is_none());
+            window.click("toggle-chat", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("chat-panel").visible());
+            window.click("chat-close", cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("chat-panel").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_chat_suggestion_is_asked_and_a_new_chat_forgets_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("toggle-chat", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("chat-suggestion-0", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            let chat = workspace.read(cx).chat.read(cx);
+            assert_eq!(chat.asked(), ["Which connections can you see?"]);
+            assert!(chat.is_busy());
+            assert!(window.find("chat-busy").visible());
+            window.click("chat-new", cx);
+        });
+        cx.update(|cx| {
+            let chat = workspace.read(cx).chat.read(cx);
+            assert!(chat.asked().is_empty());
+            assert!(!chat.is_busy());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_chat_tool_call_shows_its_arguments_only_when_clicked(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("toggle-chat", cx));
+        cx.update(|cx| {
+            let chat = workspace.read(cx).chat.clone();
+            chat.update(cx, |chat, cx| {
+                chat.show(
+                    tuplebase_core::chat::Event::Tool {
+                        name: "list_tables".into(),
+                        input: r#"{"connection":"db"}"#.into(),
+                    },
+                    cx,
+                );
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("chat-tool-input-0").is_none());
+            window.click("chat-tool-0", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("chat-tool-input-0").visible());
+            window.click("chat-tool-0", cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("chat-tool-input-0").is_none());
         });
     }
 

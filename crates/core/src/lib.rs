@@ -2,6 +2,7 @@
 
 pub mod agents;
 pub mod aws;
+pub mod chat;
 pub mod config;
 pub mod db;
 pub mod mcp_status;

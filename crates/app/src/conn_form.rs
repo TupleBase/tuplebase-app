@@ -458,6 +458,7 @@ impl ConnForm {
                         )
                         .child(
                             Button::new("fetch-fingerprint")
+                                .cursor_pointer()
                                 .label("Get from server")
                                 .loading(self.fetching_fingerprint)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -736,6 +737,7 @@ impl Render for ConnForm {
                                     .when(chosen, |el| {
                                         el.child(
                                             Button::new("save")
+                                                .cursor_pointer()
                                                 .primary()
                                                 .label("Save connection")
                                                 .on_click(
@@ -743,9 +745,15 @@ impl Render for ConnForm {
                                                 ),
                                         )
                                     })
-                                    .child(Button::new("cancel").ghost().label("Cancel").on_click(
-                                        cx.listener(|_, _, _, cx| cx.emit(ConnFormEvent::Cancel)),
-                                    )),
+                                    .child(
+                                        Button::new("cancel")
+                                            .cursor_pointer()
+                                            .ghost()
+                                            .label("Cancel")
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(ConnFormEvent::Cancel)
+                                            })),
+                                    ),
                             ),
                     ),
             )

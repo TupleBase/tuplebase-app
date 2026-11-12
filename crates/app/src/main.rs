@@ -1,6 +1,7 @@
 // No console window for release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chat;
 mod completions;
 mod conn_form;
 mod logos;
