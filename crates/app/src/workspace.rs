@@ -37,6 +37,7 @@ use crate::results::ResultsDelegate;
 use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme;
+use crate::tree_nav::{self, TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeUp};
 
 mod settings;
 
@@ -46,11 +47,6 @@ actions!(
     tuplebase,
     [
         RunQuery,
-        TreeUp,
-        TreeDown,
-        TreeCollapse,
-        TreeExpand,
-        TreeOpen,
         OpenSettings,
         CheckForUpdates,
         About,
@@ -94,11 +90,6 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(RUN_KEY, RunQuery, Some("Input")),
         KeyBinding::new(RUN_KEY, RunQuery, None),
-        KeyBinding::new("up", TreeUp, Some(TREE_CONTEXT)),
-        KeyBinding::new("down", TreeDown, Some(TREE_CONTEXT)),
-        KeyBinding::new("left", TreeCollapse, Some(TREE_CONTEXT)),
-        KeyBinding::new("right", TreeExpand, Some(TREE_CONTEXT)),
-        KeyBinding::new("enter", TreeOpen, Some(TREE_CONTEXT)),
         KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
         KeyBinding::new(secondary!("="), IncreaseFontSize, None),
         // The same key with Shift held.
@@ -106,6 +97,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(secondary!("-"), DecreaseFontSize, None),
         KeyBinding::new(secondary!("0"), ResetFontSize, None),
     ]);
+    cx.bind_keys(tree_nav::key_bindings());
 }
 
 /// Menu items must work whatever has focus, so their actions are global and go to the
@@ -163,7 +155,6 @@ const HISTORY_ICON: &[u8] = include_bytes!("../../../assets/icons/clock.svg");
 const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
 
 const HISTORY_MENU_SIZE: usize = 20;
-const TREE_CONTEXT: &str = "ConnectionTree";
 /// The least room the sidebar leaves beside it. It fits the schema panel at its widest
 /// next to an editor that is still usable.
 const MAIN_MIN_WIDTH: f32 = 480.;
@@ -1202,19 +1193,13 @@ impl Workspace {
 
     fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
         let rows = self.visible_rows();
-        if rows.is_empty() {
-            return;
-        }
         let current = self
             .cursor
             .as_ref()
             .and_then(|cursor| rows.iter().position(|row| row == cursor));
-        let last = rows.len() as isize - 1;
-        let next = match current {
-            Some(index) => (index as isize + delta).clamp(0, last),
-            None if delta > 0 => 0,
-            None => last,
-        } as usize;
+        let Some(next) = tree_nav::step(rows.len(), current, delta) else {
+            return;
+        };
         self.tree_scroll.scroll_to_item(next);
         self.cursor = Some(rows[next].clone());
         cx.notify();
@@ -1476,7 +1461,7 @@ impl Workspace {
                 v_flex()
                     .id("connections")
                     .track_focus(&self.tree_focus)
-                    .key_context(TREE_CONTEXT)
+                    .key_context(tree_nav::CONTEXT)
                     .track_scroll(&self.tree_scroll)
                     .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.move_cursor(-1, cx)))
                     .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.move_cursor(1, cx)))
@@ -3502,26 +3487,91 @@ mod tests {
         cx.update(|cx| assert_eq!(workspace.read(cx).config.connections[0].folder, "Local"));
     }
 
-    #[gpui_kit::test]
-    fn previewing_a_table_runs_its_query(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
+    /// Opens the test connection with these tables of `public` in the schema panel.
+    fn show_tables(workspace: &Entity<Workspace>, tables: &[&str], cx: &mut TestAppContext) {
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
                 let conn = this.config.connections[0].clone();
                 this.selected = Some(conn.name.clone());
                 this.schema.update(cx, |schema, cx| {
                     schema.set_connection(Some(conn), cx);
-                    schema.tables = vec![tuplebase_core::db::TableInfo {
-                        schema: "public".into(),
-                        name: "users".into(),
-                        kind: "BASE TABLE".into(),
-                    }];
+                    schema.tables = tables
+                        .iter()
+                        .map(|name| tuplebase_core::db::TableInfo {
+                            schema: "public".into(),
+                            name: (*name).into(),
+                            kind: "BASE TABLE".into(),
+                        })
+                        .collect();
                     schema.load = crate::schema::Load::Ready;
                     cx.notify();
                 });
                 cx.notify();
             });
         });
+    }
+
+    #[gpui_kit::test]
+    fn arrow_keys_walk_the_schema_tree_once_it_is_clicked(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        show_tables(&workspace, &["orders", "users"], cx);
+        let schema_cursor = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |this, cx| this.schema.read(cx).cursor_name())
+        };
+        let press = |key: &str, cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, cx| window.press(key, cx));
+        };
+
+        window_action(handle, cx, |window, cx| window.click("schema-public", cx));
+        assert_eq!(schema_cursor(cx).as_deref(), Some("public"));
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("table-public-orders").is_none());
+        });
+
+        press("right", cx);
+        press("down", cx);
+        press("down", cx);
+        press("down", cx);
+        assert_eq!(schema_cursor(cx).as_deref(), Some("users"));
+        press("up", cx);
+        assert_eq!(schema_cursor(cx).as_deref(), Some("orders"));
+
+        press("right", cx);
+        cx.update(|cx| assert_eq!(workspace.read(cx).schema.read(cx).expanded.len(), 1));
+        press("left", cx);
+        cx.update(|cx| assert!(workspace.read(cx).schema.read(cx).expanded.is_empty()));
+        press("left", cx);
+        assert_eq!(schema_cursor(cx).as_deref(), Some("public"));
+
+        // The connection tree kept its own cursor through all of it.
+        workspace.read_with(cx, |this, _| {
+            assert_eq!(this.cursor, Some(TreeRow::Connection("db".into())));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn enter_on_a_table_shows_its_rows(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_tables(&workspace, &["users"], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("table-public-users", cx);
+            window.press("left", cx);
+            window.press("enter", cx);
+        });
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(
+                this.editor.read(cx).value().as_str(),
+                r#"SELECT * FROM "public"."users" LIMIT 100"#
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn previewing_a_table_runs_its_query(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_tables(&workspace, &["users"], cx);
         window_action(handle, cx, |window, cx| {
             window.hover("table-public-users", cx);
             window.click("preview-table-public-users", cx);

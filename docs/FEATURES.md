@@ -26,7 +26,9 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
   on SQLite.
 - Filter everything by name.
 - Preview the first 100 rows of a table with one click.
-- Move through the connection tree with the arrow keys.
+- Move through the connection tree and the schema tree with the arrow keys: up and down to walk,
+  left and right to close and open. The keys go to the tree you clicked last. Enter opens a
+  connection or shows a table's first 100 rows.
 
 ## SQL editor
 

@@ -15,6 +15,7 @@ use tuplebase_core::db::{ColumnInfo, Db, ObjectInfo, ObjectKind, TableInfo};
 
 use crate::completions::SchemaNames;
 use crate::runtime::io;
+use crate::tree_nav::{self, TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeUp};
 
 const TABLE_ICON: &[u8] = include_bytes!("../../../assets/icons/table-2.svg");
 const ROW_HEIGHT: f32 = 30.;
@@ -60,6 +61,25 @@ enum Row {
         detail: String,
     },
     Note(&'static str),
+}
+
+/// A row that does something. The arrow keys stop on these and pass the others.
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    Schema(String),
+    Table(TableKey),
+    Group(String, ObjectKind),
+}
+
+impl Row {
+    fn target(&self) -> Option<Target> {
+        match self {
+            Row::Schema { name, .. } => Some(Target::Schema(name.clone())),
+            Row::Table { key, .. } => Some(Target::Table(key.clone())),
+            Row::Group { schema, kind, .. } => Some(Target::Group(schema.clone(), *kind)),
+            Row::Column { .. } | Row::Object { .. } | Row::Note(_) => None,
+        }
+    }
 }
 
 /// The groups the user has opened.
@@ -167,7 +187,11 @@ pub struct SchemaPanel {
     pub(crate) expanded: HashMap<TableKey, Columns>,
     filter: Entity<InputState>,
     scroll: UniformListScrollHandle,
+    focus: FocusHandle,
+    /// The row arrow keys act on.
+    cursor: Option<Target>,
     _filter_subscription: Subscription,
+    _focus_subscriptions: [Subscription; 2],
 }
 
 impl EventEmitter<SchemaEvent> for SchemaPanel {}
@@ -185,6 +209,12 @@ impl SchemaPanel {
                 cx.notify();
             }
         });
+        // The cursor only shows while the tree has the keys.
+        let focus = cx.focus_handle();
+        let _focus_subscriptions = [
+            cx.on_focus(&focus, window, |_, _, cx| cx.notify()),
+            cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
+        ];
         Self {
             db,
             names,
@@ -197,7 +227,10 @@ impl SchemaPanel {
             expanded: HashMap::new(),
             filter,
             scroll: UniformListScrollHandle::new(),
+            focus,
+            cursor: None,
             _filter_subscription,
+            _focus_subscriptions,
         }
     }
 
@@ -209,6 +242,7 @@ impl SchemaPanel {
         self.names.borrow_mut().clear();
         self.collapsed.clear();
         self.open_groups.clear();
+        self.cursor = None;
         self.load = Load::Idle;
         self.refresh(cx);
     }
@@ -319,14 +353,150 @@ impl SchemaPanel {
         }
     }
 
-    fn render_row(&self, row: &Row, cx: &mut Context<Self>) -> AnyElement {
+    fn filter_text(&self, cx: &App) -> String {
+        self.filter.read(cx).value().to_string()
+    }
+
+    /// The visible lines, top to bottom.
+    fn rows(&self, cx: &App) -> Vec<Row> {
+        flatten(
+            &self.tables,
+            &self.objects,
+            &self.filter_text(cx),
+            &self.collapsed,
+            &self.open_groups,
+            &self.expanded,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cursor_name(&self) -> Option<String> {
+        Some(match self.cursor.as_ref()? {
+            Target::Schema(name) => name.clone(),
+            Target::Table(key) => key.table.clone(),
+            Target::Group(_, kind) => kind.plural().to_owned(),
+        })
+    }
+
+    /// The row under the cursor, if it is still showing.
+    fn cursor_row(&self, cx: &App) -> Option<Row> {
+        let cursor = self.cursor.as_ref()?;
+        self.rows(cx)
+            .into_iter()
+            .find(|row| row.target().as_ref() == Some(cursor))
+    }
+
+    fn is_cursor(&self, row: &Row, window: &Window) -> bool {
+        self.cursor.is_some() && row.target() == self.cursor && self.focus.is_focused(window)
+    }
+
+    /// A clicked row takes the cursor, and the tree takes the keys.
+    fn take_cursor(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor = Some(target);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Puts the cursor on `target` and brings it into view.
+    fn set_cursor(&mut self, target: Target, cx: &mut Context<Self>) {
+        let index = self
+            .rows(cx)
+            .iter()
+            .position(|row| row.target().as_ref() == Some(&target));
+        if let Some(index) = index {
+            self.scroll.scroll_to_item(index, ScrollStrategy::Nearest);
+        }
+        self.cursor = Some(target);
+        cx.notify();
+    }
+
+    fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let mut stops: Vec<Target> = self.rows(cx).iter().filter_map(Row::target).collect();
+        let current = self
+            .cursor
+            .as_ref()
+            .and_then(|cursor| stops.iter().position(|stop| stop == cursor));
+        if let Some(next) = tree_nav::step(stops.len(), current, delta) {
+            self.set_cursor(stops.swap_remove(next), cx);
+        }
+    }
+
+    /// Left arrow: closes what is open, otherwise jumps to the schema above.
+    fn collapse_cursor(&mut self, cx: &mut Context<Self>) {
+        // A filter shows every match, so there is nothing to close while one is set.
+        let can_close = self.filter_text(cx).trim().is_empty();
+        match self.cursor_row(cx) {
+            Some(Row::Schema {
+                name,
+                collapsed: false,
+                ..
+            }) if can_close => self.toggle_schema(&name, cx),
+            Some(Row::Group {
+                schema,
+                kind,
+                open: true,
+                ..
+            }) if can_close => self.toggle_group(schema, kind, cx),
+            Some(Row::Table {
+                key,
+                expanded: true,
+                ..
+            }) => self.toggle_table(key, cx),
+            Some(Row::Table { key, .. }) => self.set_cursor(Target::Schema(key.schema), cx),
+            Some(Row::Group { schema, .. }) => self.set_cursor(Target::Schema(schema), cx),
+            _ => {}
+        }
+    }
+
+    /// Right arrow: opens what is closed; on an open schema, moves into it.
+    fn expand_cursor(&mut self, cx: &mut Context<Self>) {
+        match self.cursor_row(cx) {
+            Some(Row::Schema {
+                name,
+                collapsed: true,
+                ..
+            }) => self.toggle_schema(&name, cx),
+            Some(Row::Schema { .. }) => self.move_cursor(1, cx),
+            Some(Row::Table {
+                key,
+                expanded: false,
+                ..
+            }) => self.toggle_table(key, cx),
+            Some(Row::Group {
+                schema,
+                kind,
+                open: false,
+                ..
+            }) => self.toggle_group(schema, kind, cx),
+            _ => {}
+        }
+    }
+
+    /// Enter: shows a table's rows, and opens or closes anything else.
+    fn open_cursor(&mut self, cx: &mut Context<Self>) {
+        match self.cursor_row(cx) {
+            Some(Row::Schema { name, .. }) => self.toggle_schema(&name, cx),
+            Some(Row::Table { key, .. }) => self.preview(&key, cx),
+            Some(Row::Group { schema, kind, .. }) => self.toggle_group(schema, kind, cx),
+            _ => {}
+        }
+    }
+
+    fn render_row(&self, row: &Row, is_cursor: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let (muted, hover, radius) = (theme.muted_foreground, theme.accent, theme.radius);
+        let border = if is_cursor {
+            theme.ring
+        } else {
+            transparent_black()
+        };
         let line = || {
             h_flex()
                 .h(px(ROW_HEIGHT))
                 .gap_1p5()
                 .pr_1()
+                .border_1()
+                .border_color(border)
                 .rounded(radius)
                 .overflow_hidden()
         };
@@ -360,7 +530,10 @@ impl SchemaPanel {
                         .child(name.clone()),
                 )
                 .child(div().text_xs().text_color(muted).child(tables.to_string()))
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_schema(&name, cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.take_cursor(Target::Schema(name.clone()), window, cx);
+                    this.toggle_schema(&name, cx);
+                }))
                 .into_any_element(),
             Row::Table {
                 key,
@@ -402,13 +575,16 @@ impl SchemaPanel {
                                     .xsmall()
                                     .icon(IconName::Play)
                                     .tooltip("Show the first 100 rows")
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
+                                        let target = Target::Table(preview_key.clone());
+                                        this.take_cursor(target, window, cx);
                                         this.preview(&preview_key, cx);
                                     })),
                             ),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.take_cursor(Target::Table(key.clone()), window, cx);
                         this.toggle_table(key.clone(), cx);
                     }))
                     .into_any_element()
@@ -450,7 +626,8 @@ impl SchemaPanel {
                         .child(kind.plural()),
                 )
                 .child(div().text_xs().text_color(muted).child(count.to_string()))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.take_cursor(Target::Group(schema.clone(), kind), window, cx);
                     this.toggle_group(schema.clone(), kind, cx);
                 }))
                 .into_any_element(),
@@ -478,15 +655,8 @@ impl SchemaPanel {
 
 impl Render for SchemaPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let filter = self.filter.read(cx).value().to_string();
-        let rows = Rc::new(flatten(
-            &self.tables,
-            &self.objects,
-            &filter,
-            &self.collapsed,
-            &self.open_groups,
-            &self.expanded,
-        ));
+        let filter = self.filter_text(cx);
+        let rows = Rc::new(self.rows(cx));
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let message = match self.load {
@@ -531,13 +701,22 @@ impl Render for SchemaPanel {
                     uniform_list(
                         "schema-rows",
                         count,
-                        cx.processor(move |this, range: Range<usize>, _, cx| {
+                        cx.processor(move |this, range: Range<usize>, window, cx| {
                             rows[range]
                                 .iter()
-                                .map(|row| this.render_row(row, cx))
+                                .map(|row| this.render_row(row, this.is_cursor(row, window), cx))
                                 .collect::<Vec<_>>()
                         }),
                     )
+                    .track_focus(&self.focus)
+                    .key_context(tree_nav::CONTEXT)
+                    .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.move_cursor(-1, cx)))
+                    .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.move_cursor(1, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &TreeCollapse, _, cx| this.collapse_cursor(cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.expand_cursor(cx)))
+                    .on_action(cx.listener(|this, _: &TreeOpen, _, cx| this.open_cursor(cx)))
                     .px_1()
                     .flex_1()
                     .track_scroll(&self.scroll)
