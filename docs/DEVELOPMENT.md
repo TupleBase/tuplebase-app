@@ -10,6 +10,19 @@
 
 ## Commands
 
+One command starts the local databases, adds them to the app and runs it:
+
+```sh
+make dev            # databases up, then the app with its own config in target/dev-config
+make dev-fake-aws   # the same, with AWS pointed at the fake service
+make down           # stop the databases
+```
+
+`make dev` never touches the installed app's config. To run against your real config
+instead, set `TUPLEBASE_CONFIG_DIR` to its folder.
+
+The single steps:
+
 ```sh
 cargo run -p tuplebase-app                              # run the app
 cargo run -p tuplebase-mcp                              # run the MCP server (stdio)
