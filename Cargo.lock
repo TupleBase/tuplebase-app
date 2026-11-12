@@ -9293,6 +9293,7 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
  "aws-smithy-http-client",
+ "aws-types",
  "directories",
  "futures-util",
  "keyring",

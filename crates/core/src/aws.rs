@@ -11,6 +11,7 @@ use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_ssm::config::{ProvideCredentials, Region, SharedCredentialsProvider};
 use aws_sdk_ssm::error::{ProvideErrorMetadata, SdkError};
 use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
+use aws_types::os_shim_internal::{Env, Fs};
 use serde_json::Value;
 use tokio::time::timeout;
 
@@ -138,26 +139,66 @@ async fn sdk_config(auth: &AwsAuth) -> Result<SdkConfig> {
         loader = loader.region(Region::new(auth.region.clone()));
     }
     let config = loader.load().await;
+    let provider = config
+        .credentials_provider()
+        .context("no AWS credentials are set up on this machine")?;
+    let credentials = match provider.provide_credentials().await {
+        Ok(credentials) => credentials,
+        Err(e) if !profile_exists(&auth.profile).await => {
+            bail!(
+                "the AWS profile \"{}\" is not in your AWS config ({})",
+                auth.profile,
+                causes(&e)
+            )
+        }
+        Err(e) => {
+            let profile = Some(&auth.profile).filter(|p| !p.is_empty());
+            let login = profile.map_or_else(
+                || "aws sso login".to_owned(),
+                |profile| format!("aws sso login --profile {profile}"),
+            );
+            bail!(
+                "no usable AWS credentials ({}). If your session expired, run `{login}`",
+                causes(&e)
+            )
+        }
+    };
     if config.region().is_none() {
         bail!("no AWS region: set one on the connection or in the AWS profile");
     }
-    let login = if auth.profile.is_empty() {
-        "aws sso login".to_owned()
-    } else {
-        format!("aws sso login --profile {}", auth.profile)
-    };
-    let credentials = config
-        .credentials_provider()
-        .context("no AWS credentials are set up on this machine")?
-        .provide_credentials()
-        .await
-        .with_context(|| {
-            format!("no usable AWS credentials. If your session expired, run `{login}`")
-        })?;
     Ok(config
         .into_builder()
         .credentials_provider(SharedCredentialsProvider::new(credentials))
         .build())
+}
+
+/// Whether the AWS config files define `profile`. True for the default one, and when the
+/// files can't be read, so only a profile that is surely missing is reported as such.
+async fn profile_exists(profile: &str) -> bool {
+    if profile.is_empty() {
+        return true;
+    }
+    let files = Default::default();
+    match aws_config::profile::load(&Fs::real(), &Env::real(), &files, None).await {
+        Ok(profiles) => profiles.get_profile(profile).is_some(),
+        Err(_) => true,
+    }
+}
+
+/// An error's causes on one line, without the repeats and the lists the SDK adds.
+fn causes(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut next = Some(err);
+    while let Some(err) = next {
+        let text = err.to_string();
+        let line = text.lines().next().unwrap_or_default();
+        let line = line.trim_end_matches(" Attempted:").to_owned();
+        if lines.last() != Some(&line) {
+            lines.push(line);
+        }
+        next = err.source();
+    }
+    lines.join(": ")
 }
 
 /// AWS's own code and message for a refused request; the cause chain for anything else.
