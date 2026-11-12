@@ -65,6 +65,7 @@ scripts/                   install, packaging, release helpers
 | `results`            | the table that shows a query result                         |
 | `chat`               | the chat panel                                              |
 | `completions`        | SQL autocomplete                                            |
+| `tree_nav`           | keyboard navigation shared by the trees                     |
 | `runtime`            | the Tokio runtime for background work                       |
 | `theme`, `logos`     | colors and icons                                            |
 
