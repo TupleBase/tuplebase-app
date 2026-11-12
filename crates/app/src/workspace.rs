@@ -27,7 +27,7 @@ use tuplebase_core::config::{
 };
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
-use tuplebase_core::{mcp_status, secrets, updates};
+use tuplebase_core::{app_status, mcp_status, secrets, updates};
 
 use crate::chat::{ChatEvent, ChatPanel};
 use crate::completions::{SchemaNames, SqlCompletions};
@@ -398,9 +398,16 @@ impl Workspace {
     fn refresh_connected(&self, cx: &mut Context<Self>) {
         let db = self.db.clone();
         cx.spawn(async move |this, cx| {
-            let open = io(async move { Ok(db.open_connections().await) })
-                .await
-                .unwrap_or_default();
+            let open = io(async move {
+                let open = db.open_connections().await;
+                // Rewritten on every poll, changed or not: agents take a file that has
+                // stopped changing to mean the app has quit.
+                let published = open.clone();
+                let _ = tokio::task::spawn_blocking(move || app_status::publish(&published)).await;
+                Ok(open)
+            })
+            .await
+            .unwrap_or_default();
             this.update(cx, |this, cx| {
                 if this.connected != open {
                     this.connected = open;

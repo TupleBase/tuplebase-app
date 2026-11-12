@@ -12,6 +12,7 @@ use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler,
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
+use tuplebase_core::app_status;
 use tuplebase_core::config::{self, Config, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::mcp_status::Heartbeat;
@@ -104,6 +105,19 @@ impl Server {
         }))
     }
 
+    #[tool(
+        description = "List the connections the user has open in the TupleBase app right now. \
+                       These are the ones the user is working on."
+    )]
+    async fn list_open_connections(&self) -> ToolResult {
+        reply(app_status::open_connections().map(|open| {
+            json!({
+                "app_running": open.is_some(),
+                "open": open.unwrap_or_default(),
+            })
+        }))
+    }
+
     #[tool(description = "List the tables and views of a connection.")]
     async fn list_tables(&self, Parameters(args): Parameters<ConnectionArgs>) -> ToolResult {
         reply(
@@ -156,7 +170,9 @@ impl ServerHandler for Server {
             .with_server_info(Implementation::new("tuplebase", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Query the user's databases saved in TupleBase. Start with list_connections, \
-                 then list_tables / describe_table, then run_query.",
+                 then list_tables / describe_table, then run_query. When the user means the \
+                 database they are working on, list_open_connections says which ones are \
+                 open in the app.",
             )
     }
 }
