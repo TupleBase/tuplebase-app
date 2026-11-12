@@ -14,6 +14,9 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 - Mark a connection read-only to block writes from both the app and agents.
 - Passwords stay in the OS credential store, never in config files. See
   [where they are stored](CREDENTIALS.md).
+- Or keep the credentials in AWS: point a connection at a Secrets Manager secret or a Parameter
+  Store parameter, and it is read with your AWS profile each time you connect. See
+  [credentials kept in AWS](CREDENTIALS.md#credentials-kept-in-aws).
 
 ## Schema browser
 

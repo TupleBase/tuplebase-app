@@ -29,6 +29,14 @@ services:
       test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -udev -pdev app -e 'select 1 from users limit 1'"]
       interval: 2s
       retries: 30
+  # Fake AWS (Secrets Manager, Parameter Store) for the tests of credentials kept in AWS.
+  aws:
+    image: motoserver/moto:5.1.4
+    ports: ["54566:5000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:5000/moto-api/')"]
+      interval: 2s
+      retries: 30
   # SSH bastion for tunnel tests; it reaches the databases by service name.
   sshd:
     image: alpine:3.22

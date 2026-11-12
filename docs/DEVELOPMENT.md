@@ -10,6 +10,22 @@
 
 ## Commands
 
+One command starts the local databases, adds them to the app and runs it:
+
+```sh
+make dev    # databases up, then the app with its own config in target/dev-config
+make down   # stop the databases
+```
+
+`make dev` never touches the installed app's config. To run against your real config
+instead, set `TUPLEBASE_CONFIG_DIR` to its folder.
+
+The dev app's AWS is the fake one from `docker-compose.yml`, so the `test-mariadb-aws`
+connection, whose credentials are a secret there, works with no account. To use your real AWS
+profiles instead, run `make dev REAL_AWS=1`.
+
+The single steps:
+
 ```sh
 cargo run -p tuplebase-app                              # run the app
 cargo run -p tuplebase-mcp                              # run the MCP server (stdio)
@@ -34,6 +50,11 @@ Local databases, user `dev`, password `dev`, database `app`:
 | PostgreSQL | 55432 |
 | MariaDB    | 53306 |
 | SSH server | 52222 |
+| Fake AWS   | 54566 |
+
+The fake AWS serves Secrets Manager and Parameter Store. To use it from the app or the AWS
+CLI, set `AWS_ENDPOINT_URL=http://127.0.0.1:54566`, `AWS_ACCESS_KEY_ID=test` and
+`AWS_SECRET_ACCESS_KEY=test`.
 
 To get these in the app, in a "Local test databases" folder that needs no passwords:
 
@@ -41,7 +62,9 @@ To get these in the app, in a "Local test databases" folder that needs no passwo
 cargo run -p tuplebase-core --example add_test_connections
 ```
 
-It only touches your own config, and is safe to run again.
+It only touches your own config, and is safe to run again. With `AWS_ENDPOINT_URL` set to the
+fake AWS, it also stores the secret `dev/mariadb` there and adds `test-mariadb-aws`, a
+connection that takes its host, user and password from that secret. `make dev` does both.
 
 `TUPLEBASE_IT_KEYCHAIN=1` also runs a round trip against the real OS credential store.
 

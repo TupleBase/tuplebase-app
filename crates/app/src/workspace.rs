@@ -837,7 +837,10 @@ impl Workspace {
                 if let Some(old) = renamed {
                     secrets::rename(old, &connection.name)?;
                 }
-                if let Some(pw) = &password {
+                if connection.auth.is_some() {
+                    // The credentials now come from AWS; don't keep an unused password.
+                    secrets::delete_password(&connection.name)?;
+                } else if let Some(pw) = &password {
                     secrets::set_password(&connection.name, pw)?;
                 }
                 if let Some(secret) = &ssh_password {
@@ -2326,8 +2329,8 @@ fn history_label(sql: &str) -> String {
 mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
     use super::{
-        About, AgentState, AgentStatus, Config, Connection, OpenSettings, Status, TreeRow,
-        UpdateState, Workspace, bind_keys, register_menu_actions,
+        About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, OpenSettings, Status,
+        TreeRow, UpdateState, Workspace, bind_keys, register_menu_actions,
     };
     use gpui_kit::component::WindowExt as _;
     use gpui_kit::test::TestWindowExt;
@@ -2336,7 +2339,7 @@ mod tests {
         WindowOptions, px, size,
     };
     use serde_json::json;
-    use tuplebase_core::config::Adapter;
+    use tuplebase_core::config::{Adapter, AwsAuth, AwsStore};
     use tuplebase_core::db::QueryResult;
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
@@ -2375,6 +2378,7 @@ mod tests {
             color: String::new(),
             tls: Default::default(),
             ssh: None,
+            auth: None,
         };
         config.upsert(conn, None).unwrap();
         config
@@ -2832,6 +2836,72 @@ mod tests {
             assert!(this.config.connections.is_empty());
             let form = this.form.as_ref().expect("form stays open").read(cx);
             assert!(form.error.is_some());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn aws_credentials_replace_the_password_and_can_name_the_host(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-aws-name").is_none());
+            window.click("auth-AWS Secrets Manager", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-password").is_none());
+            assert!(window.try_find("conn-host").is_some());
+            window.click("conn-name", cx);
+            window.input("orders", cx);
+            window.click("conn-aws-profile", cx);
+            window.input("prod-sso", cx);
+            window.click("conn-aws-name", cx);
+            window.input("prod/orders", cx);
+            // Left behind in a field that is about to be hidden; it must not block saving.
+            window.click("conn-port", cx);
+            window.input("not a port", cx);
+            window.click("use-secret-host", cx);
+        });
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save {
+                    connection,
+                    password,
+                    ..
+                } = event
+                {
+                    *saved.borrow_mut() = Some((connection.clone(), password.clone()));
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-host").is_none());
+            window.scroll(
+                "conn-form",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2000.))),
+                cx,
+            );
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        let (connection, password) = saved.borrow_mut().take().expect("the form saved");
+        assert_eq!(password, None);
+        assert_eq!(connection.host, "");
+        assert_eq!(
+            connection.auth,
+            Some(AwsAuth {
+                store: AwsStore::SecretsManager,
+                profile: "prod-sso".into(),
+                region: String::new(),
+                name: "prod/orders".into(),
+                use_secret_host: true,
+            })
+        );
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            assert!(form.read(cx).error.is_none());
         });
     }
 
