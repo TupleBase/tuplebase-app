@@ -36,11 +36,6 @@ fn parse_color(color: &str) -> Option<u32> {
     u32::from_str_radix(color.strip_prefix('#')?, 16).ok()
 }
 
-/// The color the user picked for a connection, if any.
-pub fn picked_color(color: &str) -> Option<Hsla> {
-    parse_color(color).map(|value| rgb(value).into())
-}
-
 /// The color a connection shows: its own choice, or else its database's color.
 pub fn color_of(adapter: Adapter, color: &str) -> Hsla {
     rgb(parse_color(color).unwrap_or_else(|| database_color(adapter))).into()
@@ -71,7 +66,7 @@ pub fn brand(size: f32) -> Img {
 
 #[cfg(test)]
 mod tests {
-    use super::{color_of, picked_color};
+    use super::color_of;
     use gpui_kit::{Hsla, rgb};
     use tuplebase_core::config::Adapter;
 
@@ -81,11 +76,5 @@ mod tests {
         let database: Hsla = rgb(0x0F80CC).into();
         assert_eq!(color_of(Adapter::Sqlite, "#3E8BD6"), chosen);
         assert_eq!(color_of(Adapter::Sqlite, ""), database);
-    }
-
-    #[test]
-    fn only_a_picked_color_counts_as_picked() {
-        assert!(picked_color("#3E8BD6").is_some());
-        assert!(picked_color("").is_none());
     }
 }

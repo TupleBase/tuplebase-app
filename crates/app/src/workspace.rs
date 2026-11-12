@@ -1851,17 +1851,6 @@ impl Workspace {
             .cursor_pointer()
             .when(selected, |d| d.bg(active))
             .hover(move |s| s.bg(active))
-            .when_some(logos::picked_color(&conn.color), |row, color| {
-                row.child(
-                    h_flex()
-                        .id(SharedString::from(format!("conn-color-{}", conn.name)))
-                        .test_support()
-                        .absolute()
-                        .left(px(2. + depth as f32 * TREE_INDENT))
-                        .h_full()
-                        .child(div().w(px(3.)).h(px(16.)).rounded_full().bg(color)),
-                )
-            })
             .child(logos::icon(conn.adapter, 18.))
             .child(
                 div()
@@ -2564,22 +2553,6 @@ mod tests {
         window_action(handle, cx, |window, _| {
             assert!(window.try_find(("row", 1usize)).is_some());
             assert!(window.try_find(("row", 2usize)).is_none());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn only_a_connection_with_a_picked_color_shows_the_dash(cx: &mut TestAppContext) {
-        let mut config = config_with_connection();
-        let colored = Connection {
-            name: "colored".into(),
-            color: "#E5484D".into(),
-            ..config.find("db").unwrap().clone()
-        };
-        config.upsert(colored, None).unwrap();
-        let (handle, _) = open(config, cx);
-        window_action(handle, cx, |window, _| {
-            assert!(window.find("conn-color-colored").visible());
-            assert!(window.try_find("conn-color-db").is_none());
         });
     }
 
