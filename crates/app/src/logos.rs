@@ -1,4 +1,4 @@
-//! Database icons and the app mark.
+//! Database and agent icons and the app mark.
 
 use std::sync::{Arc, LazyLock};
 
@@ -58,6 +58,14 @@ pub fn icon(adapter: Adapter, size: f32) -> Div {
                 .with_size(px((size * 0.78).round()))
                 .text_color(white()),
         )
+}
+
+const CLAUDE: &[u8] = include_bytes!("../../../assets/logos/claude.svg");
+const CLAUDE_COLOR: u32 = 0xD97757;
+
+/// The mark of the agent the chat panel talks to, in its brand color.
+pub fn agent() -> Icon {
+    Icon::default().data(CLAUDE).text_color(rgb(CLAUDE_COLOR))
 }
 
 pub fn brand(size: f32) -> Img {

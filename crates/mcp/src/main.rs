@@ -183,8 +183,13 @@ async fn main() -> anyhow::Result<()> {
         }
     );
     // Best effort: the app's status icon matters less than serving the agent.
-    let _heartbeat = Heartbeat::start().ok();
+    let heartbeat = Heartbeat::start().ok();
     let service = Server::new(allow_writes, max_rows).serve(stdio()).await?;
+    // The agent has introduced itself by now, so the app can say who is connected.
+    if let (Some(heartbeat), Some(agent)) = (&heartbeat, service.peer_info()) {
+        let info = &agent.client_info;
+        let _ = heartbeat.set_client(info.title.as_deref().unwrap_or(&info.name));
+    }
     service.waiting().await?;
     Ok(())
 }

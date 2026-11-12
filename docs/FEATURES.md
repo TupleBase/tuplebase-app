@@ -46,15 +46,20 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 A local [MCP server](MCP.md) lets agents list connections, inspect tables and run queries.
 It uses the connections saved in the app and is read-only by default.
 Add it to your installed agents in one click from Settings or the app menu. An indicator in the
-sidebar shows when an agent has it running.
+sidebar shows when an agent has it running, and names the agents that do.
+
+Or ask from inside the app: the agent icon in the sidebar opens a chat panel that talks to your
+own Claude Code, with your account. There it can use only this MCP server, so it reaches your
+databases and nothing else on your computer. Each tool call it makes is listed; click one to see
+its arguments.
 
 ## Appearance
 
 - Make all text larger or smaller with `Cmd` and `+` or `-` on macOS, `Ctrl` on Windows and
   Linux, or from the View menu. `Cmd+0` or `Ctrl+0` brings back the default size.
 - The size is kept between launches.
-- Drag the edge of the sidebar, the schema browser or the editor to resize it. The sizes are
-  kept between launches.
+- Drag the edge of the sidebar, the schema browser, the editor or the chat panel to resize it.
+  The sizes are kept between launches.
 
 ## Updates
 

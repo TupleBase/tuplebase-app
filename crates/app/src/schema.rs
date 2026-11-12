@@ -397,6 +397,7 @@ impl SchemaPanel {
                             .group_hover(group, |s| s.visible())
                             .child(
                                 Button::new(SharedString::from(format!("preview-{id}")))
+                                    .cursor_pointer()
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Play)
@@ -510,6 +511,7 @@ impl Render for SchemaPanel {
                     )
                     .child(
                         Button::new("schema-refresh")
+                            .cursor_pointer()
                             .ghost()
                             .xsmall()
                             .icon(IconName::RefreshCw)

@@ -145,7 +145,7 @@ fn target() -> Option<Target> {
     })
 }
 
-fn server_next_to(exe: &Path) -> Option<PathBuf> {
+pub(crate) fn server_next_to(exe: &Path) -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "tuplebase-mcp.exe"
     } else {
