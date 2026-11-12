@@ -33,14 +33,23 @@ impl Secret {
     /// Reads a JSON object in the shape RDS writes: `username`, `password`, `host`,
     /// `port`, `dbname`. Any other text is the password itself.
     fn parse(value: &str) -> Result<Self> {
-        let Ok(Value::Object(fields)) = serde_json::from_str(value) else {
-            if value.is_empty() {
-                bail!("the secret is empty");
+        let fields = match serde_json::from_str(value) {
+            Ok(Value::Object(fields)) => fields,
+            // Sent as a password, broken JSON would fail far from its cause.
+            Err(e) if value.trim().starts_with('{') && value.trim().ends_with('}') => {
+                bail!("the secret looks like JSON but isn't valid ({e})")
             }
-            return Ok(Self {
-                password: value.to_owned(),
-                ..Self::default()
-            });
+            _ => {
+                // A line break after the password comes from how it was pasted or piped in.
+                let password = value.trim_end_matches(['\r', '\n']);
+                if password.is_empty() {
+                    bail!("the secret is empty");
+                }
+                return Ok(Self {
+                    password: password.to_owned(),
+                    ..Self::default()
+                });
+            }
         };
         let text = |key: &str| match fields.get(key) {
             Some(Value::String(text)) if !text.is_empty() => Some(text.clone()),
@@ -277,7 +286,18 @@ mod tests {
             let (target, password) = Secret::parse(plain).unwrap().apply(&conn(), false).unwrap();
             assert_eq!((target.user.as_str(), password.as_str()), ("me", plain));
         }
+        assert_eq!(Secret::parse("hunter2\r\n").unwrap().password, "hunter2");
         assert!(Secret::parse("").is_err());
+    }
+
+    #[test]
+    fn broken_json_is_reported_instead_of_used_as_a_password() {
+        let Err(error) = Secret::parse(r#"{"username":"app","password":"s3cret",}"#) else {
+            panic!("broken JSON was accepted");
+        };
+        let error = error.to_string();
+        assert!(error.contains("JSON"), "{error}");
+        assert!(!error.contains("s3cret"), "{error}");
     }
 
     #[test]
