@@ -9,7 +9,9 @@ services:
       # Local test database only: accepts connections without a password.
       POSTGRES_HOST_AUTH_METHOD: trust
     ports: ["55432:5432"]
-    volumes: ["./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro"]
+    volumes:
+      - ./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+      - ./dev/demo-postgres.sql:/docker-entrypoint-initdb.d/zz-demo.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "psql -h 127.0.0.1 -U dev -d app -c 'select 1 from users limit 1'"]
       interval: 2s
@@ -25,6 +27,8 @@ services:
     volumes:
       - ./dev/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
       - ./dev/mariadb-test-user.sql:/docker-entrypoint-initdb.d/zz-test-user.sql:ro
+      # After the test user, which it grants the demo databases to.
+      - ./dev/demo-mariadb.sql:/docker-entrypoint-initdb.d/zzz-demo.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "mariadb -h 127.0.0.1 -udev -pdev app -e 'select 1 from users limit 1'"]
       interval: 2s
