@@ -17,6 +17,18 @@ irm https://raw.githubusercontent.com/TupleBase/tuplebase-app/main/install.ps1 |
 This installs for the current user, without admin rights, and avoids the operating
 system's "unknown developer" warning. See [details](#command-line-details).
 
+## Homebrew
+
+macOS (Apple Silicon):
+
+```sh
+brew tap tuplebase/app https://github.com/TupleBase/tuplebase-app
+brew install --cask tuplebase/app/tuplebase
+```
+
+This installs `/Applications/TupleBase.app`, puts `tuplebase-mcp` on your `PATH`, and also
+avoids the "unknown developer" warning.
+
 ## Browser download
 
 Download the file for your platform from
@@ -85,7 +97,8 @@ TupleBase, installs the new version where the app already is, and reopens it. Co
 and passwords are kept. A log of the last update is saved as `update.log` next to
 `connections.json`.
 
-Running the install command again also updates to the latest version.
+Running the install command again also updates to the latest version. With Homebrew, use
+`brew upgrade --cask tuplebase/app/tuplebase`.
 
 The check is one HTTPS request to GitHub. It sends no connection details or queries.
 Untick **Check for updates** in the sidebar to turn it off.
@@ -103,6 +116,12 @@ rm -f ~/.local/bin/tuplebase-app ~/.local/bin/tuplebase-mcp \
   ~/.local/share/applications/tuplebase.desktop \
   ~/.local/share/icons/hicolor/256x256/apps/tuplebase.png
 rm -rf ~/.local/share/doc/tuplebase
+```
+
+```sh
+# Homebrew
+brew uninstall --cask tuplebase/app/tuplebase
+brew untap tuplebase/app
 ```
 
 ```powershell

@@ -1,6 +1,6 @@
 name: Install test
 
-# Installs the latest published release with the one-line installers.
+# Installs the latest published release with the one-line installers and with Homebrew.
 # Runs after every release, or by hand: gh workflow run install-test.yml
 on:
   workflow_dispatch:
@@ -26,6 +26,17 @@ jobs:
         run: |
           gh release download --repo "$GITHUB_REPOSITORY" --pattern '*' --dir "$RUNNER_TEMP/update"
           TUPLEBASE_DOWNLOAD_DIR="$RUNNER_TEMP/update" sh install.sh
+
+  # The same two commands a user runs; the tap is this repo's main branch.
+  brew:
+    runs-on: macos-15
+    steps:
+      - run: brew tap tuplebase/app "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+      - run: brew install --cask tuplebase/app/tuplebase
+      - run: test -x /Applications/TupleBase.app/Contents/MacOS/tuplebase-app
+      - run: test -x "$(brew --prefix)/bin/tuplebase-mcp"
+      - name: The app is not quarantined
+        run: "! xattr -p com.apple.quarantine /Applications/TupleBase.app"
 
   windows:
     runs-on: windows-2025
