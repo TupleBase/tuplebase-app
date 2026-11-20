@@ -1593,7 +1593,7 @@ impl Workspace {
                     .border_color(border)
                     .children(self.render_update(cx))
                     .child(
-                        // Wraps rather than run past the sidebar's edge when it's narrow.
+                        // Wraps when the sidebar is narrow, rather than running past its edge.
                         h_flex()
                             .flex_wrap()
                             .gap_y_1()
@@ -2501,11 +2501,11 @@ fn summary(r: &tuplebase_core::db::QueryResult, statements: usize) -> String {
     }
 }
 
-/// One line of a query, short enough for a menu.
 /// The history menu's width, in ems, and the longest label that fits it.
 const HISTORY_MENU_EMS: f32 = 44.;
 const HISTORY_LABEL_CHARS: usize = 56;
 
+/// One line of a query, short enough for a menu.
 fn history_label(sql: &str) -> String {
     let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     match flat.char_indices().nth(HISTORY_LABEL_CHARS) {
