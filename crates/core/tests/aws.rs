@@ -5,7 +5,7 @@ use std::sync::Once;
 
 use aws_sdk_ssm::types::ParameterType;
 use serde_json::json;
-use tuplebase_core::aws;
+use tuplebase_core::cloud::aws;
 use tuplebase_core::config::{Adapter, Auth, AwsSecretRef, AwsStore, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
 

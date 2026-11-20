@@ -213,7 +213,7 @@ pub fn is_rds_host(host: &str) -> bool {
 /// bundle for every commercial region, linked from "Using SSL/TLS to encrypt a connection
 /// to a DB instance" in the RDS user guide. It is public. To update it, download that URL
 /// over the file and check that `the_rds_bundle_holds_certificates` still passes.
-pub const RDS_CA_BUNDLE: &[u8] = include_bytes!("../certs/rds-global-bundle.pem");
+pub const RDS_CA_BUNDLE: &[u8] = include_bytes!("../../certs/rds-global-bundle.pem");
 
 /// An AWS profile in `~/.aws/config` or `~/.aws/credentials`.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -11,17 +11,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde_json::{Value, json};
-use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow, PgSslMode};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions, SqliteRow};
+use sqlx::mysql::{MySqlPool, MySqlRow};
+use sqlx::postgres::{PgPool, PgRow};
+use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue, Uuid};
 use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement, TypeInfo, ValueRef};
 use tokio::sync::Mutex;
 
-use crate::config::{Adapter, Connection, TlsMode};
-use crate::ssh::{self, Tunnel};
-use crate::{credentials, safety, secrets};
+use crate::config::Connection;
+use crate::safety;
+use crate::ssh::Tunnel;
+
+mod connect;
+
+use connect::{Refresher, connect};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
@@ -209,11 +213,13 @@ impl Pool {
     }
 }
 
-/// An open connection pool, and the SSH tunnel it runs through, if any.
+/// An open connection pool, the SSH tunnel it runs through and what renews its
+/// password, if any.
 struct Open {
     config: Connection,
     pool: Pool,
     tunnel: Option<Tunnel>,
+    _refresher: Option<Refresher>,
 }
 
 impl Open {
@@ -644,113 +650,12 @@ impl Db {
     }
 }
 
-/// Opens the SSH tunnel, if any, and then the connection pool.
-async fn connect(conn: &Connection) -> Result<Open> {
-    // What to connect to: a secret in AWS can name the user and host as well.
-    let credentials::Resolved {
-        target, password, ..
-    } = credentials::resolve(conn).await?;
-    let tunnel = match &conn.ssh {
-        None => None,
-        Some(config) => {
-            let name = conn.name.clone();
-            let secret =
-                tokio::task::spawn_blocking(move || secrets::get_ssh_password(&name)).await??;
-            let tunnel = ssh::open(&target, config, secret)
-                .await
-                .with_context(|| format!("opening the SSH tunnel for \"{}\"", conn.name))?;
-            Some(tunnel)
-        }
-    };
-    let (host, port) = match &tunnel {
-        Some(tunnel) => ("127.0.0.1", tunnel.local_port()),
-        None => (target.host.as_str(), target.port),
-    };
-    let pool = open_pool(&target, host, port, password)
-        .await
-        .with_context(|| format!("connecting to \"{}\"", conn.name))?;
-    Ok(Open {
-        config: conn.clone(),
-        pool,
-        tunnel,
-    })
-}
-
 /// Whether two configs reach the same server; folder and color don't affect that.
 fn same_target(a: &Connection, b: &Connection) -> bool {
     let mut a = a.clone();
     a.folder.clone_from(&b.folder);
     a.color.clone_from(&b.color);
     a == *b
-}
-
-/// Connects to `host:port`, which is the local end of the tunnel when there is one.
-async fn open_pool(
-    conn: &Connection,
-    host: &str,
-    port: u16,
-    password: Option<String>,
-) -> Result<Pool> {
-    let timeout = Duration::from_secs(10);
-    Ok(match conn.adapter {
-        Adapter::Postgres => {
-            let mut opts = PgConnectOptions::new()
-                .host(host)
-                .port(port)
-                .username(&conn.user)
-                .ssl_mode(match conn.tls {
-                    TlsMode::Prefer => PgSslMode::Prefer,
-                    TlsMode::Require => PgSslMode::Require,
-                    TlsMode::Verify => PgSslMode::VerifyFull,
-                });
-            if !conn.database.is_empty() {
-                opts = opts.database(&conn.database);
-            }
-            if let Some(pw) = &password {
-                opts = opts.password(pw);
-            }
-            let pool = PgPoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?;
-            Pool::Pg(pool)
-        }
-        Adapter::Sqlite => {
-            let opts = SqliteConnectOptions::new()
-                .filename(ssh::expand_home(&conn.database))
-                .read_only(conn.readonly);
-            let pool = SqlitePoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?;
-            Pool::Sqlite(pool)
-        }
-        Adapter::Mariadb | Adapter::Mysql => {
-            let mut opts = MySqlConnectOptions::new()
-                .host(host)
-                .port(port)
-                .username(&conn.user)
-                .ssl_mode(match conn.tls {
-                    TlsMode::Prefer => MySqlSslMode::Preferred,
-                    TlsMode::Require => MySqlSslMode::Required,
-                    TlsMode::Verify => MySqlSslMode::VerifyIdentity,
-                });
-            if !conn.database.is_empty() {
-                opts = opts.database(&conn.database);
-            }
-            if let Some(pw) = &password {
-                opts = opts.password(pw);
-            }
-            let pool = MySqlPoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?;
-            Pool::My(pool)
-        }
-    })
 }
 
 /// Whether PostgreSQL lost the statement before running it. The driver prepares each

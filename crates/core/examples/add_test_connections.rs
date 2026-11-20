@@ -7,7 +7,7 @@
 //! nothing is sent to AWS, so a real account is never written to.
 
 use serde_json::json;
-use tuplebase_core::aws;
+use tuplebase_core::cloud::aws;
 use tuplebase_core::config::{self, Adapter, Auth, AwsSecretRef, Config, Connection, TlsMode};
 
 const FOLDER: &str = "Local test databases";

@@ -2,8 +2,8 @@
 
 pub mod agents;
 pub mod app_status;
-pub mod aws;
 pub mod chat;
+pub mod cloud;
 pub mod config;
 pub mod credentials;
 pub mod db;

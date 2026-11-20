@@ -38,22 +38,25 @@ scripts/                   install, packaging, release helpers
 | `state`       | unsaved SQL, query history, panel sizes               | `config`                                               |
 | `safety`      | statement classification for the read-only guard      | `config`                                               |
 | `ssh`         | SSH tunnels                                           | `config`                                               |
-| `aws`         | the AWS SDK: secrets, SSM, IAM tokens, RDS discovery  | `config`                                               |
-| `credentials` | which password a connection signs in with             | `config` `secrets` `aws`                               |
+| `cloud`       | cloud providers, one file each (`cloud/aws.rs`)       | `config`                                               |
+| `credentials` | the password each auth method signs in with           | `config` `secrets` `cloud`                             |
 | `mcp_status`  | heartbeat files of running MCP servers                | `config`                                               |
 | `app_status`  | the file naming the connections open in the app       | `config`                                               |
 | `updates`     | the GitHub release check                              | `config`                                               |
-| `db`          | pools, queries, schema reads, the read-only guard     | `config` `secrets` `ssh` `credentials` `aws` `safety`  |
+| `db`          | pools, queries, schema reads, the read-only guard     | `config` `secrets` `ssh` `credentials` `cloud` `safety` |
 | `agents`      | the MCP server's entry in each agent's config file    | `updates`                                              |
 | `chat`        | running the user's agent for the chat panel           | `config` `agents`                                      |
 
 - **L5. Imports inside `core` go one way, with no cycles.** `config` and `secrets` import
   no sibling module. A module that only needs settings imports `config` alone. `db`,
   `agents` and `chat` combine the others, and nothing below imports them. Update the
-  table when a module's imports change.
+  table when a module's imports change. `credentials` combines `secrets` and `cloud`
+  for `db`; only `db/connect.rs` uses it, and keeps each engine's connect options in a
+  function of its own.
 - **L6. One module owns each outside system.** SQL and drivers in `db` and `safety`, the
-  credential store in `secrets`, the AWS SDK in `aws`, SSH in `ssh`, each file format in
-  the module that names it. Other modules call that module instead of the system.
+  credential store in `secrets`, each cloud provider's SDK in its own `cloud` module (the
+  AWS SDK in `cloud::aws`), SSH in `ssh`, each file format in the module that names it.
+  Other modules call that module instead of the system.
 
 ## Inside `app`
 

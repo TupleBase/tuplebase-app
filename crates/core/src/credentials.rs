@@ -2,15 +2,16 @@
 //! to give it to.
 //!
 //! Each way of getting a password lives in the module that owns its system: the OS
-//! credential store in [`crate::secrets`], AWS in [`crate::aws`]. This module only picks
+//! credential store in [`crate::secrets`], cloud providers in [`crate::cloud`]. This module only picks
 //! one, so `db` connects the same way whatever the connection uses.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::cloud::aws;
 use crate::config::{Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection};
-use crate::{aws, secrets};
+use crate::secrets;
 
 /// How often a password that expires is made again, well before it does. An IAM token
 /// lasts [`aws::IAM_TOKEN_LIFETIME`]; new connections need a valid one.

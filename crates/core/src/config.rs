@@ -169,7 +169,7 @@ impl AwsStore {
 }
 
 /// Where in AWS a secret or parameter is. Only this pointer is saved; the value is read
-/// on every connect (see [`crate::aws`]).
+/// on every connect (see [`crate::cloud::aws`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AwsSecretRef {
     /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
