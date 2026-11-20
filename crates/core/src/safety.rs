@@ -41,8 +41,9 @@ pub fn trim_statement(sql: &str) -> &str {
         .trim_end_matches(|c: char| c == ';' || c.is_whitespace())
 }
 
-/// Splits a script on `;`, ignoring semicolons inside strings, quoted names, comments and
-/// PostgreSQL dollar quotes. Comment-only pieces are dropped.
+/// Splits a script on `;`, ignoring semicolons inside strings, quoted names, comments,
+/// PostgreSQL dollar quotes, and the `BEGIN … END` body of a routine, trigger or event
+/// on MySQL, MariaDB and SQLite (see [`Body`]). Comment-only pieces are dropped.
 pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
     let postgres = adapter == Adapter::Postgres;
     let mysql = matches!(adapter, Adapter::Mariadb | Adapter::Mysql);
@@ -50,15 +51,18 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
     let mut statements = Vec::new();
     let (mut start, mut i, mut has_content) = (0, 0, false);
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut body = Body::default();
     while i < bytes.len() {
         let rest = &sql[i..];
         match bytes[i] {
+            b';' if body.depth > 0 => i += 1,
             b';' => {
                 if has_content {
                     statements.push(sql[start..i].trim());
                 }
                 start = i + 1;
                 has_content = false;
+                body = Body::default();
                 i += 1;
                 continue;
             }
@@ -89,7 +93,12 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
             b'$' if postgres && (i == 0 || !is_word(bytes[i - 1])) => {
                 i += dollar_quote_len(rest);
             }
-            _ => i += 1,
+            b if !postgres && b.is_ascii_alphabetic() && (i == 0 || !is_word(bytes[i - 1])) => {
+                let len = rest.bytes().take_while(|&b| is_word(b)).count();
+                body.word(&rest[..len], &rest[len..]);
+                i += len;
+            }
+            _ => i += rest.chars().next().map_or(1, char::len_utf8),
         }
         has_content = true;
     }
@@ -97,6 +106,67 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
         statements.push(sql[start..].trim());
     }
     statements
+}
+
+/// Tracks the `BEGIN … END` body of a `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or
+/// `EVENT` on MySQL, MariaDB and SQLite, where a `;` ends a statement inside the body
+/// rather than the `CREATE`. PostgreSQL bodies are dollar-quoted instead.
+///
+/// Only a statement that starts with `CREATE` and names one of those kinds can have a
+/// body, so a transaction's `BEGIN` or a column named `begin` changes nothing. The
+/// read-only guard is unaffected: the whole `CREATE` stays one statement, which it
+/// refuses like any other.
+#[derive(Default)]
+struct Body {
+    /// Words seen in this statement.
+    words: usize,
+    /// The statement starts with `CREATE`.
+    create: bool,
+    /// It creates a kind of object that can have a body.
+    routine: bool,
+    /// Open `BEGIN` and `CASE` blocks; each ends at an `END`.
+    depth: usize,
+    /// The previous word was an `END` closing a `CASE` statement, so the `CASE` after it
+    /// opens nothing.
+    end_case: bool,
+}
+
+impl Body {
+    /// Notes one word of the statement; `after` is the text following it.
+    fn word(&mut self, word: &str, after: &str) {
+        let is = |keyword: &str| word.eq_ignore_ascii_case(keyword);
+        self.words += 1;
+        if self.words == 1 {
+            self.create = is("create");
+            return;
+        }
+        if !self.create {
+            return;
+        }
+        if !self.routine {
+            let kinds = ["procedure", "function", "trigger", "event"];
+            self.routine = kinds.iter().any(|kind| is(kind));
+            return;
+        }
+        if std::mem::take(&mut self.end_case) && is("case") {
+            return;
+        }
+        if is("begin") || is("case") {
+            self.depth += 1;
+        } else if is("end") && self.depth > 0 {
+            // `END IF`, `END LOOP` and the like close blocks that aren't counted.
+            let next: String = after
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let uncounted = ["if", "loop", "while", "repeat", "for"];
+            if !uncounted.iter().any(|kind| next.eq_ignore_ascii_case(kind)) {
+                self.depth -= 1;
+                self.end_case = next.eq_ignore_ascii_case("case");
+            }
+        }
+    }
 }
 
 /// Bytes up to and including the closing quote; a doubled quote stays inside the string.
@@ -310,6 +380,61 @@ mod tests {
             split(Adapter::Postgres, "/* a /* b; */ c; */ select 1").len(),
             1
         );
+    }
+
+    #[test]
+    fn a_mysql_routine_body_is_one_statement() {
+        let procedure = "CREATE DEFINER=`dev`@`%` PROCEDURE `p`(IN a INT)\n\
+             outer_block: BEGIN\n\
+               DECLARE b INT DEFAULT CASE WHEN a > 0 THEN 1 ELSE 0 END;\n\
+               IF a > 1 THEN SET b = 2; ELSEIF a > 2 THEN BEGIN SET b = 3; END; END IF;\n\
+               CASE b WHEN 1 THEN SET b = 4; ELSE SET b = 5; END CASE;\n\
+               WHILE b < 10 DO SET b = b + 1; END WHILE;\n\
+               SELECT 'end;' AS `begin`;\n\
+             END outer_block";
+        let event = "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM t; END";
+        let trigger = "CREATE TRIGGER t BEFORE INSERT ON x FOR EACH ROW \
+                       BEGIN SET NEW.a = 1; SET NEW.b = 2; END";
+        for adapter in [Adapter::Mariadb, Adapter::Mysql] {
+            for body in [procedure, event, trigger] {
+                let script = format!("{body};\nSELECT 1; SELECT 2");
+                assert_eq!(split(adapter, &script), [body, "SELECT 1", "SELECT 2"]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sqlite_trigger_body_is_one_statement() {
+        let trigger = "CREATE TRIGGER t AFTER INSERT ON x BEGIN \
+                       UPDATE y SET n = CASE WHEN n > 0 THEN n + 1 ELSE 1 END; DELETE FROM z; END";
+        let script = format!("{trigger}; SELECT 1");
+        assert_eq!(split(Adapter::Sqlite, &script), [trigger, "SELECT 1"]);
+    }
+
+    #[test]
+    fn only_routine_bodies_hold_semicolons() {
+        // A table may have a column named `begin`, and a routine without BEGIN ends at `;`.
+        let sql = "CREATE TABLE t (begin INT); CREATE FUNCTION f() RETURNS INT RETURN 1; SELECT 2";
+        assert_eq!(split(Adapter::Mariadb, sql).len(), 3);
+        assert_eq!(split(Adapter::Mariadb, "BEGIN; SELECT 1; COMMIT").len(), 3);
+        // PostgreSQL bodies are dollar-quoted, so BEGIN means nothing to the splitter there.
+        let sql = "create procedure p() language sql begin atomic select 1; end; select 2";
+        assert_eq!(split(Adapter::Postgres, sql).len(), 3);
+    }
+
+    #[test]
+    fn a_routine_body_held_together_is_still_refused_when_read_only() {
+        let script = "CREATE PROCEDURE p() BEGIN SELECT 1; DROP TABLE t; END";
+        let statements = split_statements(Adapter::Mariadb, script);
+        assert_eq!(statements.len(), 1);
+        assert!(check_read_only(statements[0]).is_err());
+    }
+
+    #[test]
+    fn letters_beyond_ascii_outside_quotes_split_fine() {
+        for adapter in [Adapter::Postgres, Adapter::Mariadb, Adapter::Sqlite] {
+            assert_eq!(split(adapter, "select 1 as café; select 2").len(), 2);
+        }
     }
 
     #[test]
