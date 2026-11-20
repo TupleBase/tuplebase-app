@@ -96,7 +96,9 @@ fn general(workspace: &Entity<Workspace>) -> SettingPage {
                         )
                     }),
                 )
-                .description("System follows your computer's light or dark setting."),
+                .description("System follows your computer's light or dark setting.")
+                // Under the description, so the three buttons never run past the card.
+                .layout(Axis::Vertical),
             ),
         )
         .group(

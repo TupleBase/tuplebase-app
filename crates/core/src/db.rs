@@ -377,7 +377,16 @@ impl Db {
                     if read_only {
                         c.execute($begin).await?;
                     }
-                    let out = run!(&mut *c, sql, opts.max_rows, $decode);
+                    let mut out = run!(&mut *c, sql, opts.max_rows, $decode);
+                    // The statement never ran, and its types are known now: run it again,
+                    // in a new read-only transaction when it had one.
+                    if out.as_ref().is_err_and(lost_unnamed_statement) {
+                        if read_only {
+                            c.execute($end).await?;
+                            c.execute($begin).await?;
+                        }
+                        out = run!(&mut *c, sql, opts.max_rows, $decode);
+                    }
                     if read_only && c.execute($end).await.is_err() {
                         c.close_on_drop();
                     }
@@ -750,6 +759,20 @@ async fn open_pool(
             Pool::My(pool)
         }
     })
+}
+
+/// Whether PostgreSQL lost the statement before running it. The driver prepares each
+/// statement unnamed; when the result has a type it hasn't seen, such as an enum, it
+/// looks the type up with a query of its own, and any other query drops the unnamed
+/// statement. The second time round the type is known and nothing is looked up.
+fn lost_unnamed_statement(error: &anyhow::Error) -> bool {
+    /// `invalid_sql_statement_name`.
+    const LOST_STATEMENT: &str = "26000";
+    error
+        .downcast_ref::<sqlx::Error>()
+        .and_then(|e| e.as_database_error())
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == LOST_STATEMENT)
 }
 
 /// Runs one statement as a prepared statement on `$conn`: streams up to `$max` rows

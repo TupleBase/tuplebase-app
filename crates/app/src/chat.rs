@@ -7,7 +7,7 @@ use std::time::Duration;
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::TextView;
+use gpui_kit::component::text::{TextView, TextViewStyle};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -212,7 +212,7 @@ impl ChatPanel {
                 .into_any_element(),
             Entry::Agent(text) => div()
                 .text_sm()
-                .child(TextView::markdown(("chat-answer", ix), text.clone()))
+                .child(TextView::markdown(("chat-answer", ix), text.clone()).style(answer_style()))
                 .into_any_element(),
             // One quiet line; the arguments show on a click.
             Entry::Tool { name, input } => {
@@ -387,6 +387,17 @@ impl Render for ChatPanel {
                     ),
             )
     }
+}
+
+/// Answers often hold a table of query results. Its columns take the width their content
+/// needs, shrinking to a floor and then scrolling sideways rather than breaking words
+/// apart, and its cells are padded like the results table's.
+fn answer_style() -> TextViewStyle {
+    let mut table = StyleRefinement::default();
+    table.overflow.x = Some(Overflow::Scroll);
+    TextViewStyle::default()
+        .table(table)
+        .table_cell(StyleRefinement::default().px_2().py_1())
 }
 
 #[cfg(test)]
