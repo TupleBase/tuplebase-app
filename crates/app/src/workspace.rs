@@ -26,7 +26,7 @@ use tuplebase_core::config::{
     Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
     kept_unreadable_message, parent_of, rebase_folder,
 };
-use tuplebase_core::db::{Db, ExecOptions};
+use tuplebase_core::db::{Db, ExecOptions, ScriptResult};
 use tuplebase_core::state::SessionState;
 use tuplebase_core::{app_status, mcp_status, secrets, updates};
 
@@ -37,6 +37,7 @@ use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::row_detail::{RowDetail, RowDetailEvent};
 use crate::runtime::{blocking, io};
+use crate::saving::{Save, Saves};
 use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme;
 use crate::tree_nav::{self, TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeUp};
@@ -318,11 +319,17 @@ pub struct Workspace {
     row_detail: Entity<RowDetail>,
     _row_detail_subscriptions: [Subscription; 2],
     status: Status,
+    /// The query run whose result is still to show; an earlier one's is dropped.
+    run: u64,
     session: SessionState,
     /// SQL to show once the next frame has a window to apply it with.
     pending_editor_text: Option<String>,
     _editor_subscription: Subscription,
     _session_save: Option<Task<()>>,
+    /// A change to the session waits for `_session_save`.
+    session_unsaved: bool,
+    session_saves: Saves<SessionState>,
+    config_saves: Saves<Config>,
     schema: Entity<SchemaPanel>,
     _schema_subscription: Subscription,
     chat: Entity<ChatPanel>,
@@ -676,10 +683,10 @@ impl Workspace {
         }
     }
 
-    fn save_config(&self, cx: &mut Context<Self>) {
-        let config = self.config.clone();
+    fn save_config(&mut self, cx: &mut Context<Self>) {
+        let save = self.config_saves.save(self.config.clone());
         cx.spawn(async move |this, cx| {
-            let saved = blocking(move || config.save()).await;
+            let saved = blocking(move || save.run(Config::save)).await;
             this.update(cx, |this, cx| this.show_saved(saved, cx)).ok();
         })
         .detach();
@@ -880,6 +887,8 @@ impl Workspace {
         let _editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.remember_draft(cx);
+                // A definition still loading must not replace what was typed.
+                this.schema.update(cx, |schema, _| schema.forget_lookup());
             }
         });
         let schema = cx.new(|cx| SchemaPanel::new(db.clone(), names, window, cx));
@@ -887,6 +896,8 @@ impl Workspace {
             &schema,
             window,
             |this, _, event: &SchemaEvent, window, cx| match event {
+                // Ignored while a query runs: it would replace the SQL and not run.
+                SchemaEvent::Preview(_) if !this.can_run() => {}
                 SchemaEvent::Preview(sql) => {
                     this.editor
                         .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
@@ -944,6 +955,21 @@ impl Workspace {
                 },
             ),
         ];
+        // Quitting, or closing the window, must not lose a save still waiting.
+        cx.on_app_quit(|this, _| this.flush_saves()).detach();
+        cx.on_release(|this, cx| {
+            let mut saved = Some(this.flush_saves());
+            cx.on_app_quit(move |_| {
+                let saved = saved.take();
+                async move {
+                    if let Some(saved) = saved {
+                        saved.await;
+                    }
+                }
+            })
+            .detach();
+        })
+        .detach();
         Self {
             db,
             row_detail,
@@ -965,8 +991,12 @@ impl Workspace {
             pending_editor_text: None,
             _editor_subscription,
             _session_save: None,
+            session_unsaved: false,
+            session_saves: Saves::default(),
+            config_saves: Saves::default(),
             results,
             status,
+            run: 0,
             tree_focus: cx.focus_handle(),
             tree_scroll: ScrollHandle::new(),
             cursor: None,
@@ -983,6 +1013,16 @@ impl Workspace {
     fn selected_connection(&self) -> Option<Connection> {
         let name = self.selected.as_deref()?;
         self.config.find(name).cloned()
+    }
+
+    /// A click on a connection, or Enter on it in the tree. The open one stays as it is,
+    /// with its running query and its rows, unless it failed and this tries again.
+    fn open_connection(&mut self, name: String, cx: &mut Context<Self>) {
+        let is_open = self.selected.as_deref() == Some(name.as_str()) && self.form.is_none();
+        if is_open && !matches!(self.status, Status::Failed(_)) {
+            return;
+        }
+        self.select(name, cx);
     }
 
     fn select(&mut self, name: String, cx: &mut Context<Self>) {
@@ -1082,12 +1122,11 @@ impl Workspace {
             return;
         }
         let db = self.db.clone();
-        let name = connection.name.clone();
-        let folder = connection.folder.clone();
-        let saved = config.clone();
+        let save = self.config_saves.save(config.clone());
+        let (conn, prev) = (connection.clone(), previous.clone());
         cx.spawn(async move |this, cx| {
             let result = blocking(move || {
-                let kept = saved.save()?;
+                let kept = save.run(Config::save)?;
                 let renamed = previous.as_ref().filter(|p| **p != connection.name);
                 if let Some(old) = renamed {
                     secrets::rename(old, &connection.name)?;
@@ -1101,15 +1140,10 @@ impl Workspace {
                 if let Some(secret) = &ssh_password {
                     secrets::set_ssh_password(&connection.name, secret)?;
                 }
-                Ok((previous, kept))
+                Ok(kept)
             })
             .await;
-            let forget = match &result {
-                Ok((Some(previous), _)) => Some(previous.clone()),
-                _ => None,
-            };
-            let renamed_from = forget.clone().filter(|old| *old != name);
-            if let Some(previous) = forget {
+            if let (Ok(_), Some(previous)) = (&result, prev.clone()) {
                 io(async move {
                     db.forget(&previous).await;
                     Ok(())
@@ -1117,22 +1151,59 @@ impl Workspace {
                 .await
                 .ok();
             }
-            this.update(cx, |this, cx| match result {
-                Ok((_, kept)) => {
-                    this.config = config;
-                    if let Some(old) = &renamed_from {
-                        this.session.rename_connection(old, &name);
-                        this.selected = Some(name.clone());
-                    }
-                    this.collapsed.remove(&folder);
-                    this.select(name, cx);
-                    this.show_saved(Ok(kept), cx);
-                }
-                Err(e) => form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx)),
+            this.update(cx, |this, cx| {
+                this.finish_saving_connection(form, conn, prev, config, result, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Once the connection form's save is written.
+    fn finish_saving_connection(
+        &mut self,
+        form: Entity<ConnForm>,
+        connection: Connection,
+        previous: Option<String>,
+        config: Config,
+        result: anyhow::Result<Option<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
+        let kept = match result {
+            Ok(kept) => kept,
+            Err(e) => {
+                form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx));
+                return;
+            }
+        };
+        let (name, folder) = (connection.name.clone(), connection.folder.clone());
+        // The config may have changed while this saved, such as the text size: apply the
+        // change to it as it is now, and save that too if it isn't what was written.
+        if let Err(e) = self.config.upsert(connection, previous.as_deref()) {
+            form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx));
+            return;
+        }
+        if self.config != config {
+            self.save_config(cx);
+        }
+        let was_open = self.selected.as_deref() == Some(previous.as_deref().unwrap_or(&name));
+        let renamed_from = previous.filter(|old| *old != name);
+        if let Some(old) = &renamed_from {
+            self.session.rename_connection(old, &name);
+            self.schedule_session_save(cx);
+        }
+        self.collapsed.remove(&folder);
+        if renamed_from.is_some() && !was_open {
+            // The editor holds the open connection's SQL: leave it there.
+            self.form = None;
+            cx.notify();
+        } else {
+            if was_open {
+                self.selected = Some(name.clone());
+            }
+            self.select(name, cx);
+        }
+        self.show_saved(Ok(kept), cx);
     }
 
     fn confirm_delete(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1171,13 +1242,13 @@ impl Workspace {
         self.config.remove(&name);
         self.session.remove_connection(&name);
         self.schedule_session_save(cx);
-        let config = self.config.clone();
+        let save = self.config_saves.save(self.config.clone());
         let db = self.db.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let forget_name = name.clone();
             let result = blocking(move || {
-                let kept = config.save()?;
+                let kept = save.run(Config::save)?;
                 secrets::delete_all(&name)?;
                 Ok(kept)
             })
@@ -1198,7 +1269,7 @@ impl Workspace {
         let Some(conn) = self.selected_connection() else {
             return;
         };
-        if self.form.is_some() || matches!(self.status, Status::Busy(_)) {
+        if !self.can_run() {
             return;
         }
         let sql = {
@@ -1213,46 +1284,63 @@ impl Workspace {
         self.session.record(&conn.name, &sql);
         self.schedule_session_save(cx);
         self.status = Status::Busy("Running…".into());
+        self.run += 1;
+        let run = self.run;
         cx.notify();
         let db = self.db.clone();
         let opts = ExecOptions {
             read_only: false,
             max_rows: MAX_ROWS,
         };
-        let name = conn.name.clone();
-        let checked = conn.clone();
         cx.spawn(async move |this, cx| {
+            let checked = conn.clone();
             let result = io(async move { db.execute_script(&conn, &sql, opts).await }).await;
-            this.update(cx, |this, cx| {
-                if result.is_err() {
-                    this.check_still_connected(checked, cx);
-                }
-                // Rows from a connection the user has left must not show under another.
-                if this.selected.as_deref() != Some(name.as_str()) {
-                    return;
-                }
-                this.status = match &result {
-                    Ok(run) => Status::Done(summary(&run.result, run.statements).into()),
-                    Err(e) => Status::Failed(format!("{e:#}").into()),
-                };
-                if let Ok(run) = &result {
-                    // A statement that changed something may have changed the schema too.
-                    if run.changed {
-                        this.schema.update(cx, |schema, cx| schema.refresh(cx));
-                    }
-                    this.close_row_detail(cx);
-                    this.results.update(cx, |table, cx| {
-                        let font_size = cx.theme().font_size;
-                        table.delegate_mut().set(&run.result, font_size);
-                        table.refresh(cx);
-                        cx.notify();
-                    });
-                }
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.finish_query(run, checked, result, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Whether a query can start now: not while one runs or the form covers the editor.
+    fn can_run(&self) -> bool {
+        self.form.is_none() && !matches!(self.status, Status::Busy(_))
+    }
+
+    /// Shows the result of query run `run` on `conn`.
+    fn finish_query(
+        &mut self,
+        run: u64,
+        conn: Connection,
+        result: anyhow::Result<ScriptResult>,
+        cx: &mut Context<Self>,
+    ) {
+        let name = conn.name.clone();
+        if result.is_err() {
+            self.check_still_connected(conn, cx);
+        }
+        // Rows from a connection the user has left must not show under another, and an
+        // earlier run that finishes late must not replace a later one's.
+        if self.selected.as_deref() != Some(name.as_str()) || self.run != run {
+            return;
+        }
+        self.status = match &result {
+            Ok(run) => Status::Done(summary(&run.result, run.statements).into()),
+            Err(e) => Status::Failed(format!("{e:#}").into()),
+        };
+        if let Ok(run) = &result {
+            // A statement that changed something may have changed the schema too.
+            if run.changed {
+                self.schema.update(cx, |schema, cx| schema.refresh(cx));
+            }
+            self.close_row_detail(cx);
+            self.results.update(cx, |table, cx| {
+                let font_size = cx.theme().font_size;
+                table.delegate_mut().set(&run.result, font_size);
+                table.refresh(cx);
+                cx.notify();
+            });
+        }
+        cx.notify();
     }
 
     /// Keeps what's in the editor for the selected connection.
@@ -1307,15 +1395,50 @@ impl Workspace {
 
     /// Saves shortly after the last change, so typing doesn't write on every keystroke.
     fn schedule_session_save(&mut self, cx: &mut Context<Self>) {
+        self.session_unsaved = true;
         self._session_save = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(800))
                 .await;
-            let Ok(session) = this.read_with(cx, |this, _| this.session.clone()) else {
+            let Ok(save) = this.update(cx, |this, _| this.session_save()) else {
                 return;
             };
-            blocking(move || session.save()).await.ok();
+            blocking(move || save.run(SessionState::save)).await.ok();
         }));
+    }
+
+    fn session_save(&mut self) -> Save<SessionState> {
+        self.session_unsaved = false;
+        self.session_saves.save(self.session.clone())
+    }
+
+    /// What is left to write when the app quits: the session, if a change still waits
+    /// for its delayed save, and the newest config save, skipped if already written.
+    fn final_saves(&mut self) -> (Option<Save<SessionState>>, Option<Save<Config>>) {
+        self._session_save = None;
+        let session = self.session_unsaved.then(|| self.session_save());
+        (session, self.config_saves.latest())
+    }
+
+    /// Writes [`Self::final_saves`] in the background; the app waits a little for it.
+    fn flush_saves(&mut self) -> impl Future<Output = ()> + use<> {
+        let (session, config) = self.final_saves();
+        let saved = (session.is_some() || config.is_some()).then(|| {
+            blocking(move || {
+                if let Some(save) = session {
+                    save.run(SessionState::save).ok();
+                }
+                if let Some(save) = config {
+                    save.run(Config::save).ok();
+                }
+                Ok(())
+            })
+        });
+        async move {
+            if let Some(saved) = saved {
+                saved.await.ok();
+            }
+        }
     }
 
     fn show_history_query(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -1384,7 +1507,7 @@ impl Workspace {
         match self.cursor.clone() {
             Some(TreeRow::Folder(path)) if self.collapsed.remove(&path) => cx.notify(),
             Some(TreeRow::Folder(_)) => self.move_cursor(1, cx),
-            Some(TreeRow::Connection(name)) => self.select(name, cx),
+            Some(TreeRow::Connection(name)) => self.open_connection(name, cx),
             None => {}
         }
     }
@@ -1392,7 +1515,7 @@ impl Workspace {
     fn tree_open(&mut self, cx: &mut Context<Self>) {
         match self.cursor.clone() {
             Some(TreeRow::Folder(path)) => self.toggle_folder(path, cx),
-            Some(TreeRow::Connection(name)) => self.select(name, cx),
+            Some(TreeRow::Connection(name)) => self.open_connection(name, cx),
             None => {}
         }
     }
@@ -2059,7 +2182,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.cursor = Some(TreeRow::Connection(name.clone()));
                 this.tree_focus.focus(window, cx);
-                this.select(name.clone(), cx);
+                this.open_connection(name.clone(), cx);
             }))
             .context_menu(self.connection_menu(conn, cx))
     }
@@ -4434,5 +4557,322 @@ mod tests {
             assert!(matches!(this.status, Status::Busy(_)));
             assert_eq!(this.editor.read(cx).value().as_str(), "SELECT 1;");
         });
+    }
+
+    fn config_with_two_connections() -> Config {
+        let mut config = config_with_connection();
+        let mut other = config.connections[0].clone();
+        other.name = "other".into();
+        config.upsert(other, None).unwrap();
+        config
+    }
+
+    /// Opens the edit form of `name`, as its right-click menu does.
+    fn edit_form(
+        handle: AnyWindowHandle,
+        workspace: &Entity<Workspace>,
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> Entity<crate::conn_form::ConnForm> {
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let conn = this.config.find(name).unwrap().clone();
+                this.edit_connection(conn, window, cx);
+                this.form.clone().unwrap()
+            })
+        })
+    }
+
+    #[gpui_kit::test]
+    fn renaming_a_connection_that_is_not_open_keeps_both_drafts(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, _| {
+                this.session.set_draft("other", "select 'other'")
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 42", cx);
+        });
+        let form = edit_form(handle, &workspace, "other", cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let mut renamed = this.config.find("other").unwrap().clone();
+                renamed.name = "renamed".into();
+                let mut saved = this.config.clone();
+                saved.upsert(renamed.clone(), Some("other")).unwrap();
+                let previous = Some("other".into());
+                this.finish_saving_connection(form, renamed, previous, saved, Ok(None), cx);
+            });
+        });
+        window_action(handle, cx, |_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.selected.as_deref(), Some("db"));
+            assert_eq!(this.editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.session.drafts["db"], "select 42");
+            assert_eq!(this.session.drafts["renamed"], "select 'other'");
+            assert!(!this.session.drafts.contains_key("other"));
+            assert!(this.form.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn renaming_the_open_connection_keeps_it_open_with_its_draft(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 42", cx);
+        });
+        let form = edit_form(handle, &workspace, "db", cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let mut renamed = this.config.find("db").unwrap().clone();
+                renamed.name = "renamed".into();
+                let mut saved = this.config.clone();
+                saved.upsert(renamed.clone(), Some("db")).unwrap();
+                let previous = Some("db".into());
+                this.finish_saving_connection(form, renamed, previous, saved, Ok(None), cx);
+            });
+        });
+        window_action(handle, cx, |_, cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.selected.as_deref(), Some("renamed"));
+            assert_eq!(this.editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.session.drafts["renamed"], "select 42");
+            assert!(!this.session.drafts.contains_key("db"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_change_made_while_a_connection_saves_is_kept(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        let form = edit_form(handle, &workspace, "other", cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let mut moved = this.config.find("other").unwrap().clone();
+                moved.folder = "Staging".into();
+                // Taken at Save; the keychain may then keep it waiting.
+                let mut saved = this.config.clone();
+                saved.upsert(moved.clone(), Some("other")).unwrap();
+                this.change_font_size(|config| config.resize_font(1), cx);
+                let previous = Some("other".into());
+                this.finish_saving_connection(form, moved, previous, saved, Ok(None), cx);
+                assert_eq!(this.config.font_size, super::DEFAULT_FONT_SIZE + 1);
+                assert_eq!(this.config.find("other").unwrap().folder, "Staging");
+                // Neither save written so far holds both changes: one more does.
+                let newest = this.config_saves.latest().unwrap();
+                let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
+                assert_eq!(written.as_ref(), Some(&this.config));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_earlier_query_finishing_late_does_not_replace_a_later_one(cx: &mut TestAppContext) {
+        let (_, workspace) = open(config_with_connection(), cx);
+        let result = |rows: usize| tuplebase_core::db::ScriptResult {
+            result: QueryResult {
+                columns: vec!["n".into()],
+                rows: (0..rows).map(|n| vec![json!(n)]).collect(),
+                truncated: false,
+                rows_affected: None,
+                elapsed_ms: 1,
+            },
+            statements: 1,
+            changed: false,
+        };
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.run_query(cx);
+                let earlier = this.run;
+                // Something else, such as a save, may have changed the status meanwhile.
+                this.status = Status::Idle;
+                this.run_query(cx);
+                let later = this.run;
+                let conn = this.config.find("db").unwrap().clone();
+                this.finish_query(later, conn.clone(), Ok(result(2)), cx);
+                this.finish_query(earlier, conn, Ok(result(5)), cx);
+                let expected = super::summary(&result(2).result, 1);
+                assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == expected));
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_earlier_schema_load_does_not_replace_a_later_one(cx: &mut TestAppContext) {
+        let (_, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let conn = this.config.connections[0].clone();
+                this.schema.update(cx, |schema, cx| {
+                    schema.set_connection(Some(conn), cx);
+                    let earlier = schema.loading;
+                    schema.refresh(cx);
+                    let later = schema.loading;
+                    let users = tuplebase_core::db::TableInfo {
+                        schema: "public".into(),
+                        name: "users".into(),
+                        kind: "BASE TABLE".into(),
+                    };
+                    schema.finish_loading(later, Ok((vec![users], Vec::new(), Vec::new())), cx);
+                    schema.finish_loading(earlier, Err(anyhow::anyhow!("timed out")), cx);
+                    assert!(schema.load == crate::schema::Load::Ready);
+                    assert_eq!(schema.tables.len(), 1);
+                });
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn quitting_writes_what_still_waits_to_be_saved(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 42", cx);
+        });
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.change_font_size(|config| config.resize_font(1), cx);
+                let (session, config) = this.final_saves();
+                let session = session.expect("the draft waits for its delayed save");
+                let draft = session.run(|s| Ok(s.drafts.get("db").cloned())).unwrap();
+                assert!(draft.unwrap().contains("select 42"));
+                let config = config.expect("the text size is saved");
+                let size = config.run(|c| Ok(Some(c.font_size))).unwrap();
+                assert_eq!(size, Some(super::DEFAULT_FONT_SIZE + 1));
+                // Written once: nothing of the session waits now.
+                assert!(this.final_saves().0.is_none());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_app_quitting_takes_the_session_save_still_waiting(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 42", cx);
+        });
+        assert!(workspace.read_with(cx, |this, _| this.session_unsaved));
+        cx.quit();
+        assert!(workspace.read_with(cx, |this, _| !this.session_unsaved));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_the_open_connection_again_leaves_a_running_query(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.status = Status::Idle;
+                this.run_query(cx);
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert!(matches!(&this.status, Status::Busy(s) if s.as_ref() == "Running…"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn previewing_while_a_query_runs_leaves_the_editor_alone(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_tables(&workspace, &["users"], cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.run_query(cx);
+                assert!(matches!(this.status, Status::Busy(_)));
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            window.hover("table-public-users", cx);
+            window.click("preview-table-public-users", cx);
+        });
+        assert_eq!(editor_text(&workspace, cx), "SELECT 1;");
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.session.history_for("db").count(), 1);
+            assert!(!this.session.drafts.contains_key("db"));
+        });
+    }
+
+    /// Objects whose lookup takes a second when they are named "slow".
+    fn show_slow_objects(
+        workspace: &Entity<Workspace>,
+        objects: &[(ObjectKind, &str)],
+        cx: &mut TestAppContext,
+    ) {
+        show_objects(workspace, objects, cx);
+        let executor = cx.executor();
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.schema.update(cx, |schema, _| {
+                    schema.fetch = Rc::new(move |_, object, lookup| {
+                        let executor = executor.clone();
+                        Box::pin(async move {
+                            if object.name == "slow" {
+                                executor.timer(std::time::Duration::from_secs(1)).await;
+                            }
+                            Ok(format!("{lookup:?} of {}", object.name))
+                        })
+                    });
+                });
+            });
+        });
+    }
+
+    fn wait_for_slow_lookups(cx: &mut TestAppContext) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(2));
+        cx.run_until_parked();
+    }
+
+    #[gpui_kit::test]
+    fn a_slow_definition_does_not_replace_a_later_one(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        let objects = [
+            (ObjectKind::Function, "slow"),
+            (ObjectKind::Function, "fast"),
+        ];
+        show_slow_objects(&workspace, &objects, cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Functions", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("object-public-Functions-slow", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("object-public-Functions-fast", cx)
+        });
+        assert_eq!(editor_text(&workspace, cx), "Definition of fast");
+        wait_for_slow_lookups(cx);
+        assert_eq!(editor_text(&workspace, cx), "Definition of fast");
+    }
+
+    #[gpui_kit::test]
+    fn a_slow_definition_does_not_replace_what_was_typed_meanwhile(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_slow_objects(&workspace, &[(ObjectKind::Function, "slow")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Functions", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("object-public-Functions-slow", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 42", cx);
+        });
+        let typed = editor_text(&workspace, cx);
+        assert!(typed.contains("select 42"), "{typed}");
+        wait_for_slow_lookups(cx);
+        assert_eq!(editor_text(&workspace, cx), typed);
     }
 }

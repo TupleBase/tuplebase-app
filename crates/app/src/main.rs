@@ -10,6 +10,7 @@ mod logos;
 mod results;
 mod row_detail;
 mod runtime;
+mod saving;
 mod schema;
 mod theme;
 mod tree_nav;

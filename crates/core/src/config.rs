@@ -5,8 +5,11 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write as _;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -606,14 +609,28 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
     write_bytes_atomic(path, format!("{text}\n").as_bytes())
 }
 
+/// Each write has its own temp file, so two at once never write into or rename away
+/// each other's. It is flushed to disk before it replaces the file.
 fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}-{n}.tmp", std::process::id()));
+    let written = fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .with_context(|| format!("writing {}", tmp.display()))
+        .and_then(|()| {
+            fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+        });
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// The file's bytes, or `None` when there is no file.
@@ -778,6 +795,10 @@ impl Config {
         if let Some(reason) = &self.unsaved_because {
             bail!("not saved: {reason}");
         }
+        // One save at a time: a file another save has only half written would look
+        // unreadable here and be moved aside.
+        static SAVING: Mutex<()> = Mutex::new(());
+        let _saving = SAVING.lock().unwrap_or_else(PoisonError::into_inner);
         let existing = read_file(path).with_context(|| {
             format!(
                 "not saved: {} couldn't be checked, so it isn't written over",
@@ -1430,6 +1451,33 @@ mod tests {
         let config = Config::load_from(&path).unwrap();
         with_iam(&config).save_to(&path).unwrap();
         assert_eq!(fs::read_to_string(&backup).unwrap(), V1_FILE);
+        assert_eq!(files_named(dir.path(), ".tmp"), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn saves_at_the_same_time_all_succeed_and_leave_a_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        std::thread::scope(|scope| {
+            for thread in 0..8u8 {
+                let path = &path;
+                scope.spawn(move || {
+                    for round in 0..40u8 {
+                        let mut config = Config {
+                            font_size: 10 + (thread + round) % 10,
+                            ..Config::default()
+                        };
+                        config.upsert(pg(&format!("db{thread}")), None).unwrap();
+                        assert_eq!(config.save_to(path).unwrap(), None);
+                    }
+                });
+            }
+        });
+        Config::load_from(&path).unwrap();
+        assert_eq!(
+            files_named(dir.path(), ".unreadable-"),
+            Vec::<PathBuf>::new()
+        );
         assert_eq!(files_named(dir.path(), ".tmp"), Vec::<PathBuf>::new());
     }
 

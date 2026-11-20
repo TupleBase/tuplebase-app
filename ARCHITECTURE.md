@@ -93,6 +93,7 @@ scripts/                   install, packaging, release helpers
 | `completions`        | SQL autocomplete                                            |
 | `tree_nav`           | keyboard navigation shared by the trees                     |
 | `runtime`            | the Tokio runtime for background work                       |
+| `saving`             | background saves of one file, written in the order made     |
 | `theme`, `logos`     | colors and icons                                            |
 
 - **A1. Never block the UI thread.** Database, file, keychain and network I/O run on the
