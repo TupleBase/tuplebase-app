@@ -3,10 +3,12 @@
 //! It reads like JSON (braces, `name: value`, quoted text) without being JSON: nothing
 //! is escaped, so a value shows exactly as the database returned it. The text sits in a
 //! read-only editor, so any part of it can be selected and copied; a button copies the
-//! whole row as real JSON.
+//! whole row as real JSON. Keys and values take the SQL editor's syntax colors.
+
+use std::ops::Range;
 
 use gpui_kit::component::button::*;
-use gpui_kit::component::input::{Editor, EditorState};
+use gpui_kit::component::input::{Editor, EditorState, TextDecoration, TextDecorationCollection};
 use gpui_kit::component::*;
 use gpui_kit::*;
 use serde_json::Value;
@@ -19,6 +21,9 @@ pub enum RowDetailEvent {
 
 pub struct RowDetail {
     text: Entity<EditorState>,
+    /// The colors over `text`, one range per key and value.
+    colors: TextDecorationCollection,
+    tokens: Vec<(Range<usize>, Token)>,
     /// The row as JSON for "Copy as JSON". `None` while no row is chosen, which keeps
     /// the panel closed.
     json: Option<SharedString>,
@@ -29,15 +34,26 @@ impl EventEmitter<RowDetailEvent> for RowDetail {}
 impl RowDetail {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let text = cx.new(|cx| {
-            // Plain text: the panel isn't strict JSON, so a JSON grammar colors it
-            // unevenly.
+            // No grammar: the panel isn't strict JSON, so it is colored from the ranges
+            // `row_text` reports instead.
             EditorState::new(window, cx)
                 .folding(false)
                 .line_number(false)
                 .soft_wrap(true)
                 .searchable(true)
         });
-        Self { text, json: None }
+        let colors = text.update(cx, |state, cx| {
+            state.create_decorations_collection(Vec::new(), cx)
+        });
+        // Light and dark themes color differently.
+        cx.observe_global::<Theme>(|this, cx| this.paint(cx))
+            .detach();
+        Self {
+            text,
+            colors,
+            tokens: Vec::new(),
+            json: None,
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -46,10 +62,35 @@ impl RowDetail {
 
     pub fn show(&mut self, row: Vec<(String, Value)>, window: &mut Window, cx: &mut Context<Self>) {
         self.json = Some(row_json(&row).into());
-        let text = row_text(&row);
+        let (text, tokens) = row_text(&row);
         self.text
             .update(cx, |state, cx| state.set_value(text, window, cx));
+        self.tokens = tokens;
+        self.paint(cx);
         cx.notify();
+    }
+
+    fn paint(&self, cx: &mut Context<Self>) {
+        let theme = cx.theme();
+        let syntax = |name: &str| theme.highlight_theme.style(name).unwrap_or_default();
+        let muted = HighlightStyle {
+            color: Some(theme.muted_foreground),
+            ..Default::default()
+        };
+        let style = |token| match token {
+            Token::Key => syntax("property"),
+            Token::Punctuation => muted,
+            Token::Text => syntax("string"),
+            Token::Number => syntax("number"),
+            Token::Boolean => syntax("boolean"),
+            Token::Null => syntax("comment"),
+        };
+        let decorations = self
+            .tokens
+            .iter()
+            .map(|(range, token)| TextDecoration::new(range.clone(), style(*token)))
+            .collect();
+        self.colors.set(decorations, cx);
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
@@ -59,28 +100,99 @@ impl RowDetail {
     }
 }
 
-/// The row as the panel shows it: one field per line, inside braces. A JSON column
-/// spreads over lines, indented under its field.
-fn row_text(row: &[(String, Value)]) -> String {
-    let mut text = String::from("{\n");
-    for (name, value) in row {
-        let value = value_text(value).replace('\n', "\n  ");
-        text.push_str(&format!("  {name}: {value}\n"));
-    }
-    text.push('}');
-    text
+/// What a stretch of the panel's text is, for its color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Token {
+    Key,
+    Punctuation,
+    Text,
+    Number,
+    Boolean,
+    Null,
 }
 
-/// How a value reads in the panel: text in quotes, a JSON column spread over lines.
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::Null => "null".into(),
-        Value::String(text) => format!("\"{text}\""),
-        Value::Array(_) | Value::Object(_) => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-        }
-        other => other.to_string(),
+/// Builds the panel's text and notes where each key and value lies in it.
+#[derive(Default)]
+struct Writer {
+    text: String,
+    tokens: Vec<(Range<usize>, Token)>,
+}
+
+impl Writer {
+    fn push(&mut self, text: &str, token: Token) {
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.tokens.push((start..self.text.len(), token));
     }
+
+    fn plain(&mut self, text: &str) {
+        self.text.push_str(text);
+    }
+
+    /// A value as the panel shows it: text in quotes and not escaped, a JSON column
+    /// spread over lines like JSON, starting at the current column of `indent` spaces.
+    fn value(&mut self, value: &Value, indent: usize) {
+        match value {
+            Value::Null => self.push("null", Token::Null),
+            Value::Bool(b) => self.push(&b.to_string(), Token::Boolean),
+            Value::Number(n) => self.push(&n.to_string(), Token::Number),
+            Value::String(text) => self.push(&format!("\"{text}\""), Token::Text),
+            Value::Array(items) => {
+                self.list(("[", "]"), items.iter().map(|item| (None, item)), indent)
+            }
+            Value::Object(fields) => self.list(
+                ("{", "}"),
+                fields.iter().map(|(key, value)| (Some(key), value)),
+                indent,
+            ),
+        }
+    }
+
+    fn list<'a>(
+        &mut self,
+        (open, close): (&str, &str),
+        items: impl ExactSizeIterator<Item = (Option<&'a String>, &'a Value)>,
+        indent: usize,
+    ) {
+        let len = items.len();
+        self.push(open, Token::Punctuation);
+        if len == 0 {
+            self.push(close, Token::Punctuation);
+            return;
+        }
+        let inner = indent + 2;
+        for (ix, (key, value)) in items.enumerate() {
+            self.plain(&format!("\n{:inner$}", ""));
+            if let Some(key) = key {
+                self.push(&format!("\"{key}\""), Token::Key);
+                self.push(":", Token::Punctuation);
+                self.plain(" ");
+            }
+            self.value(value, inner);
+            if ix + 1 < len {
+                self.push(",", Token::Punctuation);
+            }
+        }
+        self.plain(&format!("\n{:indent$}", ""));
+        self.push(close, Token::Punctuation);
+    }
+}
+
+/// The row as the panel shows it, one field per line inside braces, with where each key
+/// and value lies in the text.
+fn row_text(row: &[(String, Value)]) -> (String, Vec<(Range<usize>, Token)>) {
+    let mut out = Writer::default();
+    out.push("{", Token::Punctuation);
+    for (name, value) in row {
+        out.plain("\n  ");
+        out.push(name, Token::Key);
+        out.push(":", Token::Punctuation);
+        out.plain(" ");
+        out.value(value, 2);
+    }
+    out.plain("\n");
+    out.push("}", Token::Punctuation);
+    (out.text, out.tokens)
 }
 
 impl Render for RowDetail {
@@ -141,7 +253,7 @@ impl RowDetail {
 #[cfg(test)]
 mod tests {
     // No glob: gpui_kit's `test` macro would shadow the built-in `#[test]`.
-    use super::row_text;
+    use super::{Token, row_text};
     use serde_json::json;
 
     #[test]
@@ -151,12 +263,42 @@ mod tests {
             ("ok".to_owned(), json!(true)),
             ("note".to_owned(), json!("say \"hi\"")),
             ("gone".to_owned(), json!(null)),
-            ("meta".to_owned(), json!({"a": [1]})),
+            ("meta".to_owned(), json!({"a": [1, "x"], "b": {}})),
         ];
         assert_eq!(
-            row_text(&row),
+            row_text(&row).0,
             "{\n  id: 7\n  ok: true\n  note: \"say \"hi\"\"\n  gone: null\n  \
-             meta: {\n    \"a\": [\n      1\n    ]\n  }\n}"
+             meta: {\n    \"a\": [\n      1,\n      \"x\"\n    ],\n    \"b\": {}\n  }\n}"
+        );
+    }
+
+    #[test]
+    fn every_key_and_value_is_marked_for_its_color() {
+        let row = [
+            ("id".to_owned(), json!(7)),
+            ("ok".to_owned(), json!(false)),
+            ("gone".to_owned(), json!(null)),
+            ("meta".to_owned(), json!({"a": "x"})),
+        ];
+        let (text, tokens) = row_text(&row);
+        let marked: Vec<(&str, Token)> = tokens
+            .iter()
+            .filter(|(_, token)| *token != Token::Punctuation)
+            .map(|(range, token)| (&text[range.clone()], *token))
+            .collect();
+        assert_eq!(
+            marked,
+            [
+                ("id", Token::Key),
+                ("7", Token::Number),
+                ("ok", Token::Key),
+                ("false", Token::Boolean),
+                ("gone", Token::Key),
+                ("null", Token::Null),
+                ("meta", Token::Key),
+                ("\"a\"", Token::Key),
+                ("\"x\"", Token::Text),
+            ]
         );
     }
 }

@@ -154,10 +154,13 @@ pub fn row_json(row: &[(String, Value)]) -> String {
 }
 
 /// A cell filled to its edges, with the padding the table's small size gives a cell.
-fn padded_cell() -> Div {
+/// A faint line on its right edge separates it from the next column.
+fn padded_cell(cx: &App) -> Div {
     let padding = Size::Small.table_cell_padding();
     div()
         .size_full()
+        .border_r_1()
+        .border_color(cx.theme().border)
         .pl(padding.left)
         .pr(padding.right)
         .pt(padding.top)
@@ -203,11 +206,11 @@ impl TableDelegate for ResultsDelegate {
         &mut self,
         col_ix: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let numeric = self.numeric.get(col_ix).copied().unwrap_or_default();
-        padded_cell()
-            .font_medium()
+        padded_cell(cx)
+            .font_semibold()
             .when(numeric, |cell| cell.text_right())
             .child(self.columns[col_ix].name.clone())
     }
@@ -222,14 +225,26 @@ impl TableDelegate for ResultsDelegate {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let numeric = self.numeric.get(col_ix).copied().unwrap_or_default();
-        let null = self.values[row_ix][col_ix].is_null();
-        padded_cell()
-            .when(numeric, |cell| {
-                cell.text_right()
-                    .font_family(theme.mono_font_family.clone())
+        let value = &self.values[row_ix][col_ix];
+        // The SQL editor's colors: numbers and booleans stand out, NULL steps back.
+        let syntax = |name: &str| {
+            let style = theme.highlight_theme.style(name).unwrap_or_default();
+            (style.color, style.font_style)
+        };
+        let (color, font_style) = match value {
+            Value::Null => syntax("comment"),
+            Value::Bool(_) => syntax("boolean"),
+            _ if numeric => syntax("number"),
+            _ => (None, None),
+        };
+        padded_cell(cx)
+            .when(numeric || value.is_null(), |cell| {
+                cell.font_family(theme.mono_font_family.clone())
                     .text_size(theme.mono_font_size)
             })
-            .when(null, |cell| cell.text_color(theme.muted_foreground))
+            .when(numeric, |cell| cell.text_right())
+            .when_some(color, |cell, color| cell.text_color(color))
+            .when(font_style == Some(FontStyle::Italic), |cell| cell.italic())
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |table, _, _, _| {
