@@ -43,7 +43,7 @@ pub fn trim_statement(sql: &str) -> &str {
 
 /// Splits a script on `;`, ignoring semicolons inside strings, quoted names, comments,
 /// PostgreSQL dollar quotes, and the `BEGIN … END` body of a routine, trigger or event
-/// on MySQL, MariaDB and SQLite (see [`Body`]). Comment-only pieces are dropped.
+/// on MySQL and MariaDB (see [`Body`]). Comment-only pieces are dropped.
 pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
     let postgres = adapter == Adapter::Postgres;
     let mysql = matches!(adapter, Adapter::Mariadb | Adapter::Mysql);
@@ -93,7 +93,7 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
             b'$' if postgres && (i == 0 || !is_word(bytes[i - 1])) => {
                 i += dollar_quote_len(rest);
             }
-            b if !postgres && b.is_ascii_alphabetic() && (i == 0 || !is_word(bytes[i - 1])) => {
+            b if mysql && b.is_ascii_alphabetic() && (i == 0 || !is_word(bytes[i - 1])) => {
                 let len = rest.bytes().take_while(|&b| is_word(b)).count();
                 body.word(&rest[..len], &rest[len..]);
                 i += len;
@@ -109,8 +109,13 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
 }
 
 /// Tracks the `BEGIN … END` body of a `CREATE PROCEDURE`, `FUNCTION`, `TRIGGER` or
-/// `EVENT` on MySQL, MariaDB and SQLite, where a `;` ends a statement inside the body
-/// rather than the `CREATE`. PostgreSQL bodies are dollar-quoted instead.
+/// `EVENT` on MySQL and MariaDB, where a `;` ends a statement inside the body rather
+/// than the `CREATE`. PostgreSQL bodies are dollar-quoted instead.
+///
+/// Not used for SQLite, although its trigger bodies hold `;` too. There, the number of
+/// pieces is part of the read-only guard (see `Db::execute`), and this splitter and
+/// [`first_keyword`] read comments differently, so a script could start with a comment
+/// that holds `create trigger begin` and pass as a read.
 ///
 /// Only a statement that starts with `CREATE` and names one of those kinds can have a
 /// body, so a transaction's `BEGIN` or a column named `begin` changes nothing. The
@@ -404,11 +409,11 @@ mod tests {
     }
 
     #[test]
-    fn a_sqlite_trigger_body_is_one_statement() {
-        let trigger = "CREATE TRIGGER t AFTER INSERT ON x BEGIN \
-                       UPDATE y SET n = CASE WHEN n > 0 THEN n + 1 ELSE 1 END; DELETE FROM z; END";
-        let script = format!("{trigger}; SELECT 1");
-        assert_eq!(split(Adapter::Sqlite, &script), [trigger, "SELECT 1"]);
+    fn sqlite_splits_at_every_semicolon_even_after_begin() {
+        // `#` starts a comment for `first_keyword` but not for SQLite, so holding these
+        // together would let a read-only call run three statements as one "SELECT".
+        let script = "# create trigger begin\nSELECT 1; PRAGMA query_only = OFF; DELETE FROM t";
+        assert_eq!(split(Adapter::Sqlite, script).len(), 3);
     }
 
     #[test]
