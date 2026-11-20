@@ -537,7 +537,7 @@ pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
 }
 
 /// Where the last file older versions can read is kept, once it is upgraded.
-pub const BASE_VERSION_BACKUP: &str = "connections.v1.json";
+pub const BASE_VERSION_BACKUP: &str = "connections.v1-backup.json";
 
 /// Copies a [`VERSION_BASE`] file at `path` to [`BASE_VERSION_BACKUP`] beside it, unless
 /// that copy exists already.
@@ -601,7 +601,7 @@ impl Config {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let kept = path.with_file_name(format!("{CONFIG_FILE}.unreadable-{stamp}"));
+        let kept = path.with_file_name(format!("connections.unreadable-{stamp}.json"));
         match fs::rename(path, &kept) {
             Ok(()) => (
                 Self::default(),
@@ -1123,7 +1123,7 @@ mod tests {
             let kept: Vec<_> = fs::read_dir(dir.path())
                 .unwrap()
                 .map(|e| e.unwrap().path())
-                .filter(|p| p.to_string_lossy().contains(".unreadable-"))
+                .filter(|p| p.to_string_lossy().contains("connections.unreadable-"))
                 .collect();
             assert_eq!(kept.len(), 1, "{kept:?}");
             assert_eq!(fs::read_to_string(&kept[0]).unwrap(), text);
