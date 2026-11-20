@@ -9327,6 +9327,7 @@ dependencies = [
  "directories",
  "futures-util",
  "keyring",
+ "libsqlite3-sys",
  "russh",
  "rustls-pki-types",
  "serde",

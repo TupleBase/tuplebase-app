@@ -641,6 +641,32 @@ async fn postgres_definition_of_a_missing_object_is_an_error() {
 }
 
 #[tokio::test]
+async fn postgres_comments_cannot_hide_a_copy_from_read_only() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Postgres));
+    // `BEGIN READ ONLY` doesn't stop `COPY ... TO`, so only the keyword check does.
+    for sql in [
+        "/* /* */ select */ COPY (SELECT 1) TO STDOUT",
+        "-- x\rCOPY (SELECT 1) TO STDOUT --\n(select 1)",
+    ] {
+        let error = db.execute(&conn, sql, READ).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("read-only"),
+            "{sql}: {error:#}"
+        );
+    }
+    // Comments PostgreSQL reads the same way still let a read through.
+    let r = db
+        .execute(&conn, "/* a /* b */ c */ -- d\r SELECT 1 AS n", READ)
+        .await
+        .unwrap();
+    assert_eq!(r.rows[0][0], serde_json::json!(1));
+}
+
+#[tokio::test]
 async fn mariadb_objects_show_their_definitions_and_calls() {
     if !enabled() {
         eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");

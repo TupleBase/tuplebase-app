@@ -66,16 +66,18 @@ pub enum IdentQuote {
     Backtick,
 }
 
-/// Which rules `safety::split_statements` follows to cut a script into statements.
+/// Which rules `safety` follows to read SQL: to cut a script into statements, and to
+/// find the code between the comments and strings for the read-only guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptFlavor {
-    /// Dollar quotes, nested block comments and `E'...'` escape strings; backticks are
-    /// not quotes.
+    /// Dollar quotes, nested block comments, `--` comments that also end at a carriage
+    /// return, and `E'...'` escape strings; backticks are not quotes.
     Postgres,
-    /// `#` comments, backslash escapes, and routine bodies kept whole.
+    /// `#` comments, `--` comments only before a space, backslash escapes, executable
+    /// `/*! ... */` comments, and routine bodies kept whole.
     Mysql,
-    /// Plain SQL quotes and comments only.
-    Standard,
+    /// Plain SQL quotes and comments, and `[name]` and `` `name` `` quoted names.
+    Sqlite,
 }
 
 /// What every part of TupleBase may need to know about an engine without talking to it.
@@ -122,7 +124,7 @@ const SQLITE: EngineInfo = EngineInfo {
     default_port: 0,
     is_file: true,
     quote: IdentQuote::Double,
-    script: ScriptFlavor::Standard,
+    script: ScriptFlavor::Sqlite,
 };
 
 impl Adapter {
@@ -1041,7 +1043,7 @@ mod tests {
         assert_eq!(Adapter::Postgres.info().script, ScriptFlavor::Postgres);
         assert_eq!(Adapter::Mariadb.info().script, ScriptFlavor::Mysql);
         assert_eq!(Adapter::Mysql.info().script, ScriptFlavor::Mysql);
-        assert_eq!(Adapter::Sqlite.info().script, ScriptFlavor::Standard);
+        assert_eq!(Adapter::Sqlite.info().script, ScriptFlavor::Sqlite);
     }
 
     #[test]

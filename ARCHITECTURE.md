@@ -118,7 +118,10 @@ Changing one of these needs the user's explicit agreement, not just a passing re
   connection. Never weaken the guard in `core/src/safety.rs` and `core/src/db.rs`, or
   the read-only statements in each engine module's `DIALECT` under `core/src/db/`:
   read keyword allowlist, prepared statements (one statement only), server-enforced
-  read-only transaction (`PRAGMA query_only` on SQLite, which has no such transaction).
+  read-only transaction. SQLite has no such transaction and runs every statement it is
+  given, so there read-only work runs on a connection opened read-only, with
+  `PRAGMA query_only` on, and SQLite's own parser must find exactly one statement. The
+  guard reads comments and quotes as each engine does (`ScriptFlavor`).
 
 ## Dependencies
 
@@ -126,7 +129,8 @@ Changing one of these needs the user's explicit agreement, not just a passing re
   a dedicated commit.
 - **D2. Pure-Rust dependencies by default.** Avoid C libraries (prefer `rustls` over
   OpenSSL) so all three platforms build without extra system setup. SQLite is compiled
-  into the app by `sqlx`.
+  into the app by `sqlx`; `core` also calls it directly through `libsqlite3-sys`, kept on
+  the version `sqlx` uses, for the read-only guard (S2).
 
 ## Tests
 

@@ -12,7 +12,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-use super::{Open, Pool};
+use super::{Open, Pool, SqlitePools};
 use crate::cloud::aws;
 use crate::config::{Adapter, Auth, Connection, TlsMode};
 use crate::credentials::{self, Expiry};
@@ -274,7 +274,10 @@ impl Pool {
         match (self, options) {
             (Pool::Pg(p), Options::Pg(o)) => p.set_connect_options(o),
             (Pool::My(p), Options::My(o)) => p.set_connect_options(o),
-            (Pool::Sqlite(p), Options::Sqlite(o)) => p.set_connect_options(o),
+            (Pool::Sqlite(p), Options::Sqlite(o)) => {
+                p.read_only.set_connect_options(o.clone().read_only(true));
+                p.main.set_connect_options(o);
+            }
             _ => {}
         }
     }
@@ -290,13 +293,17 @@ async fn open_pool(options: Options) -> Result<Pool> {
                 .connect_with(opts)
                 .await?,
         ),
-        Options::Sqlite(opts) => Pool::Sqlite(
-            SqlitePoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?,
-        ),
+        Options::Sqlite(opts) => {
+            let pool = || {
+                SqlitePoolOptions::new()
+                    .max_connections(4)
+                    .acquire_timeout(timeout)
+            };
+            Pool::Sqlite(SqlitePools {
+                read_only: pool().connect_lazy_with(opts.clone().read_only(true)),
+                main: pool().connect_with(opts).await?,
+            })
+        }
         Options::My(opts) => Pool::My(
             MySqlPoolOptions::new()
                 .max_connections(4)
