@@ -5,7 +5,7 @@
 //! read on every connect and never written to disk or the OS credential store, so a
 //! rotated password needs nothing from the user.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_config::profile::ProfileFileCredentialsProvider;
@@ -145,8 +145,18 @@ async fn read(store: AwsStore, secret: &AwsSecretRef) -> Result<String> {
 /// allows.
 pub const IAM_TOKEN_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
+/// An RDS IAM auth token, made by [`iam_token`].
+pub struct IamToken {
+    /// The password.
+    pub token: String,
+    /// When the credentials that signed it expire, if they do; the token is refused from
+    /// then on even within its own lifetime.
+    pub credentials_expire: Option<SystemTime>,
+}
+
 /// An RDS IAM auth token: the password for `user` at `host:port`, valid for
-/// [`IAM_TOKEN_LIFETIME`]. Made from the profile's credentials, read afresh on every call.
+/// [`IAM_TOKEN_LIFETIME`] or until the credentials that signed it expire, whichever is
+/// sooner. Made from the profile's credentials, read afresh on every call.
 ///
 /// `host` and `port` must be the database's real endpoint, even when the connection goes
 /// through an SSH tunnel: the token is signed for that name. An empty `region` means the
@@ -157,14 +167,22 @@ pub async fn iam_token(
     host: &str,
     port: u16,
     user: &str,
-) -> Result<String> {
+) -> Result<IamToken> {
     let region = match region {
         "" => region_of_host(host).unwrap_or_default(),
         region => region.to_owned(),
     };
     let made = async {
         let config = sdk_config(profile, &region).await?;
-        sign_iam_token(&config, host, port, user).await
+        let credentials_expire = match config.credentials_provider() {
+            Some(provider) => provider.provide_credentials().await?.expiry(),
+            None => None,
+        };
+        let token = sign_iam_token(&config, host, port, user).await?;
+        anyhow::Ok(IamToken {
+            token,
+            credentials_expire,
+        })
     };
     timeout(TIMEOUT, made)
         .await

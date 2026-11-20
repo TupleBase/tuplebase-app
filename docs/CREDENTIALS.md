@@ -93,9 +93,10 @@ The MCP server reads these the same way, with the AWS profile of the user it run
 
 With **IAM token**, there is no password at all: each time the app connects it makes an
 [RDS IAM auth token](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
-for the connection's user from your AWS profile. A token lasts 15 minutes, so while a
-connection is open the app makes a new one every 10 minutes for the connections it opens
-next. If a token runs out without a new one, for example because your SSO session expired
+for the connection's user from your AWS profile. A token lasts 15 minutes, or less when
+the profile's credentials expire sooner (a role session, say), so while a connection is
+open the app makes a new one after two thirds of that, at most 10 minutes, for the
+connections it opens next. If a token runs out without a new one, for example because your SSO session expired
 or the computer slept, the next query connects again and says what went wrong, such as the
 `aws sso login` command to run. The token is signed for the database's own host name, also
 when you connect through an SSH tunnel. With no region set, it uses the one in an

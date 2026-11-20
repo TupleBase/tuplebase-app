@@ -72,12 +72,12 @@ const REFRESH_CHECK: Duration = Duration::from_secs(30);
 pub(super) struct Refresher {
     task: tokio::task::JoinHandle<()>,
     renewal: Arc<Mutex<Renewal>>,
-    expiry: Expiry,
 }
 
 impl Refresher {
-    /// Resolves `conn` again every `expiry.renew_after` from `made`, when the password
-    /// in use was made, reading fresh AWS credentials each time. `host` and `port` are
+    /// Resolves `conn` again `expiry.renew_after` after `made`, when the password in use
+    /// was made, reading fresh AWS credentials each time; each new password brings its
+    /// own [`Expiry`], shorter when the credentials expire sooner. `host` and `port` are
     /// where the pool connects: the tunnel's end if there is one.
     fn start(
         conn: &Connection,
@@ -87,13 +87,13 @@ impl Refresher {
         made: SystemTime,
     ) -> Self {
         let (conn, pool) = (conn.clone(), pool.clone());
-        let renewal = Arc::new(Mutex::new(Renewal::new(made)));
+        let renewal = Arc::new(Mutex::new(Renewal::new(made, expiry)));
         let shared = renewal.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(REFRESH_CHECK).await;
                 let now = SystemTime::now();
-                if !shared.lock().unwrap().due(now, expiry.renew_after) {
+                if !shared.lock().unwrap().due(now) {
                     continue;
                 }
                 // A failure keeps the old password, which may still be valid, and tries
@@ -104,43 +104,42 @@ impl Refresher {
                         let password = resolved.password.as_deref();
                         let options = connect_options(&resolved.target, &host, port, password);
                         pool.set_options(options);
-                        *shared.lock().unwrap() = Renewal::new(now);
+                        let expiry = resolved.refresh.unwrap_or(expiry);
+                        *shared.lock().unwrap() = Renewal::new(now, expiry);
                     }
                     Err(_) => shared.lock().unwrap().failed(now),
                 }
             }
         });
-        Self {
-            task,
-            renewal,
-            expiry,
-        }
+        Self { task, renewal }
     }
 
     /// Whether the password has run out without a new one: renewing failed, or the
     /// computer slept past it.
     pub(super) fn expired(&self) -> bool {
-        let made = self.renewal.lock().unwrap().made;
-        made.elapsed().is_ok_and(|age| age >= self.expiry.lasts)
+        let Renewal { made, expiry, .. } = *self.renewal.lock().unwrap();
+        made.elapsed().is_ok_and(|age| age >= expiry.lasts)
     }
 }
 
 /// The longest a [`Refresher`] waits between failed attempts.
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 
-/// How renewing a password goes: when the one in use was made, and the attempts that
-/// failed since.
+/// How renewing a password goes: when the one in use was made and how long it is good
+/// for, and the attempts that failed since.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Renewal {
     made: SystemTime,
+    expiry: Expiry,
     failures: u32,
     last_try: Option<SystemTime>,
 }
 
 impl Renewal {
-    fn new(made: SystemTime) -> Self {
+    fn new(made: SystemTime, expiry: Expiry) -> Self {
         Self {
             made,
+            expiry,
             failures: 0,
             last_try: None,
         }
@@ -149,10 +148,10 @@ impl Renewal {
     /// Whether to try making a new password at `now`: once it is `renew_after` old, and
     /// after a failure only once the wait, doubling from [`REFRESH_CHECK`] up to
     /// [`RETRY_MAX`], has passed.
-    fn due(&self, now: SystemTime, renew_after: Duration) -> bool {
+    fn due(&self, now: SystemTime) -> bool {
         if now
             .duration_since(self.made)
-            .is_ok_and(|age| age < renew_after)
+            .is_ok_and(|age| age < self.expiry.renew_after)
         {
             return false;
         }
@@ -419,22 +418,26 @@ mod tests {
         // Late, but not yet run out: still usable while the next renewal is tried.
         refresher.renewal.lock().unwrap().made = minutes_ago(12);
         assert!(open.is_usable_for(&conn));
+        // Unless the credentials that signed it expired sooner: then it ran out with them.
+        let signed = minutes_ago(12);
+        let short = credentials::iam_expiry(signed, Some(signed + Duration::from_secs(6 * 60)));
+        refresher.renewal.lock().unwrap().expiry = short;
+        assert!(refresher.expired());
     }
 
     #[test]
     fn renewing_waits_for_its_time_then_backs_off_after_failures() {
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let at = |secs| start + Duration::from_secs(secs);
-        let every = credentials::IAM_REFRESH;
-        let mut renewal = Renewal::new(start);
-        assert!(!renewal.due(at(9 * 60), every));
-        assert!(renewal.due(at(10 * 60), every));
+        let mut renewal = Renewal::new(start, credentials::IAM_EXPIRY);
+        assert!(!renewal.due(at(9 * 60)));
+        assert!(renewal.due(at(10 * 60)));
         // Each failure doubles the wait: 30 s, 1 min, 2 min, 4 min, then 5 min at most.
         let mut now = 10 * 60;
         for wait in [30, 60, 120, 240, 300, 300] {
             renewal.failed(at(now));
-            assert!(!renewal.due(at(now + wait - 1), every), "{wait}");
-            assert!(renewal.due(at(now + wait), every), "{wait}");
+            assert!(!renewal.due(at(now + wait - 1)), "{wait}");
+            assert!(renewal.due(at(now + wait)), "{wait}");
             now += wait;
         }
         assert_eq!(
@@ -442,6 +445,11 @@ mod tests {
             "a failure keeps the old password's age"
         );
         // A clock set back doesn't make it try at once.
-        assert!(!renewal.due(at(now - 600), every));
+        assert!(!renewal.due(at(now - 600)));
+        // Credentials that expire in 6 minutes: renewed after 4.
+        let short = credentials::iam_expiry(start, Some(at(6 * 60)));
+        let renewal = Renewal::new(start, short);
+        assert!(!renewal.due(at(4 * 60 - 1)));
+        assert!(renewal.due(at(4 * 60)));
     }
 }

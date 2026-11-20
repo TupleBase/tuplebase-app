@@ -5,7 +5,7 @@
 //! credential store in [`crate::secrets`], cloud providers in [`crate::cloud`]. This module only picks
 //! one, so `db` connects the same way whatever the connection uses.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
@@ -37,11 +37,28 @@ pub struct Expiry {
     pub lasts: Duration,
 }
 
-/// An IAM token's.
+/// An IAM token's, when the credentials that signed it don't expire sooner.
 pub const IAM_EXPIRY: Expiry = Expiry {
     renew_after: IAM_REFRESH,
     lasts: aws::IAM_TOKEN_LIFETIME,
 };
+
+/// An IAM token's, made at `now` with credentials that expire at `credentials_expire`:
+/// it lasts [`aws::IAM_TOKEN_LIFETIME`] or until they expire, whichever is sooner, and is
+/// renewed after two thirds of that, at most [`IAM_REFRESH`].
+pub fn iam_expiry(now: SystemTime, credentials_expire: Option<SystemTime>) -> Expiry {
+    let Some(at) = credentials_expire else {
+        return IAM_EXPIRY;
+    };
+    let lasts = at
+        .duration_since(now)
+        .unwrap_or_default()
+        .min(aws::IAM_TOKEN_LIFETIME);
+    Expiry {
+        renew_after: (lasts * 2 / 3).min(IAM_REFRESH),
+        lasts,
+    }
+}
 
 /// Reads or makes the password for `conn`. Called on every connect, so a rotated secret
 /// needs nothing from the user.
@@ -62,7 +79,7 @@ trait Store {
         host: &str,
         port: u16,
         user: &str,
-    ) -> Result<String>;
+    ) -> Result<aws::IamToken>;
 }
 
 /// The real ones.
@@ -85,7 +102,7 @@ impl Store for System {
         host: &str,
         port: u16,
         user: &str,
-    ) -> Result<String> {
+    ) -> Result<aws::IamToken> {
         aws::iam_token(&iam.profile, &iam.region, host, port, user).await
     }
 }
@@ -127,10 +144,12 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
             // Before making a token, so none is ever sent without encryption.
             conn.check_iam_encryption()?;
             // Signed for the database's own name, even when a tunnel carries the traffic.
+            let made = SystemTime::now();
             let token = store
                 .iam_token(iam, &conn.host, conn.port, &conn.user)
                 .await?;
-            Ok(unchanged(Some(token), Some(IAM_EXPIRY)))
+            let expiry = iam_expiry(made, token.credentials_expire);
+            Ok(unchanged(Some(token.token), Some(expiry)))
         }
     }
 }
@@ -177,12 +196,15 @@ mod tests {
             host: &str,
             port: u16,
             user: &str,
-        ) -> Result<String> {
+        ) -> Result<aws::IamToken> {
             self.asked
                 .lock()
                 .unwrap()
                 .push(format!("iam {} {host}:{port} {user}", iam.profile));
-            Ok(format!("{host}:{port}/?Action=connect&DBUser={user}"))
+            Ok(aws::IamToken {
+                token: format!("{host}:{port}/?Action=connect&DBUser={user}"),
+                credentials_expire: None,
+            })
         }
     }
 
@@ -323,6 +345,25 @@ mod tests {
         assert_eq!(
             *fake.asked.lock().unwrap(),
             ["iam prod orders.abc.eu-west-1.rds.amazonaws.com:5432 app"]
+        );
+    }
+
+    #[test]
+    fn an_iam_token_lasts_no_longer_than_the_credentials_that_signed_it() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mins = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(iam_expiry(now, None), IAM_EXPIRY);
+        // Credentials good for longer than a token: the token's own 15 minutes.
+        assert_eq!(iam_expiry(now, Some(now + mins(60))), IAM_EXPIRY);
+        // A role session ending in 6 minutes: the token too, renewed after 4.
+        let short = iam_expiry(now, Some(now + mins(6)));
+        assert_eq!(short.lasts, mins(6));
+        assert_eq!(short.renew_after, mins(4));
+        // Already expired: renewed at once.
+        let gone = iam_expiry(now, Some(now - mins(1)));
+        assert_eq!(
+            (gone.lasts, gone.renew_after),
+            (Duration::ZERO, Duration::ZERO)
         );
     }
 }
