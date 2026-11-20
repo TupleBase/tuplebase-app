@@ -3407,6 +3407,41 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_found_connection_taking_its_host_from_a_secret_forgets_where_it_was_found(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
+        let found = crate::aws_picker::tests::found("orders", Some(Adapter::Postgres))
+            .connection()
+            .unwrap();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update_window(handle, |_, window, cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            form.update(cx, |form, cx| form.prefill(&found, window, cx));
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    saved.borrow_mut().push(connection.source.is_some());
+                }
+            })
+            .detach();
+        })
+        .unwrap();
+        window_action(handle, cx, |window, cx| {
+            window.click("auth-Secrets Manager", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-aws-name", cx);
+            window.input("prod/orders", cx);
+            window.click("use-secret-host", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        assert_eq!(*saved.borrow(), [false]);
+    }
+
+    #[gpui_kit::test]
     fn a_database_found_in_aws_fills_in_a_new_connection(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));

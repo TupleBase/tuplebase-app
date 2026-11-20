@@ -14,7 +14,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use super::{Open, Pool};
 use crate::cloud::aws;
-use crate::config::{Adapter, Auth, Connection, Provider, TlsMode};
+use crate::config::{Adapter, Auth, Connection, TlsMode};
 use crate::credentials::{self, Expiry};
 use crate::{secrets, ssh};
 
@@ -185,14 +185,11 @@ enum Options {
 }
 
 /// Certificate authorities to trust, besides the usual ones, when verifying `conn`'s
-/// certificate: Amazon's, for a database in RDS.
+/// certificate: Amazon's, for a database at an RDS host name. Decided by the host alone,
+/// not by where the connection was found: RDS certificates name only RDS hosts, and the
+/// host may come from a secret.
 fn extra_roots(conn: &Connection) -> Option<&'static [u8]> {
-    let found_in_aws = conn
-        .source
-        .as_ref()
-        .is_some_and(|s| s.provider == Provider::Aws);
-    let rds = found_in_aws || aws::is_rds_host(&conn.host);
-    (conn.tls == TlsMode::Verify && rds).then_some(aws::RDS_CA_BUNDLE)
+    (conn.tls == TlsMode::Verify && aws::is_rds_host(&conn.host)).then_some(aws::RDS_CA_BUNDLE)
 }
 
 /// Options to reach `conn` at `host:port`, which is the local end of the tunnel when
@@ -361,13 +358,16 @@ mod tests {
         let mut elsewhere = rds(TlsMode::Verify);
         elsewhere.host = "db.example.com".into();
         assert!(extra_roots(&elsewhere).is_none());
-        // A custom DNS name for a database that was found in AWS.
+        // Not even for a connection found in AWS, whose secret may name another host.
         elsewhere.source = Some(crate::config::Source {
-            provider: Provider::Aws,
+            provider: crate::config::Provider::Aws,
             resource: "arn:aws:rds:eu-west-1:123456789012:db:orders".into(),
             region: "eu-west-1".into(),
         });
-        assert!(extra_roots(&elsewhere).is_some());
+        assert!(extra_roots(&elsewhere).is_none());
+        let mut china = rds(TlsMode::Verify);
+        china.host = "orders.abc.cn-north-1.rds.amazonaws.com.cn".into();
+        assert!(extra_roots(&china).is_some());
     }
 
     #[tokio::test]

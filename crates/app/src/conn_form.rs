@@ -331,12 +331,11 @@ impl ConnForm {
                 tls: self.tls,
                 ssh,
                 auth,
-                // Where it was found no longer applies to another server, and would make
-                // the app trust Amazon's certificates for it.
-                source: self
-                    .source
-                    .clone()
-                    .filter(|_| text(&self.host, cx) == self.source_host),
+                // Where it was found no longer applies to another server, such as one a
+                // secret names.
+                source: self.source.clone().filter(|_| {
+                    !self.host_from_secret() && text(&self.host, cx) == self.source_host
+                }),
             },
             password: (!password.is_empty()).then_some(password),
             ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),

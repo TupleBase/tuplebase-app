@@ -140,8 +140,8 @@ and can read it.
 
 ### Verifying an RDS certificate
 
-With **Encryption** set to **Verified**, a database at an `*.rds.amazonaws.com` host, or
-one found in AWS, is also checked against
+With **Encryption** set to **Verified**, a database at an `*.rds.amazonaws.com` (or
+`*.rds.amazonaws.com.cn`) host is also checked against
 [Amazon's RDS certificate authorities](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html),
 which come with the app.
 
