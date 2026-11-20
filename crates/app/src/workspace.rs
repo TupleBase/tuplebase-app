@@ -857,6 +857,19 @@ impl Workspace {
                     this.remember_draft(cx);
                     this.run_query(cx);
                 }
+                // Not run: the user reads it, fills it in, and presses Run.
+                SchemaEvent::Insert(sql) => {
+                    this.editor
+                        .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
+                    this.remember_draft(cx);
+                }
+                // A running query's status stays until its result arrives.
+                SchemaEvent::Failed(message) => {
+                    if !matches!(this.status, Status::Busy(_)) {
+                        this.status = Status::Failed(message.clone().into());
+                        cx.notify();
+                    }
+                }
             },
         );
         let chat = cx.new(|cx| ChatPanel::new(window, cx));
@@ -2528,8 +2541,9 @@ mod tests {
         WindowOptions, point, px, size,
     };
     use serde_json::json;
+    use std::rc::Rc;
     use tuplebase_core::config::{Adapter, Appearance, AwsAuth, AwsStore};
-    use tuplebase_core::db::QueryResult;
+    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult};
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
         cx.update(|cx| {
@@ -3906,6 +3920,140 @@ mod tests {
                 r#"SELECT * FROM "public"."users" LIMIT 100"#
             );
         });
+    }
+
+    /// Shows these objects of `public` in the schema panel. Their lookups answer at once,
+    /// naming what was asked for, except for an object named `broken`.
+    fn show_objects(
+        workspace: &Entity<Workspace>,
+        objects: &[(ObjectKind, &str)],
+        cx: &mut TestAppContext,
+    ) {
+        show_tables(workspace, &[], cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.schema.update(cx, |schema, cx| {
+                    schema.objects = objects
+                        .iter()
+                        .map(|(kind, name)| ObjectInfo {
+                            schema: "public".into(),
+                            kind: *kind,
+                            name: (*name).into(),
+                            detail: String::new(),
+                        })
+                        .collect();
+                    schema.fetch = Rc::new(|_, object, lookup| {
+                        Box::pin(async move {
+                            if object.name == "broken" {
+                                anyhow::bail!("no privilege");
+                            }
+                            Ok(format!("{lookup:?} of {}", object.name))
+                        })
+                    });
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    fn editor_text(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> String {
+        cx.update(|cx| workspace.read(cx).editor.read(cx).value().to_string())
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_procedure_puts_its_definition_in_the_editor_without_running_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_objects(&workspace, &[(ObjectKind::Procedure, "start_job")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Procedures", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("object-public-Procedures-start_job", cx)
+        });
+        assert_eq!(editor_text(&workspace, cx), "Definition of start_job");
+        cx.update(|cx| assert!(matches!(workspace.read(cx).status, Status::Idle)));
+    }
+
+    #[gpui_kit::test]
+    fn right_clicking_a_procedure_inserts_a_call(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_objects(&workspace, &[(ObjectKind::Procedure, "start_job")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Procedures", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.right_click("object-public-Procedures-start_job", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(1usize, cx));
+        assert_eq!(editor_text(&workspace, cx), "Call of start_job");
+        cx.update(|cx| assert!(matches!(workspace.read(cx).status, Status::Idle)));
+    }
+
+    #[gpui_kit::test]
+    fn enter_on_a_function_shows_its_definition(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_objects(&workspace, &[(ObjectKind::Function, "total")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Functions", cx);
+            window.press("down", cx);
+            window.press("enter", cx);
+        });
+        assert_eq!(editor_text(&workspace, cx), "Definition of total");
+    }
+
+    #[gpui_kit::test]
+    fn a_definition_that_cannot_be_read_shows_on_the_status_line(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_objects(&workspace, &[(ObjectKind::Trigger, "broken")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Triggers", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("object-public-Triggers-broken", cx)
+        });
+        assert_eq!(editor_text(&workspace, cx), "SELECT 1;");
+        cx.update(|cx| match &workspace.read(cx).status {
+            Status::Failed(message) => {
+                assert!(message.contains("broken"), "{message}");
+                assert!(message.contains("no privilege"), "{message}");
+            }
+            _ => panic!("the error must show on the status line"),
+        });
+    }
+
+    #[gpui_kit::test]
+    fn objects_without_a_source_are_not_clickable(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_objects(&workspace, &[(ObjectKind::Sequence, "ids")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Sequences", cx)
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("object-public-Sequences-ids").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_view_shows_its_definition_from_its_row(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        show_objects(&workspace, &[], cx);
+        show_tables(&workspace, &["daily"], cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.schema.update(cx, |schema, cx| {
+                    schema.tables[0].kind = "VIEW".into();
+                    cx.notify();
+                });
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            window.hover("table-public-daily", cx);
+            window.click("definition-table-public-daily", cx);
+        });
+        assert_eq!(editor_text(&workspace, cx), "Definition of daily");
+        cx.update(|cx| assert!(workspace.read(cx).schema.read(cx).expanded.is_empty()));
     }
 
     #[gpui_kit::test]
