@@ -36,5 +36,6 @@ TupleBase is free and open source. If it saves you time,
 ## License
 
 [MIT](LICENSE). Bundled dependencies are listed in
-[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). Database names and logos are trademarks of
+[THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt). The bundled fonts, Inter and JetBrains Mono, are under the
+SIL Open Font License; see [assets/fonts](assets/fonts). Database names and logos are trademarks of
 their owners; see [assets/logos](assets/logos/README.md).
