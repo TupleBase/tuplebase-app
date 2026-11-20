@@ -28,7 +28,7 @@ use tuplebase_core::config::{
 };
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
-use tuplebase_core::{app_status, mcp_status, secrets, updates};
+use tuplebase_core::{app_status, mcp_status, safety, secrets, updates};
 
 use crate::chat::{ChatEvent, ChatPanel};
 use crate::completions::{self, SchemaNames, SqlCompletions};
@@ -36,6 +36,7 @@ use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::row_detail::{RowDetail, RowDetailEvent};
+use crate::run_button::{RunButton, RunStatement};
 use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme;
@@ -49,6 +50,7 @@ actions!(
     tuplebase,
     [
         RunQuery,
+        RunAll,
         OpenSettings,
         CheckForUpdates,
         About,
@@ -68,9 +70,19 @@ const SETTINGS_KEY: &str = "cmd-,";
 #[cfg(not(target_os = "macos"))]
 const SETTINGS_KEY: &str = "ctrl-,";
 #[cfg(target_os = "macos")]
-const RUN_HINT: &str = "Run query (⌘↵)";
+const RUN_ALL_KEY: &str = "cmd-shift-enter";
 #[cfg(not(target_os = "macos"))]
-const RUN_HINT: &str = "Run query (Ctrl+Enter)";
+const RUN_ALL_KEY: &str = "ctrl-shift-enter";
+#[cfg(target_os = "macos")]
+const RUN_HINT: &str = "Run the selection or the statement at the cursor (⌘↵). Run all: ⌘⇧↵";
+#[cfg(not(target_os = "macos"))]
+const RUN_HINT: &str =
+    "Run the selection or the statement at the cursor (Ctrl+Enter). Run all: Ctrl+Shift+Enter";
+#[cfg(target_os = "macos")]
+const NO_STATEMENT: &str = "No statement at the cursor. Select some SQL, or run all with ⌘⇧↵";
+#[cfg(not(target_os = "macos"))]
+const NO_STATEMENT: &str =
+    "No statement at the cursor. Select some SQL, or run all with Ctrl+Shift+Enter";
 
 /// A key held with Cmd on macOS and Ctrl elsewhere.
 #[cfg(target_os = "macos")]
@@ -92,6 +104,8 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(RUN_KEY, RunQuery, Some("Input")),
         KeyBinding::new(RUN_KEY, RunQuery, None),
+        KeyBinding::new(RUN_ALL_KEY, RunAll, Some("Input")),
+        KeyBinding::new(RUN_ALL_KEY, RunAll, None),
         KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
         KeyBinding::new(secondary!("="), IncreaseFontSize, None),
         // The same key with Shift held.
@@ -315,6 +329,8 @@ pub struct Workspace {
     selected: Option<String>,
     form: Option<Entity<ConnForm>>,
     editor: Entity<EditorState>,
+    run_button: Entity<RunButton>,
+    _run_button_subscription: Subscription,
     results: Entity<TableState<ResultsDelegate>>,
     row_detail: Entity<RowDetail>,
     _row_detail_subscriptions: [Subscription; 2],
@@ -876,6 +892,11 @@ impl Workspace {
             state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(names.clone())));
             state
         });
+        let run_button = cx.new(|cx| RunButton::new(editor.clone(), cx));
+        let _run_button_subscription =
+            cx.subscribe(&run_button, |this, _, RunStatement(sql), cx| {
+                this.run_sql(sql.clone(), cx);
+            });
         let _editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.remember_draft(cx);
@@ -890,7 +911,7 @@ impl Workspace {
                     this.editor
                         .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
                     this.remember_draft(cx);
-                    this.run_query(cx);
+                    this.run_sql(sql.clone(), cx);
                 }
                 // Not run: the user reads it, fills it in, and presses Run.
                 SchemaEvent::Insert(sql) => {
@@ -960,6 +981,8 @@ impl Workspace {
             selected: None,
             form: None,
             editor,
+            run_button,
+            _run_button_subscription,
             session: SessionState::default(),
             pending_editor_text: None,
             _editor_subscription,
@@ -992,6 +1015,11 @@ impl Workspace {
         self.pending_editor_text =
             Some(self.session.drafts.get(&name).cloned().unwrap_or_default());
         self.db.allow_connecting(&name);
+        if let Some(conn) = self.config.find(&name) {
+            let adapter = conn.adapter;
+            self.run_button
+                .update(cx, |button, cx| button.set_adapter(adapter, cx));
+        }
         self.selected = Some(name);
         self.close_row_detail(cx);
         self.results.update(cx, |table, cx| {
@@ -1192,23 +1220,50 @@ impl Workspace {
         .detach();
     }
 
-    /// Runs the selected text, or the whole editor when nothing is selected.
+    /// Runs the selected text, or else the statement at the cursor, split as a script
+    /// would be.
     fn run_query(&mut self, cx: &mut Context<Self>) {
         let Some(conn) = self.selected_connection() else {
             return;
         };
-        if self.form.is_some() || matches!(self.status, Status::Busy(_)) {
+        let editor = self.editor.read(cx);
+        let selected = editor.selected_value();
+        let sql = if selected.trim().is_empty() {
+            let text = editor.value();
+            safety::statement_at(conn.adapter, &text, editor.cursor())
+                .map(|statement| text[statement].to_owned())
+        } else {
+            Some(selected.to_string())
+        };
+        match sql {
+            Some(sql) => self.run_sql(sql, cx),
+            None if self.can_run() => {
+                self.status = Status::Done(NO_STATEMENT.into());
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    /// Runs everything in the editor.
+    fn run_all(&mut self, cx: &mut Context<Self>) {
+        let sql = self.editor.read(cx).value().to_string();
+        self.run_sql(sql, cx);
+    }
+
+    /// Whether a query may start: not while one runs or the connection form is open.
+    fn can_run(&self) -> bool {
+        self.form.is_none() && !matches!(self.status, Status::Busy(_))
+    }
+
+    /// Runs `sql` as a script on the selected connection and records it in its history.
+    fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        let Some(conn) = self.selected_connection() else {
+            return;
+        };
+        if !self.can_run() {
             return;
         }
-        let sql = {
-            let editor = self.editor.read(cx);
-            let selected = editor.selected_value();
-            if selected.trim().is_empty() {
-                editor.value().to_string()
-            } else {
-                selected.to_string()
-            }
-        };
         self.session.record(&conn.name, &sql);
         self.schedule_session_save(cx);
         self.status = Status::Busy("Running…".into());
@@ -2201,7 +2256,8 @@ impl Workspace {
                     completions::handle_keys(div().id("sql-editor"), &self.editor, window)
                         .test_support()
                         .size_full()
-                        .child(Editor::new(&self.editor).appearance(false).h_full()),
+                        .child(Editor::new(&self.editor).appearance(false).h_full())
+                        .child(self.run_button.clone()),
                 ),
             )
             .child(
@@ -2456,6 +2512,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_query(cx)))
+                    .on_action(cx.listener(|this, _: &RunAll, _, cx| this.run_all(cx)))
                     .child(
                         h_resizable("workspace-panels")
                             .on_resize(
@@ -3746,6 +3803,95 @@ mod tests {
         window_action(handle, cx, |window, cx| window.press("escape", cx));
         assert!(!menu_open(&workspace, cx));
         assert_eq!(editor_text(&workspace, cx), "S");
+    }
+
+    const SCRIPT: &str = "select 1;\nselect 2;\nselect 3;";
+
+    /// Puts the cursor at the first `at` in the editor, or selects it.
+    fn place(
+        handle: AnyWindowHandle,
+        workspace: &Entity<Workspace>,
+        at: &str,
+        select: bool,
+        cx: &mut TestAppContext,
+    ) {
+        window_action(handle, cx, |_, cx| {
+            let editor = workspace.read(cx).editor.clone();
+            editor.update(cx, |editor, cx| {
+                let start = editor.value().find(at).expect("text to place at");
+                let end = if select { start + at.len() } else { start };
+                editor.set_selected_range(start..end, cx);
+            });
+        });
+        // The button follows the editor's layout, which the next frame paints.
+        window_action(handle, cx, |_, _| ());
+    }
+
+    fn last_run(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> Option<String> {
+        cx.update(|cx| {
+            let session = &workspace.read(cx).session;
+            session.history_for("db").next().map(str::to_owned)
+        })
+    }
+
+    #[gpui_kit::test]
+    fn run_key_runs_the_statement_at_the_cursor(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "2", false, cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some("select 2"));
+        // The key runs; it never adds a line.
+        assert_eq!(editor_text(&workspace, cx), SCRIPT);
+    }
+
+    #[gpui_kit::test]
+    fn run_key_runs_the_selection(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "2;\nselect 3", true, cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some("2;\nselect 3"));
+    }
+
+    #[gpui_kit::test]
+    fn run_all_key_runs_everything(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "2", false, cx);
+        window_action(handle, cx, |window, cx| {
+            window.press("secondary-shift-enter", cx)
+        });
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some(SCRIPT));
+    }
+
+    #[gpui_kit::test]
+    fn run_key_with_no_statement_at_the_cursor_says_so(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("select 1;\n\n", cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
+        assert_eq!(last_run(&workspace, cx), None);
+        cx.update(|cx| {
+            let status = &workspace.read(cx).status;
+            assert!(matches!(status, Status::Done(s) if s.starts_with("No statement")));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_run_button_runs_its_statement(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "3", false, cx);
+        window_action(handle, cx, |window, cx| window.click("run-statement", cx));
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some("select 3"));
+    }
+
+    #[gpui_kit::test]
+    fn the_run_button_shows_only_at_a_statement(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("select 1;\n\n-- the end", cx);
+        place(handle, &workspace, "1", false, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("run-statement").visible());
+        });
+        place(handle, &workspace, "the end", false, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("run-statement").is_none());
+        });
     }
 
     #[gpui_kit::test]

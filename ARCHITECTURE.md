@@ -91,6 +91,7 @@ scripts/                   install, packaging, release helpers
 | `row_detail`         | the panel that shows one result row field by field          |
 | `chat`               | the chat panel                                              |
 | `completions`        | SQL autocomplete                                            |
+| `run_button`         | the Run button beside the statement under the cursor        |
 | `tree_nav`           | keyboard navigation shared by the trees                     |
 | `runtime`            | the Tokio runtime for background work                       |
 | `theme`, `logos`     | colors and icons                                            |
