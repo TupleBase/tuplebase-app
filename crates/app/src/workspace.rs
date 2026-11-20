@@ -3371,6 +3371,38 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn a_found_connection_moved_to_another_host_forgets_where_it_was_found(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
+        let found = crate::aws_picker::tests::found("orders", Some(Adapter::Postgres))
+            .connection()
+            .unwrap();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update_window(handle, |_, window, cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            form.update(cx, |form, cx| form.prefill(&found, window, cx));
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    saved.borrow_mut().push(connection.source.is_some());
+                }
+            })
+            .detach();
+        })
+        .unwrap();
+        // Saved as found, it keeps its source (see the test below); here the host changes.
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-host", cx);
+            window.input(".example.com", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        assert_eq!(*saved.borrow(), [false]);
+    }
+
+    #[gpui_kit::test]
     fn a_database_found_in_aws_fills_in_a_new_connection(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));

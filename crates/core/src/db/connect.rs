@@ -20,6 +20,8 @@ use crate::{secrets, ssh};
 
 /// Opens the SSH tunnel, if any, and then the connection pool.
 pub(super) async fn connect(conn: &Connection) -> Result<Open> {
+    // A token's life starts when it is signed, before the tunnel and pool take their time.
+    let signed = SystemTime::now();
     // What to connect to: a secret in AWS can name the user and host as well.
     let credentials::Resolved {
         target,
@@ -46,7 +48,8 @@ pub(super) async fn connect(conn: &Connection) -> Result<Open> {
     let pool = open_pool(options)
         .await
         .with_context(|| format!("connecting to \"{}\"", conn.name))?;
-    let refresher = refresh.map(|expiry| Refresher::start(conn, &pool, host, port, expiry));
+    let refresher =
+        refresh.map(|expiry| Refresher::start(conn, &pool, (host, port), expiry, signed));
     Ok(Open {
         config: conn.clone(),
         pool,
@@ -68,43 +71,103 @@ const REFRESH_CHECK: Duration = Duration::from_secs(30);
 /// an expired token.
 pub(super) struct Refresher {
     task: tokio::task::JoinHandle<()>,
-    /// When the password in use was made.
-    made: Arc<Mutex<SystemTime>>,
+    renewal: Arc<Mutex<Renewal>>,
     expiry: Expiry,
 }
 
 impl Refresher {
-    /// Resolves `conn` again every `expiry.renew_after`, reading fresh AWS credentials
-    /// each time. `host` and `port` are where the pool connects: the tunnel's end if
-    /// there is one.
-    fn start(conn: &Connection, pool: &Pool, host: String, port: u16, expiry: Expiry) -> Self {
+    /// Resolves `conn` again every `expiry.renew_after` from `made`, when the password
+    /// in use was made, reading fresh AWS credentials each time. `host` and `port` are
+    /// where the pool connects: the tunnel's end if there is one.
+    fn start(
+        conn: &Connection,
+        pool: &Pool,
+        (host, port): (String, u16),
+        expiry: Expiry,
+        made: SystemTime,
+    ) -> Self {
         let (conn, pool) = (conn.clone(), pool.clone());
-        let made = Arc::new(Mutex::new(SystemTime::now()));
-        let shared = made.clone();
+        let renewal = Arc::new(Mutex::new(Renewal::new(made)));
+        let shared = renewal.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(REFRESH_CHECK).await;
-                let last = *shared.lock().unwrap();
-                if last.elapsed().is_ok_and(|age| age < expiry.renew_after) {
+                let now = SystemTime::now();
+                if !shared.lock().unwrap().due(now, expiry.renew_after) {
                     continue;
                 }
-                // A failure keeps the old password, which may still be valid, and the
-                // next check tries again; once it has run out, `expired` reports it.
-                if let Ok(resolved) = credentials::resolve(&conn).await {
-                    let password = resolved.password.as_deref();
-                    pool.set_options(connect_options(&resolved.target, &host, port, password));
-                    *shared.lock().unwrap() = SystemTime::now();
+                // A failure keeps the old password, which may still be valid, and tries
+                // again later and later; once it has run out, `expired` reports it and
+                // connecting again says why.
+                match credentials::resolve(&conn).await {
+                    Ok(resolved) => {
+                        let password = resolved.password.as_deref();
+                        let options = connect_options(&resolved.target, &host, port, password);
+                        pool.set_options(options);
+                        *shared.lock().unwrap() = Renewal::new(now);
+                    }
+                    Err(_) => shared.lock().unwrap().failed(now),
                 }
             }
         });
-        Self { task, made, expiry }
+        Self {
+            task,
+            renewal,
+            expiry,
+        }
     }
 
     /// Whether the password has run out without a new one: renewing failed, or the
     /// computer slept past it.
     pub(super) fn expired(&self) -> bool {
-        let made = *self.made.lock().unwrap();
+        let made = self.renewal.lock().unwrap().made;
         made.elapsed().is_ok_and(|age| age >= self.expiry.lasts)
+    }
+}
+
+/// The longest a [`Refresher`] waits between failed attempts.
+const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+/// How renewing a password goes: when the one in use was made, and the attempts that
+/// failed since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Renewal {
+    made: SystemTime,
+    failures: u32,
+    last_try: Option<SystemTime>,
+}
+
+impl Renewal {
+    fn new(made: SystemTime) -> Self {
+        Self {
+            made,
+            failures: 0,
+            last_try: None,
+        }
+    }
+
+    /// Whether to try making a new password at `now`: once it is `renew_after` old, and
+    /// after a failure only once the wait, doubling from [`REFRESH_CHECK`] up to
+    /// [`RETRY_MAX`], has passed.
+    fn due(&self, now: SystemTime, renew_after: Duration) -> bool {
+        if now
+            .duration_since(self.made)
+            .is_ok_and(|age| age < renew_after)
+        {
+            return false;
+        }
+        let Some(last) = self.last_try else {
+            return true;
+        };
+        let wait = REFRESH_CHECK
+            .saturating_mul(1 << self.failures.saturating_sub(1).min(10))
+            .min(RETRY_MAX);
+        now.duration_since(last).is_ok_and(|since| since >= wait)
+    }
+
+    fn failed(&mut self, at: SystemTime) {
+        self.failures += 1;
+        self.last_try = Some(at);
     }
 }
 
@@ -336,9 +399,9 @@ mod tests {
         let refresher = Refresher::start(
             &conn,
             &pool,
-            "127.0.0.1".into(),
-            40000,
+            ("127.0.0.1".into(), 40000),
             credentials::IAM_EXPIRY,
+            SystemTime::now(),
         );
         let open = Open {
             config: conn.clone(),
@@ -349,11 +412,36 @@ mod tests {
         assert!(open.is_usable_for(&conn));
         // Renewing failed for a while, or the computer slept: the token has run out.
         let refresher = open.refresher.as_ref().unwrap();
-        *refresher.made.lock().unwrap() = SystemTime::now() - Duration::from_secs(16 * 60);
+        let minutes_ago = |m: u64| SystemTime::now() - Duration::from_secs(m * 60);
+        refresher.renewal.lock().unwrap().made = minutes_ago(16);
         assert!(refresher.expired());
         assert!(!open.is_usable_for(&conn));
         // Late, but not yet run out: still usable while the next renewal is tried.
-        *refresher.made.lock().unwrap() = SystemTime::now() - Duration::from_secs(12 * 60);
+        refresher.renewal.lock().unwrap().made = minutes_ago(12);
         assert!(open.is_usable_for(&conn));
+    }
+
+    #[test]
+    fn renewing_waits_for_its_time_then_backs_off_after_failures() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let at = |secs| start + Duration::from_secs(secs);
+        let every = credentials::IAM_REFRESH;
+        let mut renewal = Renewal::new(start);
+        assert!(!renewal.due(at(9 * 60), every));
+        assert!(renewal.due(at(10 * 60), every));
+        // Each failure doubles the wait: 30 s, 1 min, 2 min, 4 min, then 5 min at most.
+        let mut now = 10 * 60;
+        for wait in [30, 60, 120, 240, 300, 300] {
+            renewal.failed(at(now));
+            assert!(!renewal.due(at(now + wait - 1), every), "{wait}");
+            assert!(renewal.due(at(now + wait), every), "{wait}");
+            now += wait;
+        }
+        assert_eq!(
+            renewal.made, start,
+            "a failure keeps the old password's age"
+        );
+        // A clock set back doesn't make it try at once.
+        assert!(!renewal.due(at(now - 600), every));
     }
 }

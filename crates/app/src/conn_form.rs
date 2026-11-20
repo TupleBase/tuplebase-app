@@ -59,6 +59,8 @@ pub struct ConnForm {
     auth_kind: AuthKind,
     /// Where the connection was discovered; kept as it is.
     source: Option<Source>,
+    /// The host it was found at; `source` is dropped if the host changes.
+    source_host: String,
     aws_profile: Entity<InputState>,
     aws_region: Entity<InputState>,
     aws_name: Entity<InputState>,
@@ -160,6 +162,7 @@ impl ConnForm {
             password,
             auth_kind: auth.kind(),
             source: existing.and_then(|c| c.source.clone()),
+            source_host: existing.map(|c| c.host.clone()).unwrap_or_default(),
             aws_profile,
             aws_region,
             aws_name,
@@ -235,6 +238,7 @@ impl ConnForm {
         self.auth_kind = conn.auth.kind();
         self.tls = conn.tls;
         self.source = conn.source.clone();
+        self.source_host = conn.host.clone();
         cx.notify();
     }
 
@@ -327,7 +331,12 @@ impl ConnForm {
                 tls: self.tls,
                 ssh,
                 auth,
-                source: self.source.clone(),
+                // Where it was found no longer applies to another server, and would make
+                // the app trust Amazon's certificates for it.
+                source: self
+                    .source
+                    .clone()
+                    .filter(|_| text(&self.host, cx) == self.source_host),
             },
             password: (!password.is_empty()).then_some(password),
             ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),
