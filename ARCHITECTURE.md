@@ -86,6 +86,7 @@ scripts/                   install, packaging, release helpers
 | `conn_form`          | the add and edit connection form                            |
 | `conn_source`        | the first step of adding one: where the database is         |
 | `aws_picker`         | finding a database in AWS to fill in the form               |
+| `dialogs`            | the close icon and confirm buttons the app's dialogs share  |
 | `schema`             | the schema browser                                          |
 | `results`            | the table that shows a query result                         |
 | `row_detail`         | the panel that shows one result row field by field          |

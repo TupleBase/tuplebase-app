@@ -33,6 +33,7 @@ use tuplebase_core::{app_status, mcp_status, secrets, updates};
 use crate::chat::{ChatEvent, ChatPanel};
 use crate::completions::{SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
+use crate::dialogs;
 use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::row_detail::{RowDetail, RowDetailEvent};
@@ -827,8 +828,7 @@ impl Workspace {
                 .title(format!("Delete folder “{}”?", folder_name(&folder)))
                 .description("What's inside moves up one level. No connections are deleted.")
                 .confirm()
-                .ok_text("Delete folder")
-                .ok_variant(ButtonVariant::Danger)
+                .footer(dialogs::confirm_footer("Delete folder"))
                 .on_ok(move |_, _, cx| {
                     this.update(cx, |this, cx| this.remove_folder(&name, cx))
                         .ok();
@@ -1143,8 +1143,7 @@ impl Workspace {
                 .title(format!("Delete “{name}”?"))
                 .description("Its saved password is removed from the keychain.")
                 .confirm()
-                .ok_text("Delete")
-                .ok_variant(ButtonVariant::Danger)
+                .footer(dialogs::confirm_footer("Delete"))
                 .on_ok(move |_, _, cx| {
                     this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
                         .ok();
@@ -1696,27 +1695,32 @@ impl Workspace {
         }
         window.open_dialog(cx, |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
-            dialog.w(px(320.)).child(
-                v_flex()
-                    .id("about")
-                    .test_support()
-                    .items_center()
-                    .gap_2()
-                    .py_2()
-                    .child(logos::brand(72.))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .child(tuplebase_core::PRODUCT_NAME),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
-                    ),
-            )
+            dialog
+                .w(px(320.))
+                .p_0()
+                .close_button(false)
+                .child(dialogs::with_close_button(
+                    v_flex()
+                        .id("about")
+                        .test_support()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_6()
+                        .child(logos::brand(72.))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_semibold()
+                                .child(tuplebase_core::PRODUCT_NAME),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                        ),
+                ))
         });
     }
 
@@ -3898,8 +3902,19 @@ mod tests {
         window_action(handle, cx, |window, cx| {
             window.dispatch_action(Box::new(About), cx);
         });
-        window_action(handle, cx, |window, _| {
+        window_action(handle, cx, |window, cx| {
             assert!(window.find("about").visible());
+            // The app's close icon, in the dialog's top right corner like the library's.
+            let (close, surface) = (
+                window.within("surface").find("close").bounds(),
+                window.find("surface").bounds(),
+            );
+            assert!((close.top() - surface.top() - px(8.)).abs() <= px(1.));
+            assert!((surface.right() - close.right() - px(8.)).abs() <= px(1.));
+            window.within("surface").click("close", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
         });
     }
 
@@ -4120,6 +4135,61 @@ mod tests {
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Old", cx);
             window.click("remove-Old", cx);
+        });
+        cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn the_buttons_of_a_confirm_dialog_cancel_and_confirm(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        let ask = |cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, cx| {
+                window.hover("folder-Production", cx);
+                window.click("remove-Production", cx);
+            });
+        };
+        let folders = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |this, _| this.config.folders().len())
+        };
+        ask(cx);
+        window_action(handle, cx, |window, cx| {
+            assert!(window.has_active_dialog(cx));
+            // The app's own Cancel and OK, laid out as the library's: side by side, as
+            // wide as their labels, OK on the right.
+            let (cancel, ok) = (window.find("cancel").bounds(), window.find("ok").bounds());
+            assert_eq!(cancel.center().y, ok.center().y);
+            assert!(cancel.right() < ok.left());
+            assert!(cancel.size.width < px(100.) && ok.size.width < px(150.));
+            window.click("cancel", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        assert_eq!(folders(cx), 1);
+        ask(cx);
+        window_action(handle, cx, |window, cx| window.press("escape", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        assert_eq!(folders(cx), 1);
+        ask(cx);
+        window_action(handle, cx, |window, cx| window.click("ok", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        assert_eq!(folders(cx), 0);
+    }
+
+    #[gpui_kit::test]
+    fn enter_confirms_a_confirm_dialog(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.hover("folder-Production", cx);
+            window.click("remove-Production", cx);
+        });
+        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
         });
         cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
