@@ -42,17 +42,28 @@ scripts/                   install, packaging, release helpers
 | `mcp_status` | heartbeat files of running MCP servers                | `config`                                   |
 | `app_status` | the file naming the connections open in the app       | `config`                                   |
 | `updates`    | the GitHub release check                              | `config`                                   |
-| `db`         | pools, queries, schema reads, the read-only guard     | `config` `secrets` `ssh` `aws` `safety`    |
+| `db`         | the database API, pools, running SQL, the read-only guard | `config` `secrets` `ssh` `aws` `safety` |
+| `db/postgres`| PostgreSQL's own SQL and value decoding               | `config`, and `db` (its parent)            |
+| `db/mysql`   | MySQL's and MariaDB's own SQL and value decoding      | `config`, and `db` (its parent)            |
+| `db/sqlite`  | SQLite's own SQL and value decoding                   | `config`, and `db` (its parent)            |
+| `db/decode`  | value decoding the engine modules share               | nothing                                    |
 | `agents`     | the MCP server's entry in each agent's config file    | `updates`                                  |
 | `chat`       | running the user's agent for the chat panel           | `config` `agents`                          |
 
 - **L5. Imports inside `core` go one way, with no cycles.** `config` and `secrets` import
   no sibling module. A module that only needs settings imports `config` alone. `db`,
-  `agents` and `chat` combine the others, and nothing below imports them. Update the
-  table when a module's imports change.
+  `agents` and `chat` combine the others, and nothing below imports them. A submodule,
+  such as `db/postgres`, may import its parent and its siblings; nothing outside the
+  parent imports it. Update the table when a module's imports change.
 - **L6. One module owns each outside system.** SQL and drivers in `db` and `safety`, the
   credential store in `secrets`, the AWS SDK in `aws`, SSH in `ssh`, each file format in
   the module that names it. Other modules call that module instead of the system.
+- **L7. Engine-specific SQL lives in its engine module under `db/`.** `db.rs` keeps the
+  public API and what every engine shares; a method that needs engine-specific SQL picks
+  the engine module by the pool and calls it. MySQL and MariaDB share `db/mysql.rs`,
+  which names any difference between them where it occurs. A feature only one engine has,
+  such as MySQL events, lives only in that engine's module. A new engine is a new module
+  plus one arm per feature. Queries in `db.rs` older than this rule move when changed.
 
 ## Inside `app`
 
@@ -115,7 +126,7 @@ Changing one of these needs the user's explicit agreement, not just a passing re
 
 | Change                           | Place                                                      |
 | -------------------------------- | ---------------------------------------------------------- |
-| New database engine or SQL       | `core/src/db.rs`, and `core/src/safety.rs` for the guard   |
+| New database engine or SQL       | its module under `core/src/db/` (L7), and `core/src/safety.rs` for the guard |
 | New way to get credentials       | its own `core` module, called from `db`                    |
 | New setting saved to disk        | `core/src/config.rs`, or `core/src/state.rs` if not a connection setting |
 | New panel, dialog or form        | its own `app` module (A2)                                  |
