@@ -2154,6 +2154,8 @@ impl Workspace {
             Status::Failed(s) => (s.clone(), theme.danger),
         };
         div()
+            .id("status-line")
+            .test_support()
             .flex_none()
             .min_h(px(28.))
             .px_3()
@@ -2377,7 +2379,9 @@ impl Workspace {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let failed = matches!(self.status, Status::Failed(_));
+        // A failure, or where an unreadable connections file was kept: both matter most
+        // here, when no connections could be shown.
+        let failed = matches!(self.status, Status::Failed(_)) || self.kept_note.is_some();
         v_flex()
             .size_full()
             .child(
@@ -3389,6 +3393,21 @@ mod tests {
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
             assert!(form.read(cx).error.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn where_a_kept_connections_file_went_shows_on_the_empty_screen(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let kept = std::path::PathBuf::from("/cfg/connections.unreadable-1.json");
+                this.show_saved(Ok(Some(kept)), cx);
+            });
+            assert!(window.try_find("status-line").is_none());
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("status-line").visible());
         });
     }
 
