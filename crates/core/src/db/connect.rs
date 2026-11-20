@@ -4,6 +4,7 @@
 //!
 //! The rest of `db` asks for a pool and gets an [`Open`]; nothing here runs queries.
 
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -14,7 +15,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use super::{Open, Pool};
 use crate::cloud::aws;
 use crate::config::{Adapter, Auth, Connection, Provider, TlsMode};
-use crate::{credentials, secrets, ssh};
+use crate::credentials::{self, Expiry};
+use crate::{secrets, ssh};
 
 /// Opens the SSH tunnel, if any, and then the connection pool.
 pub(super) async fn connect(conn: &Connection) -> Result<Open> {
@@ -44,12 +46,12 @@ pub(super) async fn connect(conn: &Connection) -> Result<Open> {
     let pool = open_pool(options)
         .await
         .with_context(|| format!("connecting to \"{}\"", conn.name))?;
-    let refresher = refresh.map(|every| Refresher::start(conn, &pool, host, port, every));
+    let refresher = refresh.map(|expiry| Refresher::start(conn, &pool, host, port, expiry));
     Ok(Open {
         config: conn.clone(),
         pool,
         tunnel,
-        _refresher: refresher,
+        refresher,
     })
 }
 
@@ -59,35 +61,56 @@ const REFRESH_CHECK: Duration = Duration::from_secs(30);
 
 /// Gives a pool a new password before the old one expires, for the connections it opens
 /// from then on; those already open stay signed in. Stops when dropped.
-pub(super) struct Refresher(tokio::task::JoinHandle<()>);
+///
+/// Once the password has run out without a new one, [`Refresher::expired`] says so, and
+/// `db` connects again instead of using the pool: that either signs in afresh or fails
+/// with why, such as the `aws sso login` to run, rather than with the database refusing
+/// an expired token.
+pub(super) struct Refresher {
+    task: tokio::task::JoinHandle<()>,
+    /// When the password in use was made.
+    made: Arc<Mutex<SystemTime>>,
+    expiry: Expiry,
+}
 
 impl Refresher {
-    /// Resolves `conn` again every `every`, reading fresh AWS credentials each time.
-    /// `host` and `port` are where the pool connects: the tunnel's end if there is one.
-    fn start(conn: &Connection, pool: &Pool, host: String, port: u16, every: Duration) -> Self {
+    /// Resolves `conn` again every `expiry.renew_after`, reading fresh AWS credentials
+    /// each time. `host` and `port` are where the pool connects: the tunnel's end if
+    /// there is one.
+    fn start(conn: &Connection, pool: &Pool, host: String, port: u16, expiry: Expiry) -> Self {
         let (conn, pool) = (conn.clone(), pool.clone());
-        Self(tokio::spawn(async move {
-            let mut made = SystemTime::now();
+        let made = Arc::new(Mutex::new(SystemTime::now()));
+        let shared = made.clone();
+        let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(REFRESH_CHECK).await;
-                if made.elapsed().is_ok_and(|age| age < every) {
+                let last = *shared.lock().unwrap();
+                if last.elapsed().is_ok_and(|age| age < expiry.renew_after) {
                     continue;
                 }
                 // A failure keeps the old password, which may still be valid, and the
-                // next check tries again.
+                // next check tries again; once it has run out, `expired` reports it.
                 if let Ok(resolved) = credentials::resolve(&conn).await {
                     let password = resolved.password.as_deref();
                     pool.set_options(connect_options(&resolved.target, &host, port, password));
-                    made = SystemTime::now();
+                    *shared.lock().unwrap() = SystemTime::now();
                 }
             }
-        }))
+        });
+        Self { task, made, expiry }
+    }
+
+    /// Whether the password has run out without a new one: renewing failed, or the
+    /// computer slept past it.
+    pub(super) fn expired(&self) -> bool {
+        let made = *self.made.lock().unwrap();
+        made.elapsed().is_ok_and(|age| age >= self.expiry.lasts)
     }
 }
 
 impl Drop for Refresher {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
     }
 }
 
@@ -280,5 +303,36 @@ mod tests {
         // Options for another database are ignored rather than mixed in.
         pool.set_options(Options::Sqlite(SqliteConnectOptions::new()));
         assert_eq!(pg.connect_options().get_username(), "reporting");
+    }
+
+    #[tokio::test]
+    async fn an_expired_password_makes_the_pool_unusable_so_connecting_says_why() {
+        let conn = rds(TlsMode::Require);
+        let Options::Pg(options) = connect_options(&conn, "127.0.0.1", 40000, None) else {
+            panic!("PostgreSQL options expected");
+        };
+        let pool = Pool::Pg(PgPoolOptions::new().connect_lazy_with(options));
+        let refresher = Refresher::start(
+            &conn,
+            &pool,
+            "127.0.0.1".into(),
+            40000,
+            credentials::IAM_EXPIRY,
+        );
+        let open = Open {
+            config: conn.clone(),
+            pool,
+            tunnel: None,
+            refresher: Some(refresher),
+        };
+        assert!(open.is_usable_for(&conn));
+        // Renewing failed for a while, or the computer slept: the token has run out.
+        let refresher = open.refresher.as_ref().unwrap();
+        *refresher.made.lock().unwrap() = SystemTime::now() - Duration::from_secs(16 * 60);
+        assert!(refresher.expired());
+        assert!(!open.is_usable_for(&conn));
+        // Late, but not yet run out: still usable while the next renewal is tried.
+        *refresher.made.lock().unwrap() = SystemTime::now() - Duration::from_secs(12 * 60);
+        assert!(open.is_usable_for(&conn));
     }
 }

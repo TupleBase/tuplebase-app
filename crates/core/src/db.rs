@@ -272,12 +272,16 @@ struct Open {
     config: Connection,
     pool: Pool,
     tunnel: Option<Tunnel>,
-    _refresher: Option<Refresher>,
+    refresher: Option<Refresher>,
 }
 
 impl Open {
+    /// Also false once the password has expired without a new one, so connecting again
+    /// says why instead of the database refusing it.
     fn is_usable_for(&self, conn: &Connection) -> bool {
-        same_target(&self.config, conn) && self.tunnel.as_ref().is_none_or(Tunnel::is_alive)
+        same_target(&self.config, conn)
+            && self.tunnel.as_ref().is_none_or(Tunnel::is_alive)
+            && self.refresher.as_ref().is_none_or(|r| !r.expired())
     }
 }
 

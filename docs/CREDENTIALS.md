@@ -95,8 +95,16 @@ With **IAM token**, there is no password at all: each time the app connects it m
 [RDS IAM auth token](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
 for the connection's user from your AWS profile. A token lasts 15 minutes, so while a
 connection is open the app makes a new one every 10 minutes for the connections it opens
-next. The token is signed for the database's own host name, also when you connect through
-an SSH tunnel. With no region set, it uses the one in an `*.rds.amazonaws.com` host name.
+next. If a token runs out without a new one, for example because your SSO session expired
+or the computer slept, the next query connects again and says what went wrong, such as the
+`aws sso login` command to run. The token is signed for the database's own host name, also
+when you connect through an SSH tunnel. With no region set, it uses the one in an
+`*.rds.amazonaws.com` host name.
+
+A connection that names an AWS profile signs in with that profile only, even when
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are set in the environment. With no
+profile, the usual AWS order applies: environment variables first, then the default
+profile, then the rest.
 
 ```json
 "auth": { "type": "aws_iam", "profile": "prod-sso", "region": "eu-west-1" }

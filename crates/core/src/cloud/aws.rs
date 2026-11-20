@@ -8,6 +8,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
+use aws_config::profile::ProfileFileCredentialsProvider;
+use aws_config::provider_config::ProviderConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_rds::types::{DbCluster, DbInstance};
 use aws_sdk_ssm::config::{ProvideCredentials, SharedCredentialsProvider};
@@ -618,9 +620,19 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
     let http = aws_smithy_http_client::Builder::new()
         .tls_provider(TlsProvider::Rustls(CryptoMode::Ring))
         .build_https();
-    let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http);
+    let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http.clone());
     if !profile.is_empty() {
-        loader = loader.profile_name(profile);
+        // The default chain reads AWS_ACCESS_KEY_ID and friends before any profile, so
+        // keys in the environment would win over a profile the user chose. A named
+        // profile reads only that profile.
+        let provider_config = ProviderConfig::default().with_http_client(http);
+        let credentials = ProfileFileCredentialsProvider::builder()
+            .configure(&provider_config)
+            .profile_name(profile)
+            .build();
+        loader = loader
+            .profile_name(profile)
+            .credentials_provider(credentials);
     }
     if !region.is_empty() {
         loader = loader.region(Region::new(region.to_owned()));

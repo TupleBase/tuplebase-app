@@ -24,9 +24,24 @@ pub struct Resolved {
     pub target: Connection,
     /// `None` when there is none: a database file, or no password saved.
     pub password: Option<String>,
-    /// How often to resolve again because the password expires; `None` if it doesn't.
-    pub refresh: Option<Duration>,
+    /// When to resolve again because the password expires; `None` if it doesn't.
+    pub refresh: Option<Expiry>,
 }
+
+/// How long a password that expires is good for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Expiry {
+    /// Make a new one this long after the last, well before it runs out.
+    pub renew_after: Duration,
+    /// After this long, new connections can't sign in with it.
+    pub lasts: Duration,
+}
+
+/// An IAM token's.
+pub const IAM_EXPIRY: Expiry = Expiry {
+    renew_after: IAM_REFRESH,
+    lasts: aws::IAM_TOKEN_LIFETIME,
+};
 
 /// Reads or makes the password for `conn`. Called on every connect, so a rotated secret
 /// needs nothing from the user.
@@ -113,7 +128,7 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
             let token = store
                 .iam_token(iam, &conn.host, conn.port, &conn.user)
                 .await?;
-            Ok(unchanged(Some(token), Some(IAM_REFRESH)))
+            Ok(unchanged(Some(token), Some(IAM_EXPIRY)))
         }
     }
 }
@@ -287,7 +302,7 @@ mod tests {
             Some("orders.abc.eu-west-1.rds.amazonaws.com:5432/?Action=connect&DBUser=app")
         );
         assert_eq!(resolved.target, tunneled);
-        assert_eq!(resolved.refresh, Some(IAM_REFRESH));
+        assert_eq!(resolved.refresh, Some(IAM_EXPIRY));
         assert!(IAM_REFRESH < aws::IAM_TOKEN_LIFETIME);
         assert_eq!(
             *fake.asked.lock().unwrap(),
