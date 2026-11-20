@@ -400,6 +400,7 @@ impl ConnForm {
             )
             .child(
                 Checkbox::new("use-secret-host")
+                    .cursor_pointer()
                     .label("Take the host, port and database from the secret too")
                     .checked(self.use_secret_host)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -553,6 +554,7 @@ impl ConnForm {
                 ))
                 .child(
                     Checkbox::new("use-ssh")
+                        .cursor_pointer()
                         .label("Connect through an SSH tunnel")
                         .checked(self.use_ssh)
                         .on_click(cx.listener(|this, checked: &bool, _, cx| {
@@ -564,6 +566,7 @@ impl ConnForm {
             })
             .child(
                 Checkbox::new("readonly")
+                    .cursor_pointer()
                     .label("Read-only: block writes from the app and from agents")
                     .checked(self.readonly)
                     .on_click(cx.listener(|this, checked: &bool, _, cx| {

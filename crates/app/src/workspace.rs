@@ -16,7 +16,7 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{
     ResizablePanel, ResizableState, h_resizable, resizable_panel, v_resizable,
 };
-use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -34,6 +34,7 @@ use crate::completions::{SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::logos;
 use crate::results::ResultsDelegate;
+use crate::row_detail::{RowDetail, RowDetailEvent};
 use crate::runtime::{blocking, io};
 use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme;
@@ -260,6 +261,7 @@ enum Panel {
     Schema,
     Editor,
     Chat,
+    RowDetail,
 }
 
 impl Panel {
@@ -269,6 +271,7 @@ impl Panel {
             Panel::Schema => 270.,
             Panel::Editor => 220.,
             Panel::Chat => 380.,
+            Panel::RowDetail => 320.,
         }
     }
 
@@ -278,6 +281,7 @@ impl Panel {
             Panel::Schema => px(180.)..px(380.),
             Panel::Editor => px(80.)..px(900.),
             Panel::Chat => px(280.)..px(720.),
+            Panel::RowDetail => px(220.)..px(640.),
         }
     }
 
@@ -288,14 +292,16 @@ impl Panel {
             Panel::Schema => "schema",
             Panel::Editor => "editor",
             Panel::Chat => "chat",
+            Panel::RowDetail => "row_detail",
         }
     }
 
     /// Where it sits in its group: the chat is third, after the sidebar and the main
-    /// area; the others come first.
+    /// area, and the row detail second, after the results; the others come first.
     fn index(self) -> usize {
         match self {
             Panel::Chat => 2,
+            Panel::RowDetail => 1,
             _ => 0,
         }
     }
@@ -308,6 +314,8 @@ pub struct Workspace {
     form: Option<Entity<ConnForm>>,
     editor: Entity<EditorState>,
     results: Entity<TableState<ResultsDelegate>>,
+    row_detail: Entity<RowDetail>,
+    _row_detail_subscriptions: [Subscription; 2],
     status: Status,
     session: SessionState,
     /// SQL to show once the next frame has a window to apply it with.
@@ -435,6 +443,7 @@ impl Workspace {
             self.status = Status::Idle;
             self.schema
                 .update(cx, |schema, cx| schema.set_connection(None, cx));
+            self.close_row_detail(cx);
             self.results.update(cx, |table, cx| {
                 table.delegate_mut().clear();
                 table.refresh(cx);
@@ -516,6 +525,30 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// Settings' button for one agent. The page shows the result on that agent's row.
+    /// Only that row changes, so adds to two agents at once can't undo each other.
+    fn add_mcp_to_agent(&self, name: &'static str, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let added = blocking(move || Ok(agents::add_to(name)))
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| this.update_agents(added, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Puts each status on its agent's row, leaving the other rows as they are.
+    fn update_agents(&mut self, statuses: Vec<AgentStatus>, cx: &mut Context<Self>) {
+        for status in statuses {
+            let mut shown = self.agents.iter_mut().flatten();
+            if let Some(shown) = shown.find(|shown| shown.name == status.name) {
+                shown.state = status.state;
+            }
+        }
+        cx.notify();
     }
 
     fn finish_adding_mcp(
@@ -816,8 +849,33 @@ impl Workspace {
                     cx.notify();
                 }
             });
+        let results = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
+        let row_detail = cx.new(|cx| RowDetail::new(window, cx));
+        let _row_detail_subscriptions = [
+            cx.subscribe_in(
+                &results,
+                window,
+                |this, results, event: &TableEvent, window, cx| {
+                    if let TableEvent::SelectRow(row_ix) = event
+                        && let Some(row) = results.read(cx).delegate().row(*row_ix)
+                    {
+                        this.row_detail
+                            .update(cx, |detail, cx| detail.show(row, window, cx));
+                        cx.notify();
+                    }
+                },
+            ),
+            cx.subscribe(
+                &row_detail,
+                |this, _, event: &RowDetailEvent, cx| match event {
+                    RowDetailEvent::Close => this.close_row_detail(cx),
+                },
+            ),
+        ];
         Self {
             db,
+            row_detail,
+            _row_detail_subscriptions,
             schema,
             _schema_subscription,
             chat,
@@ -835,7 +893,7 @@ impl Workspace {
             pending_editor_text: None,
             _editor_subscription,
             _session_save: None,
-            results: cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx)),
+            results,
             status,
             tree_focus: cx.focus_handle(),
             tree_scroll: ScrollHandle::new(),
@@ -863,6 +921,7 @@ impl Workspace {
             Some(self.session.drafts.get(&name).cloned().unwrap_or_default());
         self.db.allow_connecting(&name);
         self.selected = Some(name);
+        self.close_row_detail(cx);
         self.results.update(cx, |table, cx| {
             table.delegate_mut().clear();
             table.refresh(cx);
@@ -1110,6 +1169,7 @@ impl Workspace {
                     if run.changed {
                         this.schema.update(cx, |schema, cx| schema.refresh(cx));
                     }
+                    this.close_row_detail(cx);
                     this.results.update(cx, |table, cx| {
                         table.delegate_mut().set(&run.result);
                         table.refresh(cx);
@@ -1130,6 +1190,14 @@ impl Workspace {
             self.session.set_draft(&name, &sql);
             self.schedule_session_save(cx);
         }
+    }
+
+    /// Closes the row detail panel and drops the selection that opened it.
+    fn close_row_detail(&mut self, cx: &mut Context<Self>) {
+        self.row_detail.update(cx, |detail, cx| detail.clear(cx));
+        self.results
+            .update(cx, |table, cx| table.clear_selection(cx));
+        cx.notify();
     }
 
     /// A panel that opens where it was last dragged to and keeps that size when the
@@ -2056,19 +2124,31 @@ impl Workspace {
             )
             .child(
                 resizable_panel().child(
-                    div().size_full().min_w_0().child(match placeholder {
-                        Some(text) => h_flex()
-                            .size_full()
-                            .justify_center()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(text)
-                            .into_any_element(),
-                        None => DataTable::new(&self.results)
-                            .small()
-                            .bordered(false)
-                            .into_any_element(),
-                    }),
+                    h_resizable("results-panels")
+                        .on_resize(self.remember_panel_sizes(&[Panel::RowDetail], cx))
+                        .child(
+                            resizable_panel().child(
+                                div().size_full().min_w_0().child(match placeholder {
+                                    Some(text) => h_flex()
+                                        .size_full()
+                                        .justify_center()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .child(text)
+                                        .into_any_element(),
+                                    None => DataTable::new(&self.results)
+                                        .small()
+                                        .bordered(false)
+                                        .into_any_element(),
+                                }),
+                            ),
+                        )
+                        .when(self.row_detail.read(cx).is_open(), |el| {
+                            el.child(
+                                self.sized_panel(Panel::RowDetail)
+                                    .child(self.row_detail.clone()),
+                            )
+                        }),
                 ),
             );
         v_flex()
@@ -2478,28 +2558,164 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn settings_offers_to_add_the_server_while_an_agent_lacks_it(cx: &mut TestAppContext) {
-        let status = |state| AgentStatus {
-            name: "Cursor",
-            state,
-        };
+    fn settings_offers_each_agent_its_own_add_button(cx: &mut TestAppContext) {
+        let status = |name, state| AgentStatus { name, state };
         let (handle, workspace) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| window.click("mcp-status", cx));
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
-                this.agents = Some(vec![status(AgentState::NotAdded)]);
+                this.agents = Some(vec![
+                    status("Cursor", AgentState::NotAdded),
+                    status("Codex", AgentState::Added),
+                ]);
                 cx.notify();
             });
         });
         window_action(handle, cx, |window, cx| {
-            assert!(window.find("add-mcp").visible());
+            assert!(window.find("add-mcp-Cursor").visible());
+            assert!(window.try_find("add-mcp-Codex").is_none());
             workspace.update(cx, |this, cx| {
-                this.finish_adding_mcp(vec![status(AgentState::Added)], window, cx);
+                this.agents = Some(vec![
+                    status("Cursor", AgentState::Added),
+                    status("Codex", AgentState::Added),
+                ]);
+                cx.notify();
             });
         });
         window_action(handle, cx, |window, _| {
-            assert!(window.try_find("add-mcp").is_none());
+            assert!(window.try_find("add-mcp-Cursor").is_none());
         });
+    }
+
+    #[gpui_kit::test]
+    fn adding_to_one_agent_changes_only_its_row(cx: &mut TestAppContext) {
+        let status = |name, state| AgentStatus { name, state };
+        let (_, workspace) = open(Config::default(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.agents = Some(vec![
+                    status("Cursor", AgentState::Added),
+                    status("Codex", AgentState::NotAdded),
+                ]);
+                // A result read while Cursor was still being added must not undo it.
+                this.update_agents(vec![status("Codex", AgentState::Added)], cx);
+                assert_eq!(
+                    this.agents,
+                    Some(vec![
+                        status("Cursor", AgentState::Added),
+                        status("Codex", AgentState::Added),
+                    ])
+                );
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn choosing_a_result_row_shows_its_fields_until_closed(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.results.update(cx, |table, cx| {
+                    table.delegate_mut().set(&QueryResult {
+                        columns: vec!["id".into(), "name".into()],
+                        rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!(null)]],
+                        truncated: false,
+                        rows_affected: None,
+                        elapsed_ms: 1,
+                    });
+                    table.refresh(cx);
+                });
+                cx.notify();
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("row-detail").is_none());
+            workspace.update(cx, |this, cx| {
+                this.results
+                    .update(cx, |table, cx| table.set_selected_row(0, cx));
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("row-detail").visible());
+            assert_eq!(
+                workspace.read(cx).row_detail.read(cx).shown(cx),
+                "{\n  id: 1\n  name: \"Ada\"\n}"
+            );
+            // Its text can be selected and copied like any editor's.
+            let text = workspace.read(cx).row_detail.read(cx).text().clone();
+            text.update(cx, |state, cx| state.focus(window, cx));
+            window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
+            window.dispatch_action(Box::new(gpui_kit::component::input::Copy), cx);
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("{\n  id: 1\n  name: \"Ada\"\n}".to_owned())
+        );
+        window_action(handle, cx, |window, cx| {
+            window.click("row-detail-close", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("row-detail").is_none());
+            assert_eq!(workspace.read(cx).results.read(cx).selected_row(), None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn result_cells_and_rows_can_be_copied(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.results.update(cx, |table, cx| {
+                    table.delegate_mut().set(&QueryResult {
+                        columns: vec!["id".into(), "name".into()],
+                        rows: vec![
+                            vec![json!(1), json!("say \"hi\"")],
+                            vec![json!(2), json!(null)],
+                        ],
+                        truncated: false,
+                        rows_affected: None,
+                        elapsed_ms: 1,
+                    });
+                    table.refresh(cx);
+                });
+                cx.notify();
+            });
+        });
+        let copied = |cx: &mut TestAppContext| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+        let row_0 = "{\n  \"id\": 1,\n  \"name\": \"say \\\"hi\\\"\"\n}";
+
+        // Right click a cell: "Copy value", then "Copy row as JSON".
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-cell-0:1", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        assert_eq!(copied(cx), "say \"hi\"");
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-cell-1:1", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        assert_eq!(copied(cx), "NULL");
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-cell-0:0", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(1usize, cx));
+        assert_eq!(copied(cx), row_0);
+
+        // The row detail panel copies the whole row.
+        window_action(handle, cx, |_, cx| {
+            workspace.update(cx, |this, cx| {
+                this.results
+                    .update(cx, |table, cx| table.set_selected_row(0, cx));
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("row-detail-copy", cx));
+        assert_eq!(copied(cx), row_0);
     }
 
     #[gpui_kit::test]

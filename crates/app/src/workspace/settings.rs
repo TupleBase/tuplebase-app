@@ -9,6 +9,7 @@ use gpui_kit::component::setting::{
 };
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::AgentState;
 
@@ -73,6 +74,7 @@ fn general(workspace: &Entity<Workspace>) -> SettingPage {
                     SettingField::render(move |_, _, cx| {
                         let workspace = updates.clone();
                         Switch::new("check-updates")
+                            .cursor_pointer()
                             .accessibility_label(CHECK_UPDATES)
                             .checked(workspace.read(cx).config.check_for_updates)
                             .on_click(move |checked: &bool, _, cx| {
@@ -125,7 +127,6 @@ fn agents(workspace: &Entity<Workspace>, cx: &App) -> SettingPage {
     let statuses = workspace.read(cx).agents.clone();
     let looked = statuses.is_some();
     let statuses = statuses.unwrap_or_default();
-    let can_add = statuses.iter().any(|s| s.state != AgentState::Added);
     let mut group = SettingGroup::new();
     if statuses.is_empty() {
         let note = if looked {
@@ -141,13 +142,15 @@ fn agents(workspace: &Entity<Workspace>, cx: &App) -> SettingPage {
         }));
     }
     group = group.items(statuses.into_iter().map(|status| {
-        let (text, failed): (SharedString, bool) = match status.state {
-            AgentState::Added => ("Added".into(), false),
-            AgentState::NotAdded => ("Not added".into(), false),
-            AgentState::Failed(reason) => (reason.into(), true),
+        let name = status.name;
+        let (text, failed, can_add): (SharedString, bool, bool) = match status.state {
+            AgentState::Added => ("Added".into(), false, false),
+            AgentState::NotAdded => ("Not added".into(), false, true),
+            AgentState::Failed(reason) => (reason.into(), true, true),
         };
+        let workspace = workspace.downgrade();
         SettingItem::new(
-            status.name,
+            name,
             SettingField::render(move |_, _, cx| {
                 let theme = cx.theme();
                 let color = if failed {
@@ -155,32 +158,34 @@ fn agents(workspace: &Entity<Workspace>, cx: &App) -> SettingPage {
                 } else {
                     theme.muted_foreground
                 };
-                div()
-                    .max_w(px(280.))
-                    .text_sm()
-                    .text_right()
-                    .text_color(color)
-                    .child(text.clone())
+                let workspace = workspace.clone();
+                h_flex()
+                    .gap_3()
+                    .child(
+                        div()
+                            .max_w(px(280.))
+                            .text_sm()
+                            .text_right()
+                            .text_color(color)
+                            .child(text.clone()),
+                    )
+                    .when(can_add, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("add-mcp-{name}")))
+                                .cursor_pointer()
+                                .small()
+                                .label(if failed { "Try again" } else { "Add" })
+                                .accessibility_label(format!("Add to {name}"))
+                                .on_click(move |_, _, cx| {
+                                    workspace
+                                        .update(cx, |this, cx| this.add_mcp_to_agent(name, cx))
+                                        .ok();
+                                }),
+                        )
+                    })
             }),
         )
     }));
-    if can_add {
-        let workspace = workspace.downgrade();
-        group = group.footer(move |_, _| {
-            let workspace = workspace.clone();
-            h_flex().child(
-                Button::new("add-mcp")
-                    .cursor_pointer()
-                    .small()
-                    .label("Add to all agents")
-                    .on_click(move |_, window, cx| {
-                        workspace
-                            .update(cx, |this, cx| this.add_mcp_to_agents(window, cx))
-                            .ok();
-                    }),
-            )
-        });
-    }
     SettingPage::new("AI agents")
         .icon(IconName::Bot)
         .resettable(false)
