@@ -6,7 +6,7 @@
 //!    statement smuggled in after `;`;
 //! 3. they run inside a server-enforced `READ ONLY` transaction that is rolled back.
 
-use crate::config::Adapter;
+use crate::config::{Adapter, ScriptFlavor};
 
 const READ_KEYWORDS: [&str; 8] = [
     "select", "with", "show", "explain", "values", "table", "describe", "desc",
@@ -45,8 +45,11 @@ pub fn trim_statement(sql: &str) -> &str {
 /// PostgreSQL dollar quotes, and the `BEGIN … END` body of a routine, trigger or event
 /// on MySQL and MariaDB (see [`Body`]). Comment-only pieces are dropped.
 pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
-    let postgres = adapter == Adapter::Postgres;
-    let mysql = matches!(adapter, Adapter::Mariadb | Adapter::Mysql);
+    let (postgres, mysql) = match adapter.info().script {
+        ScriptFlavor::Postgres => (true, false),
+        ScriptFlavor::Mysql => (false, true),
+        ScriptFlavor::Standard => (false, false),
+    };
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let (mut start, mut i, mut has_content) = (0, 0, false);
