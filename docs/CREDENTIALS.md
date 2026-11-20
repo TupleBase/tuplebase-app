@@ -117,9 +117,16 @@ must be set up for it (`GRANT rds_iam TO app_user;` on PostgreSQL,
 MariaDB). On MySQL and MariaDB the token is sent in clear text inside the encrypted
 connection, as RDS requires; no other password is ever sent that way.
 
-A `connections.json` with an IAM token connection is written as `"version": 2`, which
-TupleBase 0.9 and older refuse to open rather than misread. Remove the connection and the
-file goes back to version 1.
+A `connections.json` with an IAM token connection is written as `"version": 2`.
+**TupleBase 0.10 and older can't read a version 2 file**: they start with no connections,
+and saving any setting there replaces the file with an empty one. So the first time this
+version writes version 2, it keeps the version 1 file as `connections.v1.json` in the same
+folder; to go back to an older version, copy it over `connections.json`. Remove the IAM
+token connection and the file goes back to version 1.
+
+This version never writes over a `connections.json` it can't read, for example one from a
+newer version: it renames it to `connections.json.unreadable-<time>`, says so, and starts
+without it. Rename it back once you run a version that reads it.
 
 ### Verifying an RDS certificate
 

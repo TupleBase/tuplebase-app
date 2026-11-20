@@ -352,9 +352,17 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Small local file read once before the first frame.
-        let (config, status) = match Config::load() {
-            Ok(config) => (config, Status::Idle),
-            Err(e) => (Config::default(), Status::Failed(format!("{e:#}").into())),
+        // A file that can't be read is set aside, never saved over (see `core::config`).
+        let (config, status) = match Config::load_or_set_aside() {
+            Ok((config, None)) => (config, Status::Idle),
+            Ok((config, Some(message))) => (config, Status::Failed(message.into())),
+            Err(e) => {
+                let config = Config {
+                    unsaved_because: Some(format!("{e:#}")),
+                    ..Config::default()
+                };
+                (config, Status::Failed(format!("{e:#}").into()))
+            }
         };
         theme::set_appearance(config.appearance, Some(window), cx);
         cx.observe_window_appearance(window, |this, window, cx| {
