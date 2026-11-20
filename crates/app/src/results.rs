@@ -281,7 +281,7 @@ impl TableDelegate for ResultsDelegate {
 impl ResultsDelegate {
     /// `set` at the default text size.
     pub(crate) fn show(&mut self, result: &QueryResult) {
-        self.set(result, px(14.));
+        self.set(result, px(15.));
     }
 }
 

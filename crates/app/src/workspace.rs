@@ -1593,7 +1593,10 @@ impl Workspace {
                     .border_color(border)
                     .children(self.render_update(cx))
                     .child(
+                        // Wraps rather than run past the sidebar's edge when it's narrow.
                         h_flex()
+                            .flex_wrap()
+                            .gap_y_1()
                             .justify_between()
                             .child(
                                 Button::new("open-settings")
@@ -2227,7 +2230,10 @@ impl Workspace {
                             .small()
                             .icon(Icon::default().data(HISTORY_ICON))
                             .tooltip("Query history")
-                            .dropdown_menu(move |mut menu, _, _| {
+                            .dropdown_menu(move |mut menu, _, cx| {
+                                // Wide enough for a label at any text size; the menu
+                                // doesn't cut a label that is longer than it is.
+                                menu = menu.max_w(cx.theme().font_size * HISTORY_MENU_EMS);
                                 if items.is_empty() {
                                     menu = menu.label("No queries yet");
                                 }
@@ -2496,9 +2502,13 @@ fn summary(r: &tuplebase_core::db::QueryResult, statements: usize) -> String {
 }
 
 /// One line of a query, short enough for a menu.
+/// The history menu's width, in ems, and the longest label that fits it.
+const HISTORY_MENU_EMS: f32 = 44.;
+const HISTORY_LABEL_CHARS: usize = 56;
+
 fn history_label(sql: &str) -> String {
     let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    match flat.char_indices().nth(70) {
+    match flat.char_indices().nth(HISTORY_LABEL_CHARS) {
         Some((end, _)) => format!("{}…", &flat[..end]),
         None => flat,
     }
@@ -3331,7 +3341,10 @@ mod tests {
         };
         assert_eq!(super::summary(&result, 3), "3 statements. 2 rows in 5 ms");
         assert_eq!(super::history_label("select\n  1"), "select 1");
-        assert_eq!(super::history_label(&"x".repeat(100)).chars().count(), 71);
+        assert_eq!(
+            super::history_label(&"x".repeat(100)).chars().count(),
+            super::HISTORY_LABEL_CHARS + 1
+        );
     }
 
     #[gpui_kit::test]
@@ -3542,18 +3555,18 @@ mod tests {
                 )
             })
         };
-        assert_eq!(sizes(cx), (14, px(14.), px(12.)));
+        assert_eq!(sizes(cx), (15, px(15.), px(13.)));
         for _ in 0..2 {
             window_action(handle, cx, |window, cx| window.press("secondary-=", cx));
         }
-        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
+        assert_eq!(sizes(cx), (17, px(17.), px(15.)));
         window_action(handle, cx, |window, _| {
-            assert_eq!(window.rem_size(), px(16.));
+            assert_eq!(window.rem_size(), px(17.));
         });
         window_action(handle, cx, |window, cx| window.press("secondary--", cx));
-        assert_eq!(sizes(cx), (15, px(15.), px(13.)));
+        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
         window_action(handle, cx, |window, cx| window.press("secondary-0", cx));
-        assert_eq!(sizes(cx), (14, px(14.), px(12.)));
+        assert_eq!(sizes(cx), (15, px(15.), px(13.)));
     }
 
     #[gpui_kit::test]
