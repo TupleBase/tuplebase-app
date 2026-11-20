@@ -560,6 +560,9 @@ impl SchemaPanel {
             }) => self.toggle_table(key, cx),
             Some(Row::Table { key, .. }) => self.set_cursor(Target::Schema(key.schema), cx),
             Some(Row::Group { schema, .. }) => self.set_cursor(Target::Schema(schema), cx),
+            Some(Row::Object(object)) => {
+                self.set_cursor(Target::Group(object.schema, object.kind), cx)
+            }
             _ => {}
         }
     }

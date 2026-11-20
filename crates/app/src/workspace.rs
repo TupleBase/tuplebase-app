@@ -862,6 +862,11 @@ impl Workspace {
                     this.editor
                         .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
                     this.remember_draft(cx);
+                    // An earlier error is about SQL the editor no longer shows.
+                    if matches!(this.status, Status::Failed(_)) {
+                        this.status = Status::Idle;
+                        cx.notify();
+                    }
                 }
                 // A running query's status stays until its result arrives.
                 SchemaEvent::Failed(message) => {
@@ -4001,6 +4006,12 @@ mod tests {
             window.press("enter", cx);
         });
         assert_eq!(editor_text(&workspace, cx), "Definition of total");
+        let cursor = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |this, cx| this.schema.read(cx).cursor_name())
+        };
+        assert_eq!(cursor(cx).as_deref(), Some("total"));
+        window_action(handle, cx, |window, cx| window.press("left", cx));
+        assert_eq!(cursor(cx).as_deref(), Some("Functions"));
     }
 
     #[gpui_kit::test]
@@ -4021,6 +4032,17 @@ mod tests {
             }
             _ => panic!("the error must show on the status line"),
         });
+
+        // A later definition that loads clears the error.
+        show_objects(&workspace, &[(ObjectKind::Trigger, "fine")], cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("group-public-Triggers", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("object-public-Triggers-fine", cx)
+        });
+        assert_eq!(editor_text(&workspace, cx), "Definition of fine");
+        cx.update(|cx| assert!(matches!(workspace.read(cx).status, Status::Idle)));
     }
 
     #[gpui_kit::test]
