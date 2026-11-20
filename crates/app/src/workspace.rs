@@ -850,17 +850,21 @@ impl Workspace {
                 }
             });
         let results = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
-        let row_detail = cx.new(|_| RowDetail::default());
+        let row_detail = cx.new(|cx| RowDetail::new(window, cx));
         let _row_detail_subscriptions = [
-            cx.subscribe(&results, |this, results, event: &TableEvent, cx| {
-                if let TableEvent::SelectRow(row_ix) = event
-                    && let Some(row) = results.read(cx).delegate().row(*row_ix)
-                {
-                    this.row_detail
-                        .update(cx, |detail, cx| detail.show(row, cx));
-                    cx.notify();
-                }
-            }),
+            cx.subscribe_in(
+                &results,
+                window,
+                |this, results, event: &TableEvent, window, cx| {
+                    if let TableEvent::SelectRow(row_ix) = event
+                        && let Some(row) = results.read(cx).delegate().row(*row_ix)
+                    {
+                        this.row_detail
+                            .update(cx, |detail, cx| detail.show(row, window, cx));
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe(
                 &row_detail,
                 |this, _, event: &RowDetailEvent, cx| match event {
@@ -2635,12 +2639,20 @@ mod tests {
         window_action(handle, cx, |window, cx| {
             assert!(window.find("row-detail").visible());
             assert_eq!(
-                workspace.read(cx).row_detail.read(cx).shown(),
-                [
-                    ("id".to_owned(), "1".to_owned()),
-                    ("name".to_owned(), "\"Ada\"".to_owned())
-                ]
+                workspace.read(cx).row_detail.read(cx).shown(cx),
+                "{\n  id: 1\n  name: \"Ada\"\n}"
             );
+            // Its text can be selected and copied like any editor's.
+            let text = workspace.read(cx).row_detail.read(cx).text().clone();
+            text.update(cx, |state, cx| state.focus(window, cx));
+            window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
+            window.dispatch_action(Box::new(gpui_kit::component::input::Copy), cx);
+        });
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("{\n  id: 1\n  name: \"Ada\"\n}".to_owned())
+        );
+        window_action(handle, cx, |window, cx| {
             window.click("row-detail-close", cx);
         });
         window_action(handle, cx, |window, cx| {
@@ -2695,17 +2707,13 @@ mod tests {
         window_action(handle, cx, |window, cx| window.click(1usize, cx));
         assert_eq!(copied(cx), row_0);
 
-        // The row detail panel copies one field, or the whole row.
+        // The row detail panel copies the whole row.
         window_action(handle, cx, |_, cx| {
             workspace.update(cx, |this, cx| {
                 this.results
                     .update(cx, |table, cx| table.set_selected_row(0, cx));
             });
         });
-        window_action(handle, cx, |window, cx| {
-            window.click(("row-detail-copy-field", 1usize), cx);
-        });
-        assert_eq!(copied(cx), "say \"hi\"");
         window_action(handle, cx, |window, cx| window.click("row-detail-copy", cx));
         assert_eq!(copied(cx), row_0);
     }

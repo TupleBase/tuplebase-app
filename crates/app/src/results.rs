@@ -85,7 +85,7 @@ fn column_width(name: &str, rows: &[Vec<String>], index: usize) -> f32 {
 
 /// A value as the table shows it and as "Copy value" copies it: text without quotes,
 /// `NULL` for null, and compact JSON for the rest.
-pub fn cell_text(value: &Value) -> String {
+fn cell_text(value: &Value) -> String {
     match value {
         Value::Null => "NULL".into(),
         Value::String(s) => s.clone(),
