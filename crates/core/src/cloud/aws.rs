@@ -1,5 +1,5 @@
 //! Everything that talks to AWS: credentials kept in Secrets Manager and SSM Parameter
-//! Store, RDS IAM auth tokens and the profiles on this machine.
+//! Store, RDS IAM auth tokens, the profiles on this machine, and the databases in RDS.
 //!
 //! A connection saves only where the secret is (profile, region, name). The value is
 //! read on every connect and never written to disk or the OS credential store, so a
@@ -9,14 +9,18 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use aws_config::{BehaviorVersion, Region, SdkConfig};
+use aws_sdk_rds::types::{DbCluster, DbInstance};
 use aws_sdk_ssm::config::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_ssm::error::{ProvideErrorMetadata, SdkError};
-use aws_smithy_http_client::tls::{Provider, rustls_provider::CryptoMode};
+use aws_smithy_http_client::tls::{Provider as TlsProvider, rustls_provider::CryptoMode};
 use aws_types::os_shim_internal::{Env, Fs};
 use serde_json::Value;
 use tokio::time::timeout;
 
-use crate::config::{AwsSecretRef, AwsStore, Connection};
+use super::{DiscoverError, DiscoverErrorKind, Discovered, Discovery};
+use crate::config::{
+    Adapter, Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection, Provider, Source,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -248,13 +252,371 @@ async fn profiles_in(fs: &Fs, env: &Env) -> Result<Vec<Profile>> {
     Ok(profiles)
 }
 
+/// Finds the RDS databases and Aurora clusters `profile` can see in `regions`, searching
+/// the regions at once; no regions means the profile's own. Needs
+/// `rds:DescribeDBInstances` and `rds:DescribeDBClusters`. See [`super::discover`].
+pub async fn discover(profile: &str, regions: &[String]) -> Discovery {
+    let regions: Vec<&str> = regions
+        .iter()
+        .map(|r| r.trim())
+        .filter(|r| !r.is_empty())
+        .collect();
+    let mut discovery = Discovery::default();
+    // Signing in once serves every region, and a failure is reported once.
+    let first = regions.first().copied().unwrap_or_default();
+    let base = match timeout(TIMEOUT, sdk_config(profile, first)).await {
+        Ok(Ok(config)) => config,
+        Ok(Err(e)) => {
+            discovery
+                .errors
+                .push(sign_in_error(profile, &format!("{e:#}")));
+            return discovery;
+        }
+        Err(_) => {
+            discovery.errors.push(DiscoverError {
+                region: None,
+                kind: DiscoverErrorKind::TimedOut,
+                message: "Timed out signing in to AWS.".into(),
+            });
+            return discovery;
+        }
+    };
+    let regions: Vec<String> = if regions.is_empty() {
+        // `sdk_config` refuses a config with no region, so there is one.
+        base.region().map(|r| r.to_string()).into_iter().collect()
+    } else {
+        regions.into_iter().map(str::to_owned).collect()
+    };
+    let searches = regions.iter().map(|region| {
+        let config = base
+            .clone()
+            .into_builder()
+            .region(Region::new(region.clone()))
+            .build();
+        async move {
+            let result = timeout(TIMEOUT, discover_region(&config, profile, region)).await;
+            (region, result)
+        }
+    });
+    for (region, result) in futures_util::future::join_all(searches).await {
+        match result {
+            Ok(Ok(found)) if found.is_empty() => discovery.empty_regions.push(region.clone()),
+            Ok(Ok(found)) => discovery.found.extend(found),
+            Ok(Err(e)) => discovery.errors.push(region_error(region, profile, e)),
+            Err(_) => discovery.errors.push(DiscoverError {
+                region: Some(region.clone()),
+                kind: DiscoverErrorKind::TimedOut,
+                message: format!("Timed out listing the databases in {region}."),
+            }),
+        }
+    }
+    discovery
+        .found
+        .sort_by(|a, b| (a.source.region.as_str(), &a.label).cmp(&(&b.source.region, &b.label)));
+    discovery
+}
+
+/// A failure from AWS itself, with its code when it gave one.
+struct ApiFailure {
+    code: Option<String>,
+    message: String,
+}
+
+fn api_failure<E>(err: SdkError<E>) -> ApiFailure
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    match err.as_service_error() {
+        Some(refused) => ApiFailure {
+            code: refused.code().map(str::to_owned),
+            message: refused.message().unwrap_or("no details given").to_owned(),
+        },
+        None => ApiFailure {
+            code: None,
+            message: causes(&err),
+        },
+    }
+}
+
+async fn discover_region(
+    config: &SdkConfig,
+    profile: &str,
+    region: &str,
+) -> Result<Vec<Discovered>, ApiFailure> {
+    let client = aws_sdk_rds::Client::new(config);
+    let instances = client
+        .describe_db_instances()
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await
+        .map_err(api_failure)?;
+    let clusters = client
+        .describe_db_clusters()
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await
+        .map_err(api_failure)?;
+    Ok(found_in_region(&instances, &clusters, profile, region))
+}
+
+/// Clusters once each, at their writer endpoint, and the instances outside any cluster.
+fn found_in_region(
+    instances: &[DbInstance],
+    clusters: &[DbCluster],
+    profile: &str,
+    region: &str,
+) -> Vec<Discovered> {
+    let clusters = clusters.iter().map(|cluster| {
+        // Aurora says whether a cluster is public on its instances.
+        let members: Vec<&str> = cluster
+            .db_cluster_members()
+            .iter()
+            .filter_map(|m| m.db_instance_identifier())
+            .collect();
+        let public = cluster.publicly_accessible().unwrap_or(false)
+            || instances.iter().any(|i| {
+                i.publicly_accessible() == Some(true)
+                    && i.db_instance_identifier()
+                        .is_some_and(|id| members.contains(&id))
+            });
+        from_cluster(cluster, public, profile, region)
+    });
+    let instances = instances
+        .iter()
+        .filter(|i| i.db_cluster_identifier().is_none())
+        .map(|instance| from_instance(instance, profile, region));
+    clusters.chain(instances).collect()
+}
+
+/// What a database's fields say, in the provider-neutral form.
+struct Found<'a> {
+    label: &'a str,
+    engine: &'a str,
+    host: &'a str,
+    port: Option<i32>,
+    database: Option<&'a str>,
+    user: Option<&'a str>,
+    status: Option<&'a str>,
+    public: bool,
+    iam_enabled: bool,
+    managed_secret: Option<&'a str>,
+    arn: Option<&'a str>,
+    /// For a cluster: its reader endpoint.
+    readers: Option<&'a str>,
+}
+
+fn from_instance(instance: &DbInstance, profile: &str, region: &str) -> Discovered {
+    let endpoint = instance.endpoint();
+    discovered(
+        Found {
+            label: instance.db_instance_identifier().unwrap_or_default(),
+            engine: instance.engine().unwrap_or_default(),
+            host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
+            port: endpoint.and_then(|e| e.port()),
+            database: instance.db_name(),
+            user: instance.master_username(),
+            status: instance.db_instance_status(),
+            public: instance.publicly_accessible().unwrap_or(false),
+            iam_enabled: instance.iam_database_authentication_enabled() == Some(true),
+            managed_secret: instance.master_user_secret().and_then(|s| s.secret_arn()),
+            arn: instance.db_instance_arn(),
+            readers: None,
+        },
+        profile,
+        region,
+    )
+}
+
+fn from_cluster(cluster: &DbCluster, public: bool, profile: &str, region: &str) -> Discovered {
+    discovered(
+        Found {
+            label: cluster.db_cluster_identifier().unwrap_or_default(),
+            engine: cluster.engine().unwrap_or_default(),
+            host: cluster.endpoint().unwrap_or_default(),
+            port: cluster.port(),
+            database: cluster.database_name(),
+            user: cluster.master_username(),
+            status: cluster.status(),
+            public,
+            iam_enabled: cluster.iam_database_authentication_enabled() == Some(true),
+            managed_secret: cluster.master_user_secret().and_then(|s| s.secret_arn()),
+            arn: cluster.db_cluster_arn(),
+            readers: cluster.reader_endpoint(),
+        },
+        profile,
+        region,
+    )
+}
+
+/// The app's database for an RDS engine name; `None` for the ones it can't open yet.
+pub fn adapter_for_engine(engine: &str) -> Option<Adapter> {
+    match engine {
+        "postgres" | "aurora-postgresql" => Some(Adapter::Postgres),
+        // `aurora` is Aurora MySQL 5.6, from before the engine had its own name.
+        "mysql" | "aurora-mysql" | "aurora" => Some(Adapter::Mysql),
+        "mariadb" => Some(Adapter::Mariadb),
+        _ => None,
+    }
+}
+
+/// How a found database should sign in: the password RDS keeps in Secrets Manager if it
+/// keeps one, else an IAM token if the database takes them, else a password typed in.
+fn suggested_auth(found: &Found, profile: &str, region: &str) -> Auth {
+    if let Some(arn) = found.managed_secret {
+        Auth::AwsSecret(AwsSecretRef {
+            profile: profile.to_owned(),
+            region: region.to_owned(),
+            name: arn.to_owned(),
+            use_secret_host: false,
+        })
+    } else if found.iam_enabled {
+        Auth::AwsIam(AwsIamAuth {
+            profile: profile.to_owned(),
+            region: region.to_owned(),
+        })
+    } else {
+        Auth::Password
+    }
+}
+
+fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
+    let adapter = adapter_for_engine(found.engine);
+    let status = found.status.unwrap_or("unknown").to_owned();
+    let mut notes = Vec::new();
+    if adapter.is_none() {
+        notes.push(format!("{} is not supported yet.", found.engine));
+    }
+    if found.host.is_empty() {
+        notes.push(format!("It has no endpoint yet ({status})."));
+    }
+    if let Some(readers) = found.readers {
+        notes.push(format!(
+            "Aurora cluster: connects to the writer. Readers are at {readers}."
+        ));
+    }
+    if !found.public {
+        notes.push(
+            "Not reachable from the internet: connect through an SSH tunnel to a host in \
+             its VPC."
+                .into(),
+        );
+    }
+    // Without a database, PostgreSQL would look for one named after the user.
+    let database = match found.database {
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ if adapter == Some(Adapter::Postgres) => "postgres".to_owned(),
+        _ => String::new(),
+    };
+    Discovered {
+        label: found.label.to_owned(),
+        adapter,
+        engine: found.engine.to_owned(),
+        host: found.host.to_owned(),
+        port: found
+            .port
+            .and_then(|p| u16::try_from(p).ok())
+            .or(adapter.map(Adapter::default_port))
+            .unwrap_or_default(),
+        database,
+        user: found.user.unwrap_or_default().to_owned(),
+        status,
+        public: found.public,
+        iam_enabled: found.iam_enabled,
+        managed_secret: found.managed_secret.map(str::to_owned),
+        auth: suggested_auth(&found, profile, region),
+        source: Source {
+            provider: Provider::Aws,
+            resource: found.arn.unwrap_or(found.label).to_owned(),
+            region: region.to_owned(),
+        },
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+    }
+}
+
+/// The `aws sso login` command for `profile`.
+fn login_command(profile: &str) -> String {
+    match profile {
+        "" => "aws sso login".to_owned(),
+        profile => format!("aws sso login --profile {profile}"),
+    }
+}
+
+/// Why signing in failed, from [`sdk_config`]'s message.
+fn sign_in_error(profile: &str, message: &str) -> DiscoverError {
+    let (kind, message) = if message.contains("no AWS region") {
+        (
+            DiscoverErrorKind::NoRegion,
+            "No region to search: add one, or set one in the AWS profile.".to_owned(),
+        )
+    } else if message.contains("is not in your AWS config") {
+        (DiscoverErrorKind::Other, format!("{message}."))
+    } else {
+        (
+            DiscoverErrorKind::SignIn,
+            format!(
+                "Couldn't sign in to AWS ({message}). If your session expired, run `{}` \
+                 and try again.",
+                login_command(profile)
+            ),
+        )
+    };
+    DiscoverError {
+        region: None,
+        kind,
+        message,
+    }
+}
+
+fn region_error(region: &str, profile: &str, failure: ApiFailure) -> DiscoverError {
+    let code = failure.code.as_deref().unwrap_or_default();
+    let (kind, message) = match code {
+        "AccessDenied" | "AccessDeniedException" | "UnauthorizedOperation" => (
+            DiscoverErrorKind::AccessDenied,
+            format!(
+                "Not allowed to list databases in {region}: the AWS identity needs \
+                 rds:DescribeDBInstances and rds:DescribeDBClusters ({}).",
+                failure.message
+            ),
+        ),
+        "ExpiredToken"
+        | "ExpiredTokenException"
+        | "RequestExpired"
+        | "InvalidClientTokenId"
+        | "UnrecognizedClientException" => (
+            DiscoverErrorKind::SignIn,
+            format!(
+                "AWS refused the sign-in in {region} ({code}). If your session expired, run \
+                 `{}` and try again.",
+                login_command(profile)
+            ),
+        ),
+        "" => (
+            DiscoverErrorKind::Other,
+            format!("Couldn't reach RDS in {region}: {}", failure.message),
+        ),
+        code => (
+            DiscoverErrorKind::Other,
+            format!("{code} in {region}: {}", failure.message),
+        ),
+    };
+    DiscoverError {
+        region: Some(region.to_owned()),
+        kind,
+        message,
+    }
+}
+
 /// What AWS clients are built from. Loads the profile and signs in once, so a missing or
 /// expired session is reported as such instead of as a failed request. An empty `profile`
 /// means the default AWS credentials; an empty `region` means the profile's.
 pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
     // `ring` keeps the build free of C libraries (the SDK's default TLS is aws-lc).
     let http = aws_smithy_http_client::Builder::new()
-        .tls_provider(Provider::Rustls(CryptoMode::Ring))
+        .tls_provider(TlsProvider::Rustls(CryptoMode::Ring))
         .build_https();
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http);
     if !profile.is_empty() {
@@ -342,8 +704,195 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Adapter, Auth, TlsMode};
+    use crate::config::TlsMode;
     use aws_sdk_rds::config::Credentials;
+    use aws_sdk_rds::types::{DbClusterMember, Endpoint, MasterUserSecret};
+
+    fn instance(id: &str, engine: &str) -> aws_sdk_rds::types::builders::DbInstanceBuilder {
+        DbInstance::builder()
+            .db_instance_identifier(id)
+            .engine(engine)
+            .db_instance_status("available")
+            .master_username("admin")
+            .db_instance_arn(format!("arn:aws:rds:eu-west-1:123456789012:db:{id}"))
+            .endpoint(
+                Endpoint::builder()
+                    .address(format!("{id}.abc.eu-west-1.rds.amazonaws.com"))
+                    .port(5432)
+                    .build(),
+            )
+    }
+
+    #[test]
+    fn engines_map_to_the_apps_databases() {
+        assert_eq!(adapter_for_engine("postgres"), Some(Adapter::Postgres));
+        assert_eq!(
+            adapter_for_engine("aurora-postgresql"),
+            Some(Adapter::Postgres)
+        );
+        assert_eq!(adapter_for_engine("mysql"), Some(Adapter::Mysql));
+        assert_eq!(adapter_for_engine("aurora-mysql"), Some(Adapter::Mysql));
+        assert_eq!(adapter_for_engine("mariadb"), Some(Adapter::Mariadb));
+        for other in ["oracle-ee", "sqlserver-se", "db2-se", "docdb", "neptune"] {
+            assert_eq!(adapter_for_engine(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn an_aurora_cluster_is_listed_once_at_its_writer() {
+        let cluster = DbCluster::builder()
+            .db_cluster_identifier("shop")
+            .engine("aurora-postgresql")
+            .endpoint("shop.cluster-abc.eu-west-1.rds.amazonaws.com")
+            .reader_endpoint("shop.cluster-ro-abc.eu-west-1.rds.amazonaws.com")
+            .port(5432)
+            .status("available")
+            .master_username("admin")
+            .db_cluster_members(
+                DbClusterMember::builder()
+                    .db_instance_identifier("shop-1")
+                    .build(),
+            )
+            .db_cluster_members(
+                DbClusterMember::builder()
+                    .db_instance_identifier("shop-2")
+                    .build(),
+            )
+            .build();
+        let instances = [
+            instance("shop-1", "aurora-postgresql")
+                .db_cluster_identifier("shop")
+                .publicly_accessible(true)
+                .build(),
+            instance("shop-2", "aurora-postgresql")
+                .db_cluster_identifier("shop")
+                .build(),
+            instance("orders", "postgres").build(),
+        ];
+        let found = found_in_region(&instances, &[cluster], "prod", "eu-west-1");
+        let labels: Vec<_> = found.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(labels, ["shop", "orders"]);
+        let shop = &found[0];
+        assert_eq!(shop.host, "shop.cluster-abc.eu-west-1.rds.amazonaws.com");
+        assert!(shop.public, "a public member makes the cluster reachable");
+        assert!(shop.note.as_deref().unwrap().contains("cluster-ro-abc"));
+        assert_eq!(shop.database, "postgres");
+        assert!(!found[1].public);
+        assert!(found[1].note.as_deref().unwrap().contains("SSH tunnel"));
+    }
+
+    #[test]
+    fn the_managed_secret_wins_then_iam_then_a_password() {
+        let secret = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!db-1";
+        let managed = instance("a", "postgres")
+            .iam_database_authentication_enabled(true)
+            .master_user_secret(MasterUserSecret::builder().secret_arn(secret).build())
+            .build();
+        let iam = instance("b", "mysql")
+            .iam_database_authentication_enabled(true)
+            .build();
+        let plain = instance("c", "mariadb").publicly_accessible(true).build();
+        let found = found_in_region(&[managed, iam, plain], &[], "prod", "eu-west-1");
+        assert_eq!(
+            found[0].auth,
+            Auth::AwsSecret(AwsSecretRef {
+                profile: "prod".into(),
+                region: "eu-west-1".into(),
+                name: secret.into(),
+                use_secret_host: false,
+            })
+        );
+        assert_eq!(found[0].managed_secret.as_deref(), Some(secret));
+        assert_eq!(
+            found[1].auth,
+            Auth::AwsIam(AwsIamAuth {
+                profile: "prod".into(),
+                region: "eu-west-1".into(),
+            })
+        );
+        assert_eq!(found[2].auth, Auth::Password);
+        assert_eq!(found[2].note, None);
+        let conn = found[1].connection().unwrap();
+        assert_eq!(
+            (conn.adapter, conn.user.as_str()),
+            (Adapter::Mysql, "admin")
+        );
+        assert_eq!(conn.tls, TlsMode::Require);
+        assert_eq!(
+            conn.source.unwrap().resource,
+            "arn:aws:rds:eu-west-1:123456789012:db:b"
+        );
+    }
+
+    #[test]
+    fn unsupported_and_unfinished_databases_are_listed_but_not_usable() {
+        let oracle = instance("legacy", "oracle-ee").build();
+        let creating = DbInstance::builder()
+            .db_instance_identifier("new")
+            .engine("postgres")
+            .db_instance_status("creating")
+            .build();
+        let found = found_in_region(&[oracle, creating], &[], "", "eu-west-1");
+        assert!(!found[0].usable());
+        assert!(
+            found[0]
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("not supported yet")
+        );
+        assert!(!found[1].usable());
+        assert!(found[1].note.as_deref().unwrap().contains("creating"));
+    }
+
+    #[test]
+    fn discovery_errors_say_what_to_do() {
+        let expired = sign_in_error(
+            "prod-sso",
+            "no usable AWS credentials (the SSO token expired). If your session expired, run \
+             `aws sso login --profile prod-sso`",
+        );
+        assert_eq!(expired.kind, DiscoverErrorKind::SignIn);
+        assert!(expired.message.contains("aws sso login --profile prod-sso"));
+        assert_eq!(expired.region, None);
+
+        let no_region = sign_in_error("", "no AWS region: set one on the connection");
+        assert_eq!(no_region.kind, DiscoverErrorKind::NoRegion);
+
+        let denied = region_error(
+            "eu-west-1",
+            "prod",
+            ApiFailure {
+                code: Some("AccessDenied".into()),
+                message: "User is not authorized to perform: rds:DescribeDBInstances".into(),
+            },
+        );
+        assert_eq!(denied.kind, DiscoverErrorKind::AccessDenied);
+        assert!(denied.message.contains("rds:DescribeDBClusters"));
+        assert_eq!(denied.region.as_deref(), Some("eu-west-1"));
+
+        let expired = region_error(
+            "us-east-1",
+            "",
+            ApiFailure {
+                code: Some("ExpiredTokenException".into()),
+                message: "expired".into(),
+            },
+        );
+        assert_eq!(expired.kind, DiscoverErrorKind::SignIn);
+        assert!(expired.message.contains("`aws sso login`"));
+
+        let offline = region_error(
+            "eu-west-1",
+            "",
+            ApiFailure {
+                code: None,
+                message: "dispatch failure".into(),
+            },
+        );
+        assert_eq!(offline.kind, DiscoverErrorKind::Other);
+        assert!(offline.message.contains("dispatch failure"));
+    }
 
     /// Fixed credentials, region and clock, so a token comes out the same every time.
     fn fixed_config(region: &str) -> SdkConfig {
@@ -387,6 +936,16 @@ mod tests {
         );
         assert!(param("X-Amz-Signature").is_some_and(|s| s.len() == 64));
         assert!(!token.starts_with("https://"));
+        // What botocore's `generate_db_auth_token` (as in `aws rds generate-db-auth-token`)
+        // makes from the same credentials, endpoint and clock.
+        assert_eq!(
+            token,
+            "orders.abc123.eu-west-1.rds.amazonaws.com:5432/?Action=connect&DBUser=app_user\
+             &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIDEXAMPLE%2F20240826%2F\
+             eu-west-1%2Frds-db%2Faws4_request&X-Amz-Date=20240826T220000Z&X-Amz-Expires=900\
+             &X-Amz-SignedHeaders=host&X-Amz-Signature=\
+             d979106687899672efbbf170f18a2890b79e9467e94cd3abe996861da08e6264"
+        );
     }
 
     #[test]
