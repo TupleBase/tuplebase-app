@@ -510,3 +510,206 @@ async fn postgres_custom_types_can_be_read_on_a_fresh_connection() {
         assert_eq!(r.rows, [[json!("happy")]]);
     }
 }
+
+fn object(schema: &str, kind: ObjectKind, name: &str, detail: &str) -> ObjectInfo {
+    ObjectInfo {
+        schema: schema.into(),
+        kind,
+        name: name.into(),
+        detail: detail.into(),
+    }
+}
+
+#[tokio::test]
+async fn postgres_objects_show_their_definitions_and_calls() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Postgres));
+    let drop = [
+        "DROP VIEW IF EXISTS it_def_view",
+        "DROP TABLE IF EXISTS it_def_tbl",
+        "DROP FUNCTION IF EXISTS it_def_trg_fn()",
+        "DROP FUNCTION IF EXISTS it_def_fn(int)",
+        "DROP FUNCTION IF EXISTS it_def_fn(text)",
+        "DROP PROCEDURE IF EXISTS it_def_proc(int, text, bigint)",
+    ];
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    for sql in [
+        "CREATE TABLE it_def_tbl (id int)",
+        "CREATE VIEW it_def_view AS SELECT id FROM it_def_tbl",
+        "CREATE FUNCTION it_def_trg_fn() RETURNS trigger LANGUAGE plpgsql \
+         AS $$BEGIN RETURN NEW; END$$",
+        "CREATE TRIGGER it_def_trg BEFORE INSERT ON it_def_tbl \
+         FOR EACH ROW EXECUTE FUNCTION it_def_trg_fn()",
+        "CREATE FUNCTION it_def_fn(a int) RETURNS int LANGUAGE sql AS 'SELECT a'",
+        "CREATE FUNCTION it_def_fn(a text, OUT r text, OUT s text) LANGUAGE sql \
+         AS 'SELECT a, a'",
+        "CREATE PROCEDURE it_def_proc(IN job_id int, INOUT note text, OUT total bigint) \
+         LANGUAGE plpgsql AS $$BEGIN total := job_id; END$$",
+    ] {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let objects = db.list_objects(&conn).await.unwrap();
+    // The details are what the listing shows; they pick one of the overloads.
+    let int_fn = object("public", ObjectKind::Function, "it_def_fn", "a integer");
+    let text_fn = object(
+        "public",
+        ObjectKind::Function,
+        "it_def_fn",
+        "a text, OUT r text, OUT s text",
+    );
+    let proc = object(
+        "public",
+        ObjectKind::Procedure,
+        "it_def_proc",
+        "IN job_id integer, INOUT note text, OUT total bigint",
+    );
+    let trigger = object("public", ObjectKind::Trigger, "it_def_trg", "on it_def_tbl");
+    let view = object("public", ObjectKind::View, "it_def_view", "");
+    let results = (
+        db.object_definition(&conn, &int_fn).await,
+        db.object_definition(&conn, &text_fn).await,
+        db.object_definition(&conn, &proc).await,
+        db.object_definition(&conn, &trigger).await,
+        db.object_definition(&conn, &view).await,
+        db.call_template(&conn, &proc).await,
+        db.call_template(&conn, &text_fn).await,
+    );
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let (int_def, text_def, proc_def, trigger_def, view_def, proc_call, fn_call) = results;
+
+    assert_eq!(
+        listed(&objects, ObjectKind::Trigger, "it_def_trg").as_deref(),
+        Some("on it_def_tbl")
+    );
+    let int_def = int_def.unwrap();
+    assert!(
+        int_def.starts_with("CREATE OR REPLACE FUNCTION public.it_def_fn(a integer)"),
+        "{int_def}"
+    );
+    let text_def = text_def.unwrap();
+    assert!(text_def.contains("it_def_fn(a text"), "{text_def}");
+    let proc_def = proc_def.unwrap();
+    assert!(
+        proc_def.contains("PROCEDURE public.it_def_proc"),
+        "{proc_def}"
+    );
+    assert_eq!(
+        trigger_def.unwrap(),
+        "CREATE TRIGGER it_def_trg BEFORE INSERT ON it_def_tbl \
+         FOR EACH ROW EXECUTE FUNCTION it_def_trg_fn()"
+    );
+    let view_def = view_def.unwrap();
+    assert!(
+        view_def.starts_with("CREATE VIEW \"public\".\"it_def_view\" AS\nSELECT id"),
+        "{view_def}"
+    );
+    assert_eq!(
+        proc_call.unwrap(),
+        "CALL \"public\".\"it_def_proc\"(/* job_id integer */, /* INOUT note text */, \
+         NULL /* OUT total bigint */);"
+    );
+    assert_eq!(
+        fn_call.unwrap(),
+        "SELECT \"public\".\"it_def_fn\"(/* a text */);"
+    );
+}
+
+#[tokio::test]
+async fn postgres_definition_of_a_missing_object_is_an_error() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Postgres));
+    let gone = object("public", ObjectKind::Procedure, "it_def_nothing", "");
+    let error = db.object_definition(&conn, &gone).await.unwrap_err();
+    assert!(format!("{error:#}").contains("not found"), "{error:#}");
+    let sequence = object("public", ObjectKind::Sequence, "it_def_seq", "");
+    assert!(db.object_definition(&conn, &sequence).await.is_err());
+}
+
+#[tokio::test]
+async fn mariadb_objects_show_their_definitions_and_calls() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Mariadb));
+    let drop = [
+        "DROP VIEW IF EXISTS it_def_view",
+        "DROP TABLE IF EXISTS it_def_tbl",
+        "DROP FUNCTION IF EXISTS it_def_fn",
+        "DROP PROCEDURE IF EXISTS it_def_proc",
+        "DROP EVENT IF EXISTS it_def_evt",
+    ];
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    // One statement each: `execute_script` would split the bodies at their `;`.
+    for sql in [
+        "CREATE TABLE it_def_tbl (id INT)",
+        "CREATE VIEW it_def_view AS SELECT id FROM it_def_tbl",
+        "CREATE TRIGGER it_def_trg BEFORE INSERT ON it_def_tbl FOR EACH ROW SET NEW.id = NEW.id",
+        "CREATE FUNCTION it_def_fn(a INT) RETURNS INT DETERMINISTIC RETURN a",
+        "CREATE PROCEDURE it_def_proc(IN job_id INT, IN note VARCHAR(20), OUT total INT) \
+         SET total = job_id",
+        "CREATE EVENT it_def_evt ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+    ] {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let proc = object("app", ObjectKind::Procedure, "it_def_proc", "");
+    let function = object("app", ObjectKind::Function, "it_def_fn", "int(11)");
+    let trigger = object("app", ObjectKind::Trigger, "it_def_trg", "");
+    let event = object("app", ObjectKind::Event, "it_def_evt", "");
+    let view = object("app", ObjectKind::View, "it_def_view", "");
+    let results = (
+        db.object_definition(&conn, &proc).await,
+        db.object_definition(&conn, &function).await,
+        db.object_definition(&conn, &trigger).await,
+        db.object_definition(&conn, &event).await,
+        db.object_definition(&conn, &view).await,
+        db.call_template(&conn, &proc).await,
+        db.call_template(&conn, &function).await,
+    );
+    for sql in drop {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let (proc_def, fn_def, trigger_def, event_def, view_def, proc_call, fn_call) = results;
+
+    let proc_def = proc_def.unwrap();
+    assert!(proc_def.starts_with("CREATE"), "{proc_def}");
+    assert!(proc_def.contains("PROCEDURE `it_def_proc`"), "{proc_def}");
+    let fn_def = fn_def.unwrap();
+    assert!(fn_def.contains("FUNCTION `it_def_fn`"), "{fn_def}");
+    let trigger_def = trigger_def.unwrap();
+    assert!(
+        trigger_def.contains("TRIGGER `it_def_trg`"),
+        "{trigger_def}"
+    );
+    let event_def = event_def.unwrap();
+    assert!(event_def.contains("EVENT `it_def_evt`"), "{event_def}");
+    let view_def = view_def.unwrap();
+    assert!(view_def.contains("VIEW `it_def_view`"), "{view_def}");
+    let proc_call = proc_call.unwrap();
+    assert!(
+        proc_call.starts_with("CALL `app`.`it_def_proc`(/* job_id int"),
+        "{proc_call}"
+    );
+    assert!(proc_call.contains("/* note varchar(20)"), "{proc_call}");
+    assert!(
+        proc_call.ends_with(", @total);\nSELECT @total;"),
+        "{proc_call}"
+    );
+    let fn_call = fn_call.unwrap();
+    assert!(
+        fn_call.starts_with("SELECT `app`.`it_def_fn`(/* a int"),
+        "{fn_call}"
+    );
+}

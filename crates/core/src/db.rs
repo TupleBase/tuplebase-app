@@ -62,6 +62,9 @@ pub enum ObjectKind {
     Trigger,
     Event,
     Index,
+    /// Views are listed with the tables, never by [`Db::list_objects`]; this kind names
+    /// one for [`Db::object_definition`].
+    View,
 }
 
 impl ObjectKind {
@@ -75,6 +78,39 @@ impl ObjectKind {
             Self::Trigger => "Triggers",
             Self::Event => "Events",
             Self::Index => "Indexes",
+            Self::View => "Views",
+        }
+    }
+
+    /// Whether [`Db::object_definition`] can show the source of this kind of object.
+    pub fn has_definition(self) -> bool {
+        matches!(
+            self,
+            Self::Function
+                | Self::Procedure
+                | Self::Trigger
+                | Self::Event
+                | Self::Index
+                | Self::View
+        )
+    }
+
+    /// Functions and procedures, which [`Db::call_template`] writes a call for.
+    pub fn is_routine(self) -> bool {
+        matches!(self, Self::Function | Self::Procedure)
+    }
+
+    fn singular(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+            Self::Sequence => "sequence",
+            Self::Type => "type",
+            Self::Extension => "extension",
+            Self::Trigger => "trigger",
+            Self::Event => "event",
+            Self::Index => "index",
+            Self::View => "view",
         }
     }
 }
@@ -84,8 +120,38 @@ pub struct ObjectInfo {
     pub schema: String,
     pub kind: ObjectKind,
     pub name: String,
-    /// A short note shown beside the name, such as a function's arguments.
+    /// A short note shown beside the name, such as a function's arguments. It also tells
+    /// apart objects that share a name, such as overloaded PostgreSQL functions.
     pub detail: String,
+}
+
+/// How a routine's parameter passes its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamMode {
+    In,
+    Out,
+    InOut,
+    Variadic,
+}
+
+impl ParamMode {
+    fn parse(mode: &str) -> Self {
+        match mode.trim().to_uppercase().as_str() {
+            "OUT" => Self::Out,
+            "INOUT" => Self::InOut,
+            "VARIADIC" => Self::Variadic,
+            _ => Self::In,
+        }
+    }
+}
+
+/// One parameter of a function or procedure, as the database describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    pub mode: ParamMode,
+    /// Empty for an unnamed PostgreSQL parameter.
+    pub name: String,
+    pub data_type: String,
 }
 
 /// Each query returns schema, name and detail.
@@ -133,7 +199,52 @@ const PG_OBJECTS: &[(ObjectKind, &str)] = &[
          FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
          WHERE n.nspname NOT LIKE 'pg\\_%' ORDER BY 1, 2",
     ),
+    (
+        ObjectKind::Trigger,
+        // The detail must match PG_TRIGGER_DEF's: trigger names are unique per table only.
+        "SELECT n.nspname::text, t.tgname::text, ('on ' || c.relname)::text \
+         FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE NOT t.tgisinternal AND n.nspname NOT LIKE 'pg\\_%' \
+         AND n.nspname <> 'information_schema' ORDER BY 1, 2, 3",
+    ),
 ];
+
+/// Picks one routine: `$1` schema, `$2` name, `$3` kind (`f` or `p`), and `$4` the
+/// identity arguments the listing showed, which choose among overloads.
+const PG_ROUTINE: &str = "SELECT p.oid::bigint FROM pg_proc p \
+     JOIN pg_namespace n ON n.oid = p.pronamespace \
+     WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = $3::\"char\" \
+     ORDER BY (pg_get_function_identity_arguments(p.oid) = $4) DESC, p.oid LIMIT 1";
+
+/// `$1` schema, `$2` name, `$3` the listing's detail, `on <table>`.
+const PG_TRIGGER_DEF: &str = "SELECT pg_get_triggerdef(t.oid, true) \
+     FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND t.tgname = $2 AND NOT t.tgisinternal \
+     ORDER BY (('on ' || c.relname) = $3) DESC, t.oid LIMIT 1";
+
+const PG_VIEW_DEF: &str = "SELECT pg_get_viewdef(c.oid, true) \
+     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'";
+
+/// information_schema names a routine `<name>_<oid>`, with the name cut short when it
+/// is long, so this matches on the oid.
+const PG_PARAMETERS: &str = "SELECT COALESCE(x.parameter_mode, 'IN')::text, \
+     COALESCE(x.parameter_name, '')::text, \
+     (CASE WHEN x.data_type = 'USER-DEFINED' THEN x.udt_name \
+     WHEN x.data_type = 'ARRAY' THEN substr(x.udt_name, 2) || '[]' \
+     ELSE x.data_type END)::text \
+     FROM information_schema.parameters x \
+     WHERE x.specific_schema = $1 AND x.specific_name LIKE '%\\_' || $2::bigint::text \
+     ORDER BY x.ordinal_position";
+
+/// `ordinal_position` 0 is a function's return value.
+const MY_PARAMETERS: &str = "SELECT CAST(COALESCE(parameter_mode, 'IN') AS CHAR), \
+     CAST(COALESCE(parameter_name, '') AS CHAR), CAST(dtd_identifier AS CHAR) \
+     FROM information_schema.parameters \
+     WHERE specific_schema = ? AND specific_name = ? AND routine_type = ? \
+     AND ordinal_position > 0 ORDER BY ordinal_position";
 
 const MY_OBJECTS: &[(ObjectKind, &str)] = &[
     (
@@ -602,6 +713,138 @@ impl Db {
             .collect())
     }
 
+    /// The statement that creates `object`, such as `CREATE PROCEDURE ...`, to show in
+    /// the editor. It's only read, never run.
+    pub async fn object_definition(
+        &self,
+        conn: &Connection,
+        object: &ObjectInfo,
+    ) -> Result<String> {
+        let ObjectInfo {
+            schema,
+            kind,
+            name,
+            detail,
+        } = object;
+        let what = format!("{} {schema}.{name}", kind.singular());
+        let unsupported = || {
+            anyhow!(
+                "this database can't show the source of a {}",
+                kind.singular()
+            )
+        };
+        let quote = |ident: &str| conn.adapter.quote_ident(ident);
+        // `None`: no such object. `Some(None)`: there is one, but its source is hidden.
+        let found: Option<Option<String>> = match self.pool(conn).await? {
+            Pool::Pg(p) => match kind {
+                ObjectKind::Function | ObjectKind::Procedure => {
+                    let oid = pg_routine(&p, object).await?;
+                    sqlx::query_scalar("SELECT pg_get_functiondef($1::bigint::oid)")
+                        .bind(oid)
+                        .fetch_optional(&p)
+                        .await?
+                }
+                ObjectKind::Trigger => {
+                    sqlx::query_scalar(PG_TRIGGER_DEF)
+                        .bind(schema)
+                        .bind(name)
+                        .bind(detail)
+                        .fetch_optional(&p)
+                        .await?
+                }
+                ObjectKind::View => {
+                    let body: Option<Option<String>> = sqlx::query_scalar(PG_VIEW_DEF)
+                        .bind(schema)
+                        .bind(name)
+                        .fetch_optional(&p)
+                        .await?;
+                    body.map(|body| {
+                        body.map(|body| {
+                            let target = format!("{}.{}", quote(schema), quote(name));
+                            format!("CREATE VIEW {target} AS\n{}", body.trim_start())
+                        })
+                    })
+                }
+                _ => return Err(unsupported()),
+            },
+            Pool::My(p) => {
+                let (keyword, column) = match kind {
+                    ObjectKind::Procedure => ("PROCEDURE", "Create Procedure"),
+                    ObjectKind::Function => ("FUNCTION", "Create Function"),
+                    ObjectKind::Trigger => ("TRIGGER", "SQL Original Statement"),
+                    ObjectKind::Event => ("EVENT", "Create Event"),
+                    ObjectKind::View => ("VIEW", "Create View"),
+                    _ => return Err(unsupported()),
+                };
+                // SHOW can't take bound names, and not every SHOW CREATE can be prepared,
+                // so this goes as plain text with both names quoted.
+                let sql = format!("SHOW CREATE {keyword} {}.{}", quote(schema), quote(name));
+                let row = (&p).fetch_optional(AssertSqlSafe(sql)).await?;
+                row.map(|row| my_text_column(&row, column)).transpose()?
+            }
+            Pool::Sqlite(p) => {
+                let kind = match kind {
+                    ObjectKind::Trigger => "trigger",
+                    ObjectKind::View => "view",
+                    ObjectKind::Index => "index",
+                    _ => return Err(unsupported()),
+                };
+                sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = ? AND name = ?")
+                    .bind(kind)
+                    .bind(name)
+                    .fetch_optional(&p)
+                    .await?
+            }
+        };
+        definition_text(&what, found)
+    }
+
+    /// A call of a function or procedure to paste into the editor, with a placeholder
+    /// for each value. See [`call_sql`].
+    pub async fn call_template(&self, conn: &Connection, object: &ObjectInfo) -> Result<String> {
+        if !object.kind.is_routine() {
+            bail!("only functions and procedures can be called");
+        }
+        let rows: Vec<(String, String, String)> = match self.pool(conn).await? {
+            Pool::Pg(p) => {
+                let oid = pg_routine(&p, object).await?;
+                sqlx::query_as(PG_PARAMETERS)
+                    .bind(&object.schema)
+                    .bind(oid)
+                    .fetch_all(&p)
+                    .await?
+            }
+            Pool::My(p) => {
+                let routine_type = match object.kind {
+                    ObjectKind::Procedure => "PROCEDURE",
+                    _ => "FUNCTION",
+                };
+                sqlx::query_as(MY_PARAMETERS)
+                    .bind(&object.schema)
+                    .bind(&object.name)
+                    .bind(routine_type)
+                    .fetch_all(&p)
+                    .await?
+            }
+            Pool::Sqlite(_) => bail!("SQLite has no functions or procedures"),
+        };
+        let params: Vec<Parameter> = rows
+            .into_iter()
+            .map(|(mode, name, data_type)| Parameter {
+                mode: ParamMode::parse(&mode),
+                name,
+                data_type,
+            })
+            .collect();
+        Ok(call_sql(
+            conn.adapter,
+            object.kind,
+            &object.schema,
+            &object.name,
+            &params,
+        ))
+    }
+
     async fn pool(&self, conn: &Connection) -> Result<Pool> {
         let waiting_since = Instant::now();
         let slot = self
@@ -690,6 +933,128 @@ fn same_target(a: &Connection, b: &Connection) -> bool {
     a.folder.clone_from(&b.folder);
     a.color.clone_from(&b.color);
     a == *b
+}
+
+/// The oid of the PostgreSQL function or procedure `object` names, as a `bigint`.
+async fn pg_routine(pool: &PgPool, object: &ObjectInfo) -> Result<i64> {
+    let prokind = match object.kind {
+        ObjectKind::Procedure => "p",
+        _ => "f",
+    };
+    sqlx::query_scalar(PG_ROUTINE)
+        .bind(&object.schema)
+        .bind(&object.name)
+        .bind(prokind)
+        .bind(&object.detail)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            let kind = object.kind.singular();
+            anyhow!("{kind} {}.{} not found", object.schema, object.name)
+        })
+}
+
+/// The text of `column`, found by name in any letter case. MySQL and MariaDB name the
+/// columns of SHOW CREATE differently for each kind of object.
+fn my_text_column(row: &MySqlRow, column: &str) -> Result<Option<String>> {
+    let Some(index) = row
+        .columns()
+        .iter()
+        .position(|c| c.name().eq_ignore_ascii_case(column))
+    else {
+        let names: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+        bail!("no \"{column}\" column in {names:?}");
+    };
+    if let Ok(text) = row.try_get::<Option<String>, _>(index) {
+        return Ok(text);
+    }
+    let bytes: Option<Vec<u8>> = row.try_get_unchecked(index)?;
+    Ok(bytes.map(|b| String::from_utf8_lossy(&b).into_owned()))
+}
+
+/// What [`Db::object_definition`] found for `what`: `None` when there's no such object,
+/// `Some(None)` when there is one but the database hides its source.
+fn definition_text(what: &str, found: Option<Option<String>>) -> Result<String> {
+    match found {
+        None => bail!("{what} not found"),
+        Some(None) => bail!(
+            "the database won't show the source of {what}: this user lacks the privilege to see it"
+        ),
+        Some(Some(sql)) => Ok(sql.trim().to_owned()),
+    }
+}
+
+/// A call of a routine to paste into the editor: `CALL` for a procedure, `SELECT` for a
+/// function, with each value a comment naming the parameter and its type. Nothing here
+/// runs; the user fills the values in and presses Run.
+///
+/// Output parameters take no value. MySQL and MariaDB get a session variable for each,
+/// selected after the call. A PostgreSQL procedure takes `NULL` in their place, and a
+/// function leaves them out.
+pub fn call_sql(
+    adapter: Adapter,
+    kind: ObjectKind,
+    schema: &str,
+    name: &str,
+    params: &[Parameter],
+) -> String {
+    let my = matches!(adapter, Adapter::Mariadb | Adapter::Mysql);
+    let mut args = Vec::new();
+    let mut variables = Vec::new();
+    for (index, param) in params.iter().enumerate() {
+        let note = |mode: &str| sql_comment(&[mode, &param.name, &param.data_type]);
+        match param.mode {
+            ParamMode::Out | ParamMode::InOut if my => {
+                let variable = my_variable(&param.name, index);
+                args.push(variable.clone());
+                variables.push(variable);
+            }
+            ParamMode::Out if kind == ObjectKind::Function => {}
+            ParamMode::Out => args.push(format!("NULL {}", note("OUT"))),
+            ParamMode::InOut => args.push(note("INOUT")),
+            ParamMode::Variadic => args.push(note("VARIADIC")),
+            ParamMode::In => args.push(note("")),
+        }
+    }
+    let target = format!(
+        "{}.{}",
+        adapter.quote_ident(schema),
+        adapter.quote_ident(name)
+    );
+    let verb = match kind {
+        ObjectKind::Procedure => "CALL",
+        _ => "SELECT",
+    };
+    let call = format!("{verb} {target}({});", args.join(", "));
+    if variables.is_empty() {
+        call
+    } else {
+        format!("{call}\nSELECT {};", variables.join(", "))
+    }
+}
+
+/// `/* a b */` from the non-empty parts. Nothing in them can end the comment early.
+fn sql_comment(parts: &[&str]) -> String {
+    let text: Vec<String> = parts
+        .iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| part.trim().replace("*/", "* /"))
+        .collect();
+    format!("/* {} */", text.join(" "))
+}
+
+/// A MySQL session variable for an output parameter, named after it.
+fn my_variable(name: &str, index: usize) -> String {
+    if name.is_empty() {
+        format!("@out{}", index + 1)
+    } else if name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.'))
+    {
+        format!("@{name}")
+    } else {
+        format!("@{}", Adapter::Mysql.quote_ident(name))
+    }
 }
 
 /// Connects to `host:port`, which is the local end of the tunnel when there is one.
@@ -947,5 +1312,131 @@ mod tests {
         let _connecting = slot.lock().await;
         let open = tokio::time::timeout(Duration::from_secs(5), db.open_connections()).await;
         assert_eq!(open, Ok(HashSet::new()));
+    }
+
+    fn param(mode: ParamMode, name: &str, data_type: &str) -> Parameter {
+        Parameter {
+            mode,
+            name: name.into(),
+            data_type: data_type.into(),
+        }
+    }
+
+    #[test]
+    fn a_mysql_procedure_call_has_a_placeholder_per_value_and_variables_for_outputs() {
+        let params = [
+            param(ParamMode::In, "job_id", "int"),
+            param(ParamMode::In, "note", "varchar(200)"),
+            param(ParamMode::Out, "total", "int"),
+            param(ParamMode::InOut, "my count", "int"),
+        ];
+        for adapter in [Adapter::Mariadb, Adapter::Mysql] {
+            assert_eq!(
+                call_sql(adapter, ObjectKind::Procedure, "shop", "start_job", &params),
+                "CALL `shop`.`start_job`(/* job_id int */, /* note varchar(200) */, @total, \
+                 @`my count`);\nSELECT @total, @`my count`;"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mysql_function_is_selected() {
+        let params = [param(ParamMode::In, "a", "int(11)")];
+        assert_eq!(
+            call_sql(Adapter::Mariadb, ObjectKind::Function, "app", "f", &params),
+            "SELECT `app`.`f`(/* a int(11) */);"
+        );
+    }
+
+    #[test]
+    fn a_postgres_procedure_passes_null_for_outputs() {
+        let params = [
+            param(ParamMode::In, "job_id", "integer"),
+            param(ParamMode::InOut, "note", "text"),
+            param(ParamMode::Out, "total", "bigint"),
+        ];
+        assert_eq!(
+            call_sql(
+                Adapter::Postgres,
+                ObjectKind::Procedure,
+                "public",
+                "start_job",
+                &params
+            ),
+            "CALL \"public\".\"start_job\"(/* job_id integer */, /* INOUT note text */, \
+             NULL /* OUT total bigint */);"
+        );
+    }
+
+    #[test]
+    fn a_postgres_function_leaves_outputs_out() {
+        let params = [
+            param(ParamMode::In, "", "integer"),
+            param(ParamMode::Variadic, "rest", "text[]"),
+            param(ParamMode::Out, "result", "integer"),
+        ];
+        assert_eq!(
+            call_sql(
+                Adapter::Postgres,
+                ObjectKind::Function,
+                "public",
+                "f",
+                &params
+            ),
+            "SELECT \"public\".\"f\"(/* integer */, /* VARIADIC rest text[] */);"
+        );
+    }
+
+    #[test]
+    fn a_routine_without_parameters_gets_empty_parentheses() {
+        assert_eq!(
+            call_sql(Adapter::Postgres, ObjectKind::Procedure, "s", "p", &[]),
+            "CALL \"s\".\"p\"();"
+        );
+    }
+
+    #[test]
+    fn names_cannot_end_a_placeholder_early_or_break_quoting() {
+        let params = [param(ParamMode::In, "a*/b", "int")];
+        assert_eq!(
+            call_sql(Adapter::Mysql, ObjectKind::Procedure, "s`x", "p", &params),
+            "CALL `s``x`.`p`(/* a* /b int */);"
+        );
+        let unnamed = [param(ParamMode::Out, "", "int")];
+        assert_eq!(
+            call_sql(Adapter::Mysql, ObjectKind::Procedure, "s", "p", &unnamed),
+            "CALL `s`.`p`(@out1);\nSELECT @out1;"
+        );
+    }
+
+    #[test]
+    fn parameter_modes_are_read_in_any_case() {
+        assert_eq!(ParamMode::parse("inout"), ParamMode::InOut);
+        assert_eq!(ParamMode::parse("OUT"), ParamMode::Out);
+        assert_eq!(ParamMode::parse("VARIADIC"), ParamMode::Variadic);
+        assert_eq!(ParamMode::parse(""), ParamMode::In);
+    }
+
+    #[test]
+    fn a_hidden_source_says_why() {
+        let what = "procedure shop.start_job";
+        let hidden = definition_text(what, Some(None)).unwrap_err().to_string();
+        assert!(hidden.contains("privilege"), "{hidden}");
+        assert!(hidden.contains(what), "{hidden}");
+        let missing = definition_text(what, None).unwrap_err().to_string();
+        assert!(missing.contains("not found"), "{missing}");
+        let found = definition_text(what, Some(Some("CREATE x\n".into()))).unwrap();
+        assert_eq!(found, "CREATE x");
+    }
+
+    #[test]
+    fn only_kinds_with_a_source_have_a_definition() {
+        assert!(ObjectKind::Procedure.has_definition());
+        assert!(ObjectKind::View.has_definition());
+        assert!(!ObjectKind::Sequence.has_definition());
+        assert!(!ObjectKind::Type.has_definition());
+        assert!(!ObjectKind::Extension.has_definition());
+        assert!(ObjectKind::Function.is_routine());
+        assert!(!ObjectKind::Trigger.is_routine());
     }
 }
