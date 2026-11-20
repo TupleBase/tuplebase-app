@@ -1140,10 +1140,13 @@ impl Workspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, target) = (this.clone(), name.clone());
             alert
-                .title(format!("Delete “{name}”?"))
-                .description("Its saved password is removed from the keychain.")
+                .title(format!("Delete the connection “{name}”?"))
+                .description(
+                    "Only the saved connection and its password in the keychain are removed. \
+                     The database and its data are not touched.",
+                )
                 .confirm()
-                .ok_text("Delete")
+                .ok_text("Delete connection")
                 .ok_variant(ButtonVariant::Danger)
                 .on_ok(move |_, _, cx| {
                     this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
@@ -2087,13 +2090,15 @@ impl Workspace {
                 menu
             };
             menu.item(
-                PopupMenuItem::new("Edit").on_click(menu_click(&this, move |this, window, cx| {
-                    this.edit_connection(edited.clone(), window, cx)
-                })),
+                PopupMenuItem::new("Edit connection")
+                    .on_click(menu_click(&this, move |this, window, cx| {
+                        this.edit_connection(edited.clone(), window, cx)
+                    })),
             )
             .separator()
             .item(
-                PopupMenuItem::new("Delete")
+                // "connection", so it's never mistaken for dropping the database.
+                PopupMenuItem::new("Delete connection")
                     .on_click(menu_click(&this, move |this, window, cx| {
                         this.confirm_delete(name.clone(), window, cx)
                     })),
@@ -2131,14 +2136,14 @@ impl Workspace {
                 )),
             )
             .separator()
-            .item(PopupMenuItem::new("Rename").on_click(menu_click(
+            .item(PopupMenuItem::new("Rename folder").on_click(menu_click(
                 &this,
                 move |this, window, cx| {
                     this.begin_folder_edit(String::new(), Some(rename.clone()), window, cx);
                 },
             )))
             .item(
-                PopupMenuItem::new("Delete")
+                PopupMenuItem::new("Delete folder")
                     .on_click(menu_click(&this, move |this, window, cx| {
                         this.confirm_remove_folder(remove.clone(), window, cx)
                     })),
