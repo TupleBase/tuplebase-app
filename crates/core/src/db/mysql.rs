@@ -78,6 +78,50 @@ const PARAMETERS: &str = "SELECT CAST(COALESCE(parameter_mode, 'IN') AS CHAR), \
      WHERE specific_schema = ? AND specific_name = ? AND routine_type = ? \
      AND ordinal_position > 0 ORDER BY ordinal_position";
 
+pub(super) async fn column_names(pool: &MySqlPool) -> Result<Vec<(String,)>> {
+    Ok(sqlx::query_as(
+        "SELECT DISTINCT CAST(column_name AS CHAR) FROM information_schema.columns \
+         WHERE table_schema NOT IN \
+         ('mysql', 'information_schema', 'performance_schema', 'sys') \
+         ORDER BY 1 LIMIT 5000",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Schema, name and `table_type` of every table and view.
+pub(super) async fn tables(pool: &MySqlPool) -> Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT CAST(table_schema AS CHAR), CAST(table_name AS CHAR), \
+         CAST(table_type AS CHAR) FROM information_schema.tables \
+         WHERE table_schema NOT IN \
+         ('mysql', 'information_schema', 'performance_schema', 'sys') \
+         ORDER BY 1, 2",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Name, type and `YES` or `NO` for nullable, of each column. `schema` defaults to
+/// `database`, the connection's, or else the server's current database.
+pub(super) async fn columns(
+    pool: &MySqlPool,
+    schema: Option<&str>,
+    database: &str,
+    table: &str,
+) -> Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT CAST(column_name AS CHAR), CAST(column_type AS CHAR), \
+         CAST(is_nullable AS CHAR) FROM information_schema.columns \
+         WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ? \
+         ORDER BY ordinal_position",
+    )
+    .bind(schema.or((!database.is_empty()).then_some(database)))
+    .bind(table)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub(super) async fn list_objects(pool: &MySqlPool) -> Vec<ObjectInfo> {
     let mut found = Vec::new();
     for &(kind, sql) in OBJECTS {

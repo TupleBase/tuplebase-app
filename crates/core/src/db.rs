@@ -486,72 +486,19 @@ impl Db {
 
     /// Column names across the connection's tables, for autocomplete.
     pub async fn list_column_names(&self, conn: &Connection) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                sqlx::query_as(
-                    "SELECT DISTINCT column_name::text FROM information_schema.columns \
-                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                     ORDER BY 1 LIMIT 5000",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::My(p) => {
-                sqlx::query_as(
-                    "SELECT DISTINCT CAST(column_name AS CHAR) FROM information_schema.columns \
-                     WHERE table_schema NOT IN \
-                     ('mysql', 'information_schema', 'performance_schema', 'sys') \
-                     ORDER BY 1 LIMIT 5000",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::Sqlite(p) => {
-                sqlx::query_as(
-                    "SELECT DISTINCT p.name FROM sqlite_master m \
-                     JOIN pragma_table_info(m.name) p \
-                     WHERE m.type IN ('table', 'view') ORDER BY 1 LIMIT 5000",
-                )
-                .fetch_all(&p)
-                .await?
-            }
+        let rows = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::column_names(&p).await?,
+            Pool::My(p) => mysql::column_names(&p).await?,
+            Pool::Sqlite(p) => sqlite::column_names(&p).await?,
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
     pub async fn list_tables(&self, conn: &Connection) -> Result<Vec<TableInfo>> {
-        let rows: Vec<(String, String, String)> = match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                sqlx::query_as(
-                    "SELECT table_schema::text, table_name::text, table_type::text \
-                     FROM information_schema.tables \
-                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                     ORDER BY 1, 2",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::My(p) => {
-                sqlx::query_as(
-                    "SELECT CAST(table_schema AS CHAR), CAST(table_name AS CHAR), \
-                     CAST(table_type AS CHAR) FROM information_schema.tables \
-                     WHERE table_schema NOT IN \
-                     ('mysql', 'information_schema', 'performance_schema', 'sys') \
-                     ORDER BY 1, 2",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::Sqlite(p) => {
-                sqlx::query_as(
-                    "SELECT 'main', name, \
-                     CASE type WHEN 'view' THEN 'VIEW' ELSE 'BASE TABLE' END \
-                     FROM sqlite_master \
-                     WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                )
-                .fetch_all(&p)
-                .await?
-            }
+        let rows = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::tables(&p).await?,
+            Pool::My(p) => mysql::tables(&p).await?,
+            Pool::Sqlite(p) => sqlite::tables(&p).await?,
         };
         Ok(rows
             .into_iter()
@@ -577,44 +524,10 @@ impl Db {
         schema: Option<&str>,
         table: &str,
     ) -> Result<Vec<ColumnInfo>> {
-        let rows: Vec<(String, String, String)> = match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                sqlx::query_as(
-                    "SELECT column_name::text, data_type::text, is_nullable::text \
-                     FROM information_schema.columns \
-                     WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-                )
-                .bind(schema.unwrap_or("public"))
-                .bind(table)
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::My(p) => {
-                sqlx::query_as(
-                    "SELECT CAST(column_name AS CHAR), CAST(column_type AS CHAR), \
-                     CAST(is_nullable AS CHAR) FROM information_schema.columns \
-                     WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ? \
-                     ORDER BY ordinal_position",
-                )
-                .bind(schema.or((!conn.database.is_empty()).then_some(conn.database.as_str())))
-                .bind(table)
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::Sqlite(p) => {
-                let columns: Vec<(String, String, i64)> =
-                    sqlx::query_as("SELECT name, type, \"notnull\" FROM pragma_table_info(?)")
-                        .bind(table)
-                        .fetch_all(&p)
-                        .await?;
-                columns
-                    .into_iter()
-                    .map(|(name, data_type, not_null)| {
-                        let nullable = if not_null == 0 { "YES" } else { "NO" };
-                        (name, data_type, nullable.to_owned())
-                    })
-                    .collect()
-            }
+        let rows = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::columns(&p, schema, table).await?,
+            Pool::My(p) => mysql::columns(&p, schema, &conn.database, table).await?,
+            Pool::Sqlite(p) => sqlite::columns(&p, table).await?,
         };
         if rows.is_empty() {
             bail!("table \"{table}\" not found");

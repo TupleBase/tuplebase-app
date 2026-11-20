@@ -23,6 +23,49 @@ const OBJECTS: &[(ObjectKind, &str)] = &[
     ),
 ];
 
+pub(super) async fn column_names(pool: &SqlitePool) -> Result<Vec<(String,)>> {
+    Ok(sqlx::query_as(
+        "SELECT DISTINCT p.name FROM sqlite_master m \
+         JOIN pragma_table_info(m.name) p \
+         WHERE m.type IN ('table', 'view') ORDER BY 1 LIMIT 5000",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Schema (always `main`), name and `table_type` of every table and view, named as
+/// `information_schema` would.
+pub(super) async fn tables(pool: &SqlitePool) -> Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT 'main', name, \
+         CASE type WHEN 'view' THEN 'VIEW' ELSE 'BASE TABLE' END \
+         FROM sqlite_master \
+         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Name, type and `YES` or `NO` for nullable, of each column. SQLite has one schema per
+/// file, so there's none to choose.
+pub(super) async fn columns(
+    pool: &SqlitePool,
+    table: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let columns: Vec<(String, String, i64)> =
+        sqlx::query_as("SELECT name, type, \"notnull\" FROM pragma_table_info(?)")
+            .bind(table)
+            .fetch_all(pool)
+            .await?;
+    Ok(columns
+        .into_iter()
+        .map(|(name, data_type, not_null)| {
+            let nullable = if not_null == 0 { "YES" } else { "NO" };
+            (name, data_type, nullable.to_owned())
+        })
+        .collect())
+}
+
 pub(super) async fn list_objects(pool: &SqlitePool) -> Vec<ObjectInfo> {
     let mut found = Vec::new();
     for &(kind, sql) in OBJECTS {

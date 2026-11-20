@@ -99,6 +99,46 @@ const PARAMETERS: &str = "SELECT COALESCE(x.parameter_mode, 'IN')::text, \
      WHERE x.specific_schema = $1 AND x.specific_name LIKE '%\\_' || $2::bigint::text \
      ORDER BY x.ordinal_position";
 
+pub(super) async fn column_names(pool: &PgPool) -> Result<Vec<(String,)>> {
+    Ok(sqlx::query_as(
+        "SELECT DISTINCT column_name::text FROM information_schema.columns \
+         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY 1 LIMIT 5000",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Schema, name and `table_type` of every table and view.
+pub(super) async fn tables(pool: &PgPool) -> Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT table_schema::text, table_name::text, table_type::text \
+         FROM information_schema.tables \
+         WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
+         ORDER BY 1, 2",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Name, type and `YES` or `NO` for nullable, of each column; `schema` defaults to
+/// `public`.
+pub(super) async fn columns(
+    pool: &PgPool,
+    schema: Option<&str>,
+    table: &str,
+) -> Result<Vec<(String, String, String)>> {
+    Ok(sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_nullable::text \
+         FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+    )
+    .bind(schema.unwrap_or("public"))
+    .bind(table)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub(super) async fn list_objects(pool: &PgPool) -> Vec<ObjectInfo> {
     let mut found = Vec::new();
     for &(kind, sql) in OBJECTS {
