@@ -8,7 +8,7 @@
 
 use serde_json::json;
 use tuplebase_core::aws;
-use tuplebase_core::config::{self, Adapter, AwsAuth, AwsStore, Config, Connection, TlsMode};
+use tuplebase_core::config::{self, Adapter, Auth, AwsSecretRef, Config, Connection, TlsMode};
 
 const FOLDER: &str = "Local test databases";
 const AWS_REGION: &str = "eu-west-1";
@@ -27,7 +27,8 @@ fn connection(name: &str, adapter: Adapter, port: u16, user: &str) -> Connection
         color: String::new(),
         tls: TlsMode::default(),
         ssh: None,
-        auth: None,
+        auth: Default::default(),
+        source: None,
     }
 }
 
@@ -36,8 +37,7 @@ fn aws_connection() -> Connection {
     Connection {
         host: String::new(),
         database: String::new(),
-        auth: Some(AwsAuth {
-            store: AwsStore::SecretsManager,
+        auth: Auth::AwsSecret(AwsSecretRef {
             profile: String::new(),
             region: AWS_REGION.into(),
             name: AWS_SECRET.into(),

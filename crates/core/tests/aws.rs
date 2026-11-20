@@ -6,7 +6,7 @@ use std::sync::Once;
 use aws_sdk_ssm::types::ParameterType;
 use serde_json::json;
 use tuplebase_core::aws;
-use tuplebase_core::config::{Adapter, AwsAuth, AwsStore, Connection};
+use tuplebase_core::config::{Adapter, Auth, AwsSecretRef, AwsStore, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
 
 const READ: ExecOptions = ExecOptions {
@@ -62,6 +62,12 @@ async fn put_parameter(name: &str, value: &str) {
 
 /// A MariaDB connection that says nothing itself: no host, user or stored password.
 fn connection(name: &str, store: AwsStore, secret: &str) -> Connection {
+    let secret = AwsSecretRef {
+        profile: String::new(),
+        region: "eu-west-1".into(),
+        name: secret.into(),
+        use_secret_host: true,
+    };
     Connection {
         name: name.into(),
         folder: String::new(),
@@ -74,13 +80,11 @@ fn connection(name: &str, store: AwsStore, secret: &str) -> Connection {
         color: String::new(),
         tls: Default::default(),
         ssh: None,
-        auth: Some(AwsAuth {
-            store,
-            profile: String::new(),
-            region: "eu-west-1".into(),
-            name: secret.into(),
-            use_secret_host: true,
-        }),
+        auth: match store {
+            AwsStore::SecretsManager => Auth::AwsSecret(secret),
+            AwsStore::ParameterStore => Auth::AwsParameter(secret),
+        },
+        source: None,
     }
 }
 
@@ -130,7 +134,9 @@ async fn a_parameter_works_as_json_or_as_the_password_alone() {
         AwsStore::ParameterStore,
         "/it/maria/password",
     );
-    conn.auth.as_mut().unwrap().use_secret_host = false;
+    if let Auth::AwsParameter(parameter) = &mut conn.auth {
+        parameter.use_secret_host = false;
+    }
     conn.host = "127.0.0.1".into();
     conn.port = 53306;
     conn.database = "app".into();

@@ -153,17 +153,13 @@ fn default_ssh_port() -> u16 {
 }
 
 /// The AWS service that holds a connection's credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AwsStore {
-    #[serde(rename = "aws_secret")]
     SecretsManager,
-    #[serde(rename = "aws_parameter")]
     ParameterStore,
 }
 
 impl AwsStore {
-    pub const ALL: [AwsStore; 2] = [AwsStore::SecretsManager, AwsStore::ParameterStore];
-
     pub fn label(self) -> &'static str {
         match self {
             AwsStore::SecretsManager => "AWS Secrets Manager",
@@ -172,12 +168,10 @@ impl AwsStore {
     }
 }
 
-/// Take the credentials from AWS on every connect, instead of the OS credential store.
-/// Only this pointer is saved; see [`crate::aws`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AwsAuth {
-    #[serde(rename = "type")]
-    pub store: AwsStore,
+/// Where in AWS a secret or parameter is. Only this pointer is saved; the value is read
+/// on every connect (see [`crate::aws`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsSecretRef {
     /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub profile: String,
@@ -189,6 +183,110 @@ pub struct AwsAuth {
     /// Also take the host, port and database from the secret.
     #[serde(default)]
     pub use_secret_host: bool,
+}
+
+/// Sign in to the database with a short-lived RDS IAM token made from an AWS profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsIamAuth {
+    /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    /// The database's region. Empty means the one in its `*.rds.amazonaws.com` host
+    /// name, or else the profile's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region: String,
+}
+
+/// Where a connection's password comes from. Saved as `auth`, tagged by `type`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Auth {
+    /// The OS credential store (see [`crate::secrets`]). Not written to the file.
+    #[default]
+    Password,
+    /// A secret in AWS Secrets Manager.
+    AwsSecret(AwsSecretRef),
+    /// A parameter in AWS Systems Manager Parameter Store.
+    AwsParameter(AwsSecretRef),
+    /// An RDS IAM auth token for the connection's user, made on every connect.
+    AwsIam(AwsIamAuth),
+}
+
+impl Auth {
+    pub fn is_password(&self) -> bool {
+        *self == Auth::Password
+    }
+
+    pub fn kind(&self) -> AuthKind {
+        match self {
+            Auth::Password => AuthKind::Password,
+            Auth::AwsSecret(_) => AuthKind::AwsSecret,
+            Auth::AwsParameter(_) => AuthKind::AwsParameter,
+            Auth::AwsIam(_) => AuthKind::AwsIam,
+        }
+    }
+
+    /// The secret or parameter it reads, and the store that holds it.
+    pub fn secret(&self) -> Option<(AwsStore, &AwsSecretRef)> {
+        match self {
+            Auth::AwsSecret(secret) => Some((AwsStore::SecretsManager, secret)),
+            Auth::AwsParameter(parameter) => Some((AwsStore::ParameterStore, parameter)),
+            Auth::Password | Auth::AwsIam(_) => None,
+        }
+    }
+
+    /// The AWS profile and region it uses, if it uses AWS.
+    pub fn aws_profile(&self) -> Option<(&str, &str)> {
+        match self {
+            Auth::AwsSecret(r) | Auth::AwsParameter(r) => Some((&r.profile, &r.region)),
+            Auth::AwsIam(iam) => Some((&iam.profile, &iam.region)),
+            Auth::Password => None,
+        }
+    }
+}
+
+/// The choices the connection form offers, one per [`Auth`] variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    Password,
+    AwsSecret,
+    AwsParameter,
+    AwsIam,
+}
+
+impl AuthKind {
+    pub const ALL: [AuthKind; 4] = [
+        AuthKind::Password,
+        AuthKind::AwsSecret,
+        AuthKind::AwsParameter,
+        AuthKind::AwsIam,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthKind::Password => "Password",
+            AuthKind::AwsSecret => "Secrets Manager",
+            AuthKind::AwsParameter => "Parameter Store",
+            AuthKind::AwsIam => "IAM token",
+        }
+    }
+}
+
+/// The cloud a connection was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Aws,
+}
+
+/// Where a connection was discovered, so it can be found there again. Never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Source {
+    pub provider: Provider,
+    /// The resource's identifier there, such as an RDS ARN.
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,9 +312,12 @@ pub struct Connection {
     pub tls: TlsMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
-    /// `None` means a password from the OS credential store.
+    /// Where the password comes from. Left out of the file for the OS credential store.
+    #[serde(default, skip_serializing_if = "Auth::is_password")]
+    pub auth: Auth,
+    /// Where the connection was discovered, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AwsAuth>,
+    pub source: Option<Source>,
 }
 
 impl Connection {
@@ -229,8 +330,8 @@ impl Connection {
                 || self.database.clone(),
                 |n| n.to_string_lossy().into_owned(),
             )
-        } else if let Some(auth) = self.auth.as_ref().filter(|a| a.use_secret_host) {
-            auth.name.clone()
+        } else if let Some((_, secret)) = self.auth.secret().filter(|(_, s)| s.use_secret_host) {
+            secret.name.clone()
         } else {
             self.host.clone()
         }
@@ -247,18 +348,18 @@ impl Connection {
             if self.ssh.is_some() {
                 bail!("SSH tunnels don't apply to database files");
             }
-            if self.auth.is_some() {
+            if !self.auth.is_password() {
                 bail!("AWS credentials don't apply to database files");
             }
-        } else if let Some(auth) = &self.auth {
+        } else if let Some((_, secret)) = self.auth.secret() {
             // The user can come from the secret, and so can the host.
-            if auth.name.trim().is_empty() {
+            if secret.name.trim().is_empty() {
                 bail!(
                     "a secret or parameter name is required for \"{}\"",
                     self.name
                 );
             }
-            if !auth.use_secret_host && self.host.trim().is_empty() {
+            if !secret.use_secret_host && self.host.trim().is_empty() {
                 bail!("host is required for \"{}\"", self.name);
             }
         } else {
@@ -267,6 +368,14 @@ impl Connection {
             }
             if self.user.trim().is_empty() {
                 bail!("user is required for \"{}\"", self.name);
+            }
+            // RDS refuses IAM tokens over a connection that isn't encrypted.
+            if matches!(self.auth, Auth::AwsIam(_)) && self.tls == TlsMode::Prefer {
+                bail!(
+                    "an IAM token needs an encrypted connection: set Encryption to Required \
+                     or Verified for \"{}\"",
+                    self.name
+                );
             }
         }
         let color_is_valid = self.color.is_empty()
@@ -313,6 +422,10 @@ impl FolderNode<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    /// The file format: [`VERSION_IAM`] once a connection uses an IAM token, which older
+    /// versions of the app can't read, so that they refuse the file instead of failing to
+    /// parse it; otherwise [`VERSION_BASE`]. Kept up to date by [`Config::upsert`] and
+    /// [`Config::remove`].
     pub version: u32,
     /// Sidebar folder paths, so that empty folders are kept.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -357,6 +470,11 @@ impl Appearance {
     }
 }
 
+/// The file format every version of the app reads.
+pub const VERSION_BASE: u32 = 1;
+/// The file format of a config with an IAM token connection.
+pub const VERSION_IAM: u32 = 2;
+
 pub const DEFAULT_FONT_SIZE: u8 = 15;
 /// The smallest and largest text the app offers.
 pub const FONT_SIZES: RangeInclusive<u8> = 10..=28;
@@ -372,7 +490,7 @@ fn default_font_size() -> u8 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: VERSION_BASE,
             folders: Vec::new(),
             connections: Vec::new(),
             check_for_updates: true,
@@ -426,15 +544,27 @@ impl Config {
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut config: Config =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        if config.version != 1 {
+        if !(VERSION_BASE..=VERSION_IAM).contains(&config.version) {
             bail!("unsupported config version {}", config.version);
         }
         config.resize_font(0);
+        config.sync_version();
         Ok(config)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &serde_json::to_string_pretty(self)?)
+        let mut config = self.clone();
+        config.sync_version();
+        write_atomic(path, &serde_json::to_string_pretty(&config)?)
+    }
+
+    /// Sets the oldest file format that holds every connection.
+    fn sync_version(&mut self) {
+        let iam = self
+            .connections
+            .iter()
+            .any(|c| matches!(c.auth, Auth::AwsIam(_)));
+        self.version = if iam { VERSION_IAM } else { VERSION_BASE };
     }
 
     /// Makes the app's text `steps` pixels larger, or smaller for a negative number,
@@ -594,12 +724,14 @@ impl Config {
             Some(i) => self.connections[i] = conn,
             None => self.connections.push(conn),
         }
+        self.sync_version();
         Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.connections.len();
         self.connections.retain(|c| c.name != name);
+        self.sync_version();
         self.connections.len() != before
     }
 }
@@ -621,7 +753,8 @@ mod tests {
             color: String::new(),
             tls: TlsMode::default(),
             ssh: None,
-            auth: None,
+            auth: Auth::Password,
+            source: None,
         }
     }
 
@@ -710,20 +843,30 @@ mod tests {
         assert!(!json.contains("tls") && !json.contains("ssh") && !json.contains("auth"));
     }
 
-    fn aws(name: &str) -> AwsAuth {
-        AwsAuth {
-            store: AwsStore::SecretsManager,
+    fn aws(name: &str) -> Auth {
+        Auth::AwsSecret(AwsSecretRef {
             profile: "prod-sso".into(),
             region: String::new(),
             name: name.into(),
             use_secret_host: false,
+        })
+    }
+
+    fn iam(name: &str) -> Connection {
+        Connection {
+            tls: TlsMode::Require,
+            auth: Auth::AwsIam(AwsIamAuth {
+                profile: "prod-sso".into(),
+                region: "eu-west-1".into(),
+            }),
+            ..pg(name)
         }
     }
 
     #[test]
     fn aws_auth_is_saved_as_a_pointer() {
         let mut conn = pg("a");
-        conn.auth = Some(aws("prod/orders"));
+        conn.auth = aws("prod/orders");
         let json = serde_json::to_value(&conn).unwrap();
         assert_eq!(
             json["auth"],
@@ -741,22 +884,218 @@ mod tests {
     fn aws_auth_needs_a_name_and_can_supply_the_user_and_host() {
         let mut config = Config::default();
         let mut conn = pg("a");
-        conn.auth = Some(aws(""));
+        conn.auth = aws("");
         assert!(config.upsert(conn.clone(), None).is_err());
 
-        conn.auth = Some(aws("prod/orders"));
+        conn.auth = aws("prod/orders");
         conn.user.clear();
         assert!(config.upsert(conn.clone(), None).is_ok());
 
         conn.host.clear();
         assert!(config.upsert(conn.clone(), Some("a")).is_err());
-        conn.auth.as_mut().unwrap().use_secret_host = true;
+        let Auth::AwsSecret(secret) = &mut conn.auth else {
+            unreachable!()
+        };
+        secret.use_secret_host = true;
         assert!(config.upsert(conn.clone(), Some("a")).is_ok());
         assert_eq!(conn.location(), "prod/orders");
 
         let mut file = sqlite("/data/app.sqlite");
-        file.auth = Some(aws("prod/orders"));
+        file.auth = aws("prod/orders");
         assert!(config.upsert(file, None).is_err());
+    }
+
+    /// A config written before IAM tokens existed, as the app wrote it.
+    const V1_FILE: &str = r#"{
+  "version": 1,
+  "folders": [
+    "Prod"
+  ],
+  "connections": [
+    {
+      "name": "plain",
+      "folder": "Prod",
+      "adapter": "postgres",
+      "host": "db.example.com",
+      "port": 5432,
+      "database": "app",
+      "user": "dev",
+      "readonly": false
+    },
+    {
+      "name": "secret",
+      "adapter": "mariadb",
+      "host": "",
+      "port": 3306,
+      "user": "",
+      "readonly": true,
+      "tls": "require",
+      "auth": {
+        "type": "aws_secret",
+        "profile": "prod-sso",
+        "region": "eu-west-1",
+        "name": "prod/orders-db",
+        "use_secret_host": true
+      }
+    },
+    {
+      "name": "parameter",
+      "adapter": "mysql",
+      "host": "10.0.0.5",
+      "port": 3306,
+      "user": "app",
+      "readonly": false,
+      "auth": {
+        "type": "aws_parameter",
+        "name": "/prod/password",
+        "use_secret_host": false
+      }
+    }
+  ],
+  "check_for_updates": true,
+  "font_size": 15
+}"#;
+
+    #[test]
+    fn a_version_1_file_loads_and_saves_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, format!("{V1_FILE}\n")).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.version, VERSION_BASE);
+        assert!(config.connections[0].auth.is_password());
+        assert_eq!(
+            config.connections[1].auth,
+            Auth::AwsSecret(AwsSecretRef {
+                profile: "prod-sso".into(),
+                region: "eu-west-1".into(),
+                name: "prod/orders-db".into(),
+                use_secret_host: true,
+            })
+        );
+        assert_eq!(
+            config.connections[2]
+                .auth
+                .secret()
+                .map(|(store, s)| (store, &*s.name)),
+            Some((AwsStore::ParameterStore, "/prod/password"))
+        );
+        config.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{V1_FILE}\n"));
+    }
+
+    #[test]
+    fn an_iam_connection_raises_the_version_and_removing_it_lowers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let mut config = Config::default();
+        config.upsert(pg("plain"), None).unwrap();
+        config.save_to(&path).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""version": 1"#)
+        );
+
+        config.upsert(iam("iam"), None).unwrap();
+        assert_eq!(config.version, VERSION_IAM);
+        config.save_to(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""version": 2"#), "{text}");
+        assert_eq!(Config::load_from(&path).unwrap(), config);
+
+        config.remove("iam");
+        assert_eq!(config.version, VERSION_BASE);
+        config.save_to(&path).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""version": 1"#)
+        );
+    }
+
+    #[test]
+    fn unknown_versions_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, r#"{ "version": 3 }"#).unwrap();
+        let error = Config::load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported config version 3"), "{error}");
+        fs::write(&path, r#"{ "version": 2 }"#).unwrap();
+        assert!(Config::load_from(&path).is_ok());
+    }
+
+    #[test]
+    fn each_auth_is_saved_with_its_type() {
+        let cases = [
+            (Auth::Password, None),
+            (
+                aws("s"),
+                Some(
+                    r#"{"type":"aws_secret","profile":"prod-sso","name":"s","use_secret_host":false}"#,
+                ),
+            ),
+            (
+                Auth::AwsParameter(AwsSecretRef {
+                    name: "/p".into(),
+                    ..Default::default()
+                }),
+                Some(r#"{"type":"aws_parameter","name":"/p","use_secret_host":false}"#),
+            ),
+            (
+                Auth::AwsIam(AwsIamAuth::default()),
+                Some(r#"{"type":"aws_iam"}"#),
+            ),
+        ];
+        for (auth, expected) in cases {
+            let conn = Connection {
+                auth: auth.clone(),
+                ..pg("a")
+            };
+            let json = serde_json::to_value(&conn).unwrap();
+            let written = json.get("auth").map(|a| a.to_string());
+            assert_eq!(written.as_deref(), expected);
+            let back: Connection = serde_json::from_value(json).unwrap();
+            assert_eq!(back.auth, auth);
+        }
+    }
+
+    #[test]
+    fn a_source_is_saved_without_secrets() {
+        let conn = Connection {
+            source: Some(Source {
+                provider: Provider::Aws,
+                resource: "arn:aws:rds:eu-west-1:123456789012:db:orders".into(),
+                region: "eu-west-1".into(),
+            }),
+            ..pg("a")
+        };
+        let json = serde_json::to_value(&conn).unwrap();
+        assert_eq!(
+            json["source"],
+            serde_json::json!({
+                "provider": "aws",
+                "resource": "arn:aws:rds:eu-west-1:123456789012:db:orders",
+                "region": "eu-west-1",
+            })
+        );
+        assert_eq!(serde_json::from_value::<Connection>(json).unwrap(), conn);
+    }
+
+    #[test]
+    fn an_iam_token_needs_a_user_a_host_and_encryption() {
+        let mut config = Config::default();
+        let mut conn = iam("a");
+        conn.tls = TlsMode::Prefer;
+        let error = config.upsert(conn.clone(), None).unwrap_err().to_string();
+        assert!(error.contains("encrypted"), "{error}");
+        conn.tls = TlsMode::Verify;
+        assert!(config.upsert(conn.clone(), None).is_ok());
+        conn.user.clear();
+        assert!(config.upsert(conn.clone(), Some("a")).is_err());
+        conn.user = "dev".into();
+        conn.host.clear();
+        assert!(config.upsert(conn, Some("a")).is_err());
     }
 
     #[test]

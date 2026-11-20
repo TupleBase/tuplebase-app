@@ -1,4 +1,5 @@
-//! Credentials kept in AWS: Secrets Manager secrets and SSM Parameter Store parameters.
+//! Everything that talks to AWS: credentials kept in Secrets Manager and SSM Parameter
+//! Store, RDS IAM auth tokens and the profiles on this machine.
 //!
 //! A connection saves only where the secret is (profile, region, name). The value is
 //! read on every connect and never written to disk or the OS credential store, so a
@@ -15,7 +16,7 @@ use aws_types::os_shim_internal::{Env, Fs};
 use serde_json::Value;
 use tokio::time::timeout;
 
-use crate::config::{AwsAuth, AwsStore, Connection};
+use crate::config::{AwsSecretRef, AwsStore, Connection};
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -90,27 +91,30 @@ impl Secret {
     }
 }
 
-/// Reads the secret `auth` points at. Returns the connection to open, with the user
-/// (and host, if asked) filled in from the secret, and its password.
-pub async fn resolve(conn: &Connection, auth: &AwsAuth) -> Result<(Connection, String)> {
-    let resolved = async {
-        let value = timeout(TIMEOUT, read(auth))
-            .await
-            .map_err(|_| anyhow!("timed out"))??;
-        Secret::parse(&value)?.apply(conn, auth.use_secret_host)
-    };
-    resolved
-        .await
-        .with_context(|| format!("reading \"{}\" from {}", auth.name, auth.store.label()))
+/// The connection to open and its password: `conn` with the user (and the host, if
+/// `use_secret_host`) taken from a secret's `value`.
+pub fn apply_secret(
+    conn: &Connection,
+    value: &str,
+    use_secret_host: bool,
+) -> Result<(Connection, String)> {
+    Secret::parse(value)?.apply(conn, use_secret_host)
 }
 
-async fn read(auth: &AwsAuth) -> Result<String> {
-    let config = sdk_config(&auth.profile, &auth.region).await?;
-    match auth.store {
+/// Reads the text of a secret or parameter from AWS.
+pub async fn secret_value(store: AwsStore, secret: &AwsSecretRef) -> Result<String> {
+    timeout(TIMEOUT, read(store, secret))
+        .await
+        .map_err(|_| anyhow!("timed out"))?
+}
+
+async fn read(store: AwsStore, secret: &AwsSecretRef) -> Result<String> {
+    let config = sdk_config(&secret.profile, &secret.region).await?;
+    match store {
         AwsStore::SecretsManager => {
             let output = aws_sdk_secretsmanager::Client::new(&config)
                 .get_secret_value()
-                .secret_id(&auth.name)
+                .secret_id(&secret.name)
                 .send()
                 .await
                 .map_err(api_error)?;
@@ -120,7 +124,7 @@ async fn read(auth: &AwsAuth) -> Result<String> {
         AwsStore::ParameterStore => {
             let output = aws_sdk_ssm::Client::new(&config)
                 .get_parameter()
-                .name(&auth.name)
+                .name(&secret.name)
                 .with_decryption(true)
                 .send()
                 .await
@@ -129,6 +133,119 @@ async fn read(auth: &AwsAuth) -> Result<String> {
             value.map(str::to_owned).context("the parameter is empty")
         }
     }
+}
+
+/// How long RDS accepts an IAM auth token for new connections, which is also the most it
+/// allows.
+pub const IAM_TOKEN_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
+/// An RDS IAM auth token: the password for `user` at `host:port`, valid for
+/// [`IAM_TOKEN_LIFETIME`]. Made from the profile's credentials, read afresh on every call.
+///
+/// `host` and `port` must be the database's real endpoint, even when the connection goes
+/// through an SSH tunnel: the token is signed for that name. An empty `region` means the
+/// one in an `*.rds.amazonaws.com` host name, or else the profile's.
+pub async fn iam_token(
+    profile: &str,
+    region: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+) -> Result<String> {
+    let region = match region {
+        "" => region_of_host(host).unwrap_or_default(),
+        region => region.to_owned(),
+    };
+    let made = async {
+        let config = sdk_config(profile, &region).await?;
+        sign_iam_token(&config, host, port, user).await
+    };
+    timeout(TIMEOUT, made)
+        .await
+        .map_err(|_| anyhow!("timed out"))?
+        .context("making an RDS IAM auth token")
+}
+
+/// Signs the token with the credentials, region and clock in `config`.
+async fn sign_iam_token(config: &SdkConfig, host: &str, port: u16, user: &str) -> Result<String> {
+    let region = config.region().context("no AWS region")?.clone();
+    let generator = aws_sdk_rds::auth_token::AuthTokenGenerator::new(
+        aws_sdk_rds::auth_token::Config::builder()
+            .hostname(host)
+            .port(port.into())
+            .username(user)
+            .region(region)
+            .expires_in(IAM_TOKEN_LIFETIME.as_secs())
+            .build()
+            .map_err(|e| anyhow!("{e}"))?,
+    );
+    let token = generator
+        .auth_token(config)
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(token.as_str().to_owned())
+}
+
+/// The region in an RDS endpoint such as `orders.abc123.eu-west-1.rds.amazonaws.com`.
+pub fn region_of_host(host: &str) -> Option<String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let rest = host
+        .strip_suffix(".rds.amazonaws.com")
+        .or_else(|| host.strip_suffix(".rds.amazonaws.com.cn"))?;
+    let region = rest.rsplit('.').next()?;
+    let looks_like_one = region.split('-').count() >= 3
+        && region
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    looks_like_one.then(|| region.to_owned())
+}
+
+/// Whether `host` is an RDS endpoint, whose certificates come from Amazon's RDS
+/// certificate authorities.
+pub fn is_rds_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.ends_with(".rds.amazonaws.com") || host.ends_with(".rds.amazonaws.com.cn")
+}
+
+/// Amazon's RDS certificate authorities, for verifying an RDS database's certificate.
+///
+/// Source: <https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem>, the
+/// bundle for every commercial region, linked from "Using SSL/TLS to encrypt a connection
+/// to a DB instance" in the RDS user guide. It is public. To update it, download that URL
+/// over the file and check that `the_rds_bundle_holds_certificates` still passes.
+pub const RDS_CA_BUNDLE: &[u8] = include_bytes!("../certs/rds-global-bundle.pem");
+
+/// An AWS profile in `~/.aws/config` or `~/.aws/credentials`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    /// The profile's own region, if it sets one.
+    pub region: Option<String>,
+}
+
+/// The profiles set up on this machine, sorted by name. Honours `AWS_CONFIG_FILE` and
+/// `AWS_SHARED_CREDENTIALS_FILE`.
+pub async fn profiles() -> Result<Vec<Profile>> {
+    profiles_in(&Fs::real(), &Env::real()).await
+}
+
+async fn profiles_in(fs: &Fs, env: &Env) -> Result<Vec<Profile>> {
+    let files = Default::default();
+    let set = aws_config::profile::load(fs, env, &files, None)
+        .await
+        .map_err(|e| anyhow!("reading the AWS config files: {}", causes(&e)))?;
+    let mut profiles: Vec<Profile> = set
+        .profiles()
+        .map(|name| Profile {
+            name: name.to_owned(),
+            region: set
+                .get_profile(name)
+                .and_then(|p| p.get("region"))
+                .map(str::to_owned),
+        })
+        .collect();
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(profiles)
 }
 
 /// What AWS clients are built from. Loads the profile and signs in once, so a missing or
@@ -225,7 +342,112 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Adapter, TlsMode};
+    use crate::config::{Adapter, Auth, TlsMode};
+    use aws_sdk_rds::config::Credentials;
+
+    /// Fixed credentials, region and clock, so a token comes out the same every time.
+    fn fixed_config(region: &str) -> SdkConfig {
+        SdkConfig::builder()
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "AKIDEXAMPLE",
+                "secret",
+                None,
+                None,
+                "test",
+            )))
+            .region(Region::new(region.to_owned()))
+            // 2024-08-26T22:00:00Z
+            .time_source(aws_smithy_async::time::StaticTimeSource::from_secs(
+                1_724_709_600,
+            ))
+            .build()
+    }
+
+    #[tokio::test]
+    async fn an_iam_token_is_a_presigned_connect_request_for_the_endpoint() {
+        let host = "orders.abc123.eu-west-1.rds.amazonaws.com";
+        let token = sign_iam_token(&fixed_config("eu-west-1"), host, 5432, "app_user")
+            .await
+            .unwrap();
+        let (endpoint, query) = token.split_once("/?").expect("host, then a query");
+        assert_eq!(endpoint, format!("{host}:5432"));
+        let params: Vec<(&str, &str)> = query
+            .split('&')
+            .map(|pair| pair.split_once('=').unwrap())
+            .collect();
+        let param = |name: &str| params.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+        assert_eq!(param("Action"), Some("connect"));
+        assert_eq!(param("DBUser"), Some("app_user"));
+        assert_eq!(param("X-Amz-Expires"), Some("900"));
+        assert_eq!(param("X-Amz-Algorithm"), Some("AWS4-HMAC-SHA256"));
+        assert_eq!(param("X-Amz-Date"), Some("20240826T220000Z"));
+        assert_eq!(
+            param("X-Amz-Credential"),
+            Some("AKIDEXAMPLE%2F20240826%2Feu-west-1%2Frds-db%2Faws4_request")
+        );
+        assert!(param("X-Amz-Signature").is_some_and(|s| s.len() == 64));
+        assert!(!token.starts_with("https://"));
+    }
+
+    #[test]
+    fn the_region_is_read_from_an_rds_host_name() {
+        let region = |host| region_of_host(host);
+        assert_eq!(
+            region("orders.abc123.eu-west-1.rds.amazonaws.com").as_deref(),
+            Some("eu-west-1")
+        );
+        assert_eq!(
+            region("Orders.cluster-ro-abc.US-EAST-2.rds.amazonaws.com.").as_deref(),
+            Some("us-east-2")
+        );
+        assert_eq!(region("db.example.com"), None);
+        assert_eq!(region("localhost"), None);
+        assert!(is_rds_host("orders.abc123.eu-west-1.rds.amazonaws.com"));
+        assert!(!is_rds_host("rds.amazonaws.com.example.com"));
+    }
+
+    #[test]
+    fn the_rds_bundle_holds_certificates() {
+        use rustls_pki_types::CertificateDer;
+        use rustls_pki_types::pem::PemObject;
+        let certificates: Vec<_> = CertificateDer::pem_slice_iter(RDS_CA_BUNDLE)
+            .collect::<Result<_, _>>()
+            .expect("every certificate parses");
+        assert!(certificates.len() > 50, "{}", certificates.len());
+    }
+
+    #[tokio::test]
+    async fn profiles_come_from_both_files_with_their_regions() {
+        let fs = Fs::from_slice(&[
+            (
+                "/home/me/.aws/config",
+                "[default]\nregion = eu-west-1\n\n[profile prod-sso]\nsso_session = corp\n\
+                 region = us-east-1\n\n[sso-session corp]\nsso_region = us-east-1\n",
+            ),
+            (
+                "/home/me/.aws/credentials",
+                "[ci]\naws_access_key_id = AKID\naws_secret_access_key = s\n",
+            ),
+        ]);
+        let env = Env::from_slice(&[("HOME", "/home/me")]);
+        let profiles = profiles_in(&fs, &env).await.unwrap();
+        let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["ci", "default", "prod-sso"]);
+        assert_eq!(profiles[1].region.as_deref(), Some("eu-west-1"));
+        assert_eq!(profiles[2].region.as_deref(), Some("us-east-1"));
+        assert_eq!(profiles[0].region, None);
+    }
+
+    #[tokio::test]
+    async fn no_aws_files_means_no_profiles() {
+        let env = Env::from_slice(&[("HOME", "/home/me")]);
+        assert!(
+            profiles_in(&Fs::from_slice(&[]), &env)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     fn conn() -> Connection {
         Connection {
@@ -240,7 +462,8 @@ mod tests {
             color: String::new(),
             tls: TlsMode::default(),
             ssh: None,
-            auth: None,
+            auth: Auth::Password,
+            source: None,
         }
     }
 

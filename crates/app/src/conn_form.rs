@@ -6,7 +6,9 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tuplebase_core::config::{Adapter, AwsAuth, AwsStore, Connection, SshConfig, TlsMode};
+use tuplebase_core::config::{
+    Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Source, SshConfig, TlsMode,
+};
 use tuplebase_core::ssh;
 
 use crate::logos;
@@ -44,8 +46,10 @@ pub struct ConnForm {
     database: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
-    /// `None` means a password; otherwise where in AWS the credentials are.
-    aws_store: Option<AwsStore>,
+    /// Where the password comes from.
+    auth_kind: AuthKind,
+    /// Where the connection was discovered; kept as it is.
+    source: Option<Source>,
     aws_profile: Entity<InputState>,
     aws_region: Entity<InputState>,
     aws_name: Entity<InputState>,
@@ -96,11 +100,16 @@ impl ConnForm {
             },
             String::new(),
         );
-        let aws = existing.and_then(|c| c.auth.as_ref());
-        let aws_field = |f: fn(&AwsAuth) -> String| aws.map(f).unwrap_or_default();
-        let aws_profile = input("Default credentials", aws_field(|a| a.profile.clone()));
-        let aws_region = input("The profile's region", aws_field(|a| a.region.clone()));
-        let aws_name = input("prod/orders-db", aws_field(|a| a.name.clone()));
+        let auth = existing.map(|c| c.auth.clone()).unwrap_or_default();
+        let (profile, region) = auth.aws_profile().unwrap_or_default();
+        let secret = auth.secret().map(|(_, secret)| secret);
+        let aws_profile = input("Default credentials", profile.to_owned());
+        let aws_region = input("The profile's region", region.to_owned());
+        let aws_name = input(
+            "prod/orders-db",
+            secret.map(|s| s.name.clone()).unwrap_or_default(),
+        );
+        let use_secret_host = secret.is_some_and(|s| s.use_secret_host);
         let ssh = existing.and_then(|c| c.ssh.as_ref());
         let ssh_field = |f: fn(&SshConfig) -> String| ssh.map(f).unwrap_or_default();
         let ssh_host = input("bastion.example.com", ssh_field(|s| s.host.clone()));
@@ -127,11 +136,12 @@ impl ConnForm {
             database,
             user,
             password,
-            aws_store: aws.map(|a| a.store),
+            auth_kind: auth.kind(),
+            source: existing.and_then(|c| c.source.clone()),
             aws_profile,
             aws_region,
             aws_name,
-            use_secret_host: aws.is_some_and(|a| a.use_secret_host),
+            use_secret_host,
             readonly: existing.is_some_and(|c| c.readonly),
             color: existing.map(|c| c.color.clone()).unwrap_or_default(),
             tls: existing.map_or(TlsMode::default(), |c| c.tls),
@@ -149,7 +159,33 @@ impl ConnForm {
 
     /// Whether the secret names the host, so the Host and Port fields are hidden.
     fn host_from_secret(&self) -> bool {
-        self.aws_store.is_some() && self.use_secret_host && !self.adapter.is_file()
+        self.uses_secret() && self.use_secret_host && !self.adapter.is_file()
+    }
+
+    /// Whether the credentials come from a secret or parameter in AWS.
+    fn uses_secret(&self) -> bool {
+        matches!(self.auth_kind, AuthKind::AwsSecret | AuthKind::AwsParameter)
+    }
+
+    /// The credentials as chosen, from the visible fields only.
+    fn auth(&self, cx: &App) -> Auth {
+        let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let secret = || AwsSecretRef {
+            profile: text(&self.aws_profile),
+            region: text(&self.aws_region),
+            name: text(&self.aws_name),
+            use_secret_host: self.use_secret_host,
+        };
+        match self.auth_kind {
+            _ if self.adapter.is_file() => Auth::Password,
+            AuthKind::Password => Auth::Password,
+            AuthKind::AwsSecret => Auth::AwsSecret(secret()),
+            AuthKind::AwsParameter => Auth::AwsParameter(secret()),
+            AuthKind::AwsIam => Auth::AwsIam(AwsIamAuth {
+                profile: text(&self.aws_profile),
+                region: text(&self.aws_region),
+            }),
+        }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -193,17 +229,8 @@ impl ConnForm {
             None
         };
         let uses_ssh = ssh.is_some();
-        let auth = self
-            .aws_store
-            .filter(|_| !self.adapter.is_file())
-            .map(|store| AwsAuth {
-                store,
-                profile: text(&self.aws_profile, cx),
-                region: text(&self.aws_region, cx),
-                name: text(&self.aws_name, cx),
-                use_secret_host: self.use_secret_host,
-            });
-        let password = visible(&self.password, auth.is_none(), cx);
+        let auth = self.auth(cx);
+        let password = visible(&self.password, auth.is_password(), cx);
         let ssh_password = text(&self.ssh_password, cx);
         cx.emit(ConnFormEvent::Save {
             connection: Connection {
@@ -219,6 +246,7 @@ impl ConnForm {
                 tls: self.tls,
                 ssh,
                 auth,
+                source: self.source.clone(),
             },
             password: (!password.is_empty()).then_some(password),
             ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),
@@ -348,44 +376,55 @@ impl ConnForm {
         ))
     }
 
-    fn render_auth(
-        &self,
-        store: Option<AwsStore>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let label = store.map_or("Password", AwsStore::label);
-        choice("auth", label, self.aws_store == store, cx).on_click(cx.listener(
+    fn render_auth(&self, kind: AuthKind, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        choice("auth", kind.label(), self.auth_kind == kind, cx).on_click(cx.listener(
             move |this, _, _, cx| {
-                this.aws_store = store;
+                this.choose_auth(kind);
                 cx.notify();
             },
         ))
     }
 
-    fn render_aws(&self, store: AwsStore, cx: &mut Context<Self>) -> impl IntoElement {
-        let name_label = match store {
-            AwsStore::SecretsManager => "Secret name or ARN",
-            AwsStore::ParameterStore => "Parameter name",
-        };
-        v_flex()
+    fn choose_auth(&mut self, kind: AuthKind) {
+        self.auth_kind = kind;
+        // RDS takes an IAM token only over an encrypted connection.
+        if kind == AuthKind::AwsIam && self.tls == TlsMode::Prefer {
+            self.tls = TlsMode::Require;
+        }
+    }
+
+    fn render_aws(&self, kind: AuthKind, cx: &mut Context<Self>) -> impl IntoElement {
+        let profile = h_flex()
+            .gap_3()
+            .child(field(
+                "AWS profile",
+                Input::new(&self.aws_profile).id("conn-aws-profile"),
+                cx,
+            ))
+            .child(field(
+                "Region",
+                Input::new(&self.aws_region).id("conn-aws-region"),
+                cx,
+            ));
+        let column = v_flex()
             .gap_3()
             .pl_4()
             .border_l_2()
             .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(field(
-                        "AWS profile",
-                        Input::new(&self.aws_profile).id("conn-aws-profile"),
-                        cx,
-                    ))
-                    .child(field(
-                        "Region",
-                        Input::new(&self.aws_region).id("conn-aws-region"),
-                        cx,
-                    )),
-            )
+            .child(profile);
+        let name_label = match kind {
+            AuthKind::AwsSecret => "Secret name or ARN",
+            AuthKind::AwsParameter => "Parameter name",
+            AuthKind::Password | AuthKind::AwsIam => {
+                return column.child(hint(
+                    "A token for the user below is made from your AWS profile each time you \
+                     connect. The user needs rds-db:connect, and the database IAM \
+                     authentication turned on.",
+                    cx,
+                ));
+            }
+        };
+        column
             .child(
                 field(
                     name_label,
@@ -517,21 +556,22 @@ impl ConnForm {
     }
 
     fn render_credentials(&self, cx: &mut Context<Self>) -> Div {
-        let aws_store = self.aws_store;
+        let kind = self.auth_kind;
         v_flex()
             .gap_3()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(self.render_auth(None, cx))
-                    .children(AwsStore::ALL.map(|s| self.render_auth(Some(s), cx))),
+                    .children(AuthKind::ALL.map(|k| self.render_auth(k, cx))),
             )
-            .when_some(aws_store, |el, store| el.child(self.render_aws(store, cx)))
+            .when(kind != AuthKind::Password, |el| {
+                el.child(self.render_aws(kind, cx))
+            })
             .child(
                 h_flex()
                     .gap_3()
                     .child(field("User", Input::new(&self.user).id("conn-user"), cx))
-                    .when(aws_store.is_none(), |el| {
+                    .when(kind == AuthKind::Password, |el| {
                         el.child(field(
                             "Password",
                             Input::new(&self.password).id("conn-password").mask_toggle(),

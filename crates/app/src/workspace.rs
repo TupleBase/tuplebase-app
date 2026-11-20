@@ -1035,7 +1035,7 @@ impl Workspace {
                 if let Some(old) = renamed {
                     secrets::rename(old, &connection.name)?;
                 }
-                if connection.auth.is_some() {
+                if !connection.auth.is_password() {
                     // The credentials now come from AWS; don't keep an unused password.
                     secrets::delete_password(&connection.name)?;
                 } else if let Some(pw) = &password {
@@ -2528,7 +2528,7 @@ mod tests {
         WindowOptions, point, px, size,
     };
     use serde_json::json;
-    use tuplebase_core::config::{Adapter, Appearance, AwsAuth, AwsStore};
+    use tuplebase_core::config::{Adapter, Appearance, Auth, AwsIamAuth, AwsSecretRef, TlsMode};
     use tuplebase_core::db::QueryResult;
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
@@ -2567,7 +2567,8 @@ mod tests {
             color: String::new(),
             tls: Default::default(),
             ssh: None,
-            auth: None,
+            auth: Default::default(),
+            source: None,
         };
         config.upsert(conn, None).unwrap();
         config
@@ -3275,7 +3276,7 @@ mod tests {
         open_new_form(handle, cx);
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("conn-aws-name").is_none());
-            window.click("auth-AWS Secrets Manager", cx);
+            window.click("auth-Secrets Manager", cx);
         });
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("conn-password").is_none());
@@ -3316,14 +3317,71 @@ mod tests {
         assert_eq!(connection.host, "");
         assert_eq!(
             connection.auth,
-            Some(AwsAuth {
-                store: AwsStore::SecretsManager,
+            Auth::AwsSecret(AwsSecretRef {
                 profile: "prod-sso".into(),
                 region: String::new(),
                 name: "prod/orders".into(),
                 use_secret_host: true,
             })
         );
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            assert!(form.read(cx).error.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_credentials_choice_switches_the_fields_and_iam_turns_on_encryption(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(Config::default(), cx);
+        open_new_form(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-password").is_some());
+            window.click("auth-IAM token", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-password").is_none());
+            assert!(window.try_find("conn-aws-name").is_none());
+            assert!(window.try_find("conn-aws-profile").is_some());
+            assert!(window.try_find("conn-host").is_some());
+            window.click("auth-Parameter Store", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-aws-name").is_some());
+            window.click("auth-IAM token", cx);
+        });
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    *saved.borrow_mut() = Some(connection.clone());
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-name", cx);
+            window.input("orders", cx);
+            window.click("conn-host", cx);
+            window.input("orders.abc.eu-west-1.rds.amazonaws.com", cx);
+            window.click("conn-user", cx);
+            window.input("app", cx);
+            window.click("conn-aws-profile", cx);
+            window.input("prod", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        let connection = saved.borrow_mut().take().expect("the form saved");
+        assert_eq!(
+            connection.auth,
+            Auth::AwsIam(AwsIamAuth {
+                profile: "prod".into(),
+                region: String::new(),
+            })
+        );
+        assert_eq!(connection.tls, TlsMode::Require);
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
             assert!(form.read(cx).error.is_none());

@@ -31,20 +31,21 @@ scripts/                   install, packaging, release helpers
 
 ## Inside `core`
 
-| Module       | Owns                                                  | Imports from `core`                        |
-| ------------ | ----------------------------------------------------- | ------------------------------------------ |
-| `config`     | connection settings and the config directory          | nothing                                    |
-| `secrets`    | passwords in the OS credential store                  | nothing                                    |
-| `state`      | unsaved SQL, query history, panel sizes               | `config`                                   |
-| `safety`     | statement classification for the read-only guard      | `config`                                   |
-| `ssh`        | SSH tunnels                                           | `config`                                   |
-| `aws`        | credentials read from Secrets Manager and SSM         | `config`                                   |
-| `mcp_status` | heartbeat files of running MCP servers                | `config`                                   |
-| `app_status` | the file naming the connections open in the app       | `config`                                   |
-| `updates`    | the GitHub release check                              | `config`                                   |
-| `db`         | pools, queries, schema reads, the read-only guard     | `config` `secrets` `ssh` `aws` `safety`    |
-| `agents`     | the MCP server's entry in each agent's config file    | `updates`                                  |
-| `chat`       | running the user's agent for the chat panel           | `config` `agents`                          |
+| Module        | Owns                                                  | Imports from `core`                                    |
+| ------------- | ----------------------------------------------------- | ------------------------------------------------------ |
+| `config`      | connection settings and the config directory          | nothing                                                |
+| `secrets`     | passwords in the OS credential store                  | nothing                                                |
+| `state`       | unsaved SQL, query history, panel sizes               | `config`                                               |
+| `safety`      | statement classification for the read-only guard      | `config`                                               |
+| `ssh`         | SSH tunnels                                           | `config`                                               |
+| `aws`         | the AWS SDK: secrets, SSM, IAM tokens, RDS discovery  | `config`                                               |
+| `credentials` | which password a connection signs in with             | `config` `secrets` `aws`                               |
+| `mcp_status`  | heartbeat files of running MCP servers                | `config`                                               |
+| `app_status`  | the file naming the connections open in the app       | `config`                                               |
+| `updates`     | the GitHub release check                              | `config`                                               |
+| `db`          | pools, queries, schema reads, the read-only guard     | `config` `secrets` `ssh` `credentials` `aws` `safety`  |
+| `agents`      | the MCP server's entry in each agent's config file    | `updates`                                              |
+| `chat`        | running the user's agent for the chat panel           | `config` `agents`                                      |
 
 - **L5. Imports inside `core` go one way, with no cycles.** `config` and `secrets` import
   no sibling module. A module that only needs settings imports `config` alone. `db`,
@@ -116,7 +117,7 @@ Changing one of these needs the user's explicit agreement, not just a passing re
 | Change                           | Place                                                      |
 | -------------------------------- | ---------------------------------------------------------- |
 | New database engine or SQL       | `core/src/db.rs`, and `core/src/safety.rs` for the guard   |
-| New way to get credentials       | its own `core` module, called from `db`                    |
+| New way to get credentials       | its own `core` module, called from `credentials`           |
 | New setting saved to disk        | `core/src/config.rs`, or `core/src/state.rs` if not a connection setting |
 | New panel, dialog or form        | its own `app` module (A2)                                  |
 | New item in Settings             | `app/src/workspace/settings.rs`                            |

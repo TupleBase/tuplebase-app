@@ -21,7 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{Adapter, Connection, TlsMode};
 use crate::ssh::{self, Tunnel};
-use crate::{aws, safety, secrets};
+use crate::{credentials, safety, secrets};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
@@ -646,18 +646,10 @@ impl Db {
 
 /// Opens the SSH tunnel, if any, and then the connection pool.
 async fn connect(conn: &Connection) -> Result<Open> {
-    let name = conn.name.clone();
     // What to connect to: a secret in AWS can name the user and host as well.
-    let (target, password) = if conn.adapter.is_file() {
-        (conn.clone(), None)
-    } else if let Some(auth) = &conn.auth {
-        let (target, password) = aws::resolve(conn, auth).await?;
-        (target, Some(password))
-    } else {
-        // Keychain access can block (or show an OS prompt), so keep it off the runtime.
-        let password = tokio::task::spawn_blocking(move || secrets::get_password(&name)).await??;
-        (conn.clone(), password)
-    };
+    let credentials::Resolved {
+        target, password, ..
+    } = credentials::resolve(conn).await?;
     let tunnel = match &conn.ssh {
         None => None,
         Some(config) => {

@@ -43,7 +43,8 @@ fn connection(adapter: Adapter) -> Connection {
         color: String::new(),
         tls: Default::default(),
         ssh: None,
-        auth: None,
+        auth: Default::default(),
+        source: None,
     }
 }
 
@@ -398,7 +399,8 @@ fn sqlite_connection(dir: &tempfile::TempDir, name: &str) -> Connection {
         color: String::new(),
         tls: Default::default(),
         ssh: None,
-        auth: None,
+        auth: Default::default(),
+        source: None,
     }
 }
 
