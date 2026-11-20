@@ -1,7 +1,18 @@
-//! Database access for PostgreSQL and MariaDB/MySQL.
+//! Database access for PostgreSQL, MariaDB/MySQL and SQLite.
 //!
 //! Async API; callers provide a Tokio runtime. One pool per connection, cached by
 //! name and rebuilt when the connection's settings change.
+//!
+//! This file holds the public API and what all engines share. Each [`Db`] method that
+//! needs engine-specific SQL picks the engine module by the pool and calls it:
+//! [`postgres`], [`mysql`] (MySQL and MariaDB) and [`sqlite`]. A feature only one engine
+//! has, such as MySQL events, lives only in that engine's module.
+
+mod connect;
+mod decode;
+mod mysql;
+mod postgres;
+mod sqlite;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -10,20 +21,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryStreamExt;
 use serde::Serialize;
-use serde_json::{Value, json};
-use sqlx::mysql::{MySqlPool, MySqlRow};
-use sqlx::postgres::{PgPool, PgRow};
-use sqlx::sqlite::{SqlitePool, SqliteRow};
-use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use sqlx::types::{Decimal, JsonValue, Uuid};
-use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement, TypeInfo, ValueRef};
+use serde_json::Value;
+use sqlx::mysql::MySqlPool;
+use sqlx::postgres::PgPool;
+use sqlx::sqlite::SqlitePool;
+use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
 use tokio::sync::Mutex;
 
-use crate::config::Connection;
+use crate::config::{Adapter, Connection};
 use crate::safety;
 use crate::ssh::Tunnel;
-
-mod connect;
 
 use connect::{Refresher, connect};
 
@@ -66,6 +73,9 @@ pub enum ObjectKind {
     Trigger,
     Event,
     Index,
+    /// Views are listed with the tables, never by [`Db::list_objects`]; this kind names
+    /// one for [`Db::object_definition`].
+    View,
 }
 
 impl ObjectKind {
@@ -79,6 +89,39 @@ impl ObjectKind {
             Self::Trigger => "Triggers",
             Self::Event => "Events",
             Self::Index => "Indexes",
+            Self::View => "Views",
+        }
+    }
+
+    /// Whether [`Db::object_definition`] can show the source of this kind of object.
+    pub fn has_definition(self) -> bool {
+        matches!(
+            self,
+            Self::Function
+                | Self::Procedure
+                | Self::Trigger
+                | Self::Event
+                | Self::Index
+                | Self::View
+        )
+    }
+
+    /// Functions and procedures, which [`Db::call_template`] writes a call for.
+    pub fn is_routine(self) -> bool {
+        matches!(self, Self::Function | Self::Procedure)
+    }
+
+    fn singular(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+            Self::Sequence => "sequence",
+            Self::Type => "type",
+            Self::Extension => "extension",
+            Self::Trigger => "trigger",
+            Self::Event => "event",
+            Self::Index => "index",
+            Self::View => "view",
         }
     }
 }
@@ -88,99 +131,109 @@ pub struct ObjectInfo {
     pub schema: String,
     pub kind: ObjectKind,
     pub name: String,
-    /// A short note shown beside the name, such as a function's arguments.
+    /// A short note shown beside the name, such as a function's arguments. It also tells
+    /// apart objects that share a name, such as overloaded PostgreSQL functions.
     pub detail: String,
 }
 
-/// Each query returns schema, name and detail.
-const PG_OBJECTS: &[(ObjectKind, &str)] = &[
-    (
-        ObjectKind::Function,
-        "SELECT n.nspname::text, p.proname::text, pg_get_function_identity_arguments(p.oid)::text \
-         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-         WHERE p.prokind = 'f' AND n.nspname NOT LIKE 'pg\\_%' \
-         AND n.nspname <> 'information_schema' AND NOT EXISTS \
-         (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e') \
-         ORDER BY 1, 2, 3",
-    ),
-    (
-        ObjectKind::Procedure,
-        "SELECT n.nspname::text, p.proname::text, pg_get_function_identity_arguments(p.oid)::text \
-         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-         WHERE p.prokind = 'p' AND n.nspname NOT LIKE 'pg\\_%' \
-         AND n.nspname <> 'information_schema' AND NOT EXISTS \
-         (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e') \
-         ORDER BY 1, 2, 3",
-    ),
-    (
-        ObjectKind::Sequence,
-        "SELECT sequence_schema::text, sequence_name::text, data_type::text \
-         FROM information_schema.sequences \
-         WHERE sequence_schema NOT LIKE 'pg\\_%' AND sequence_schema <> 'information_schema' \
-         ORDER BY 1, 2",
-    ),
-    (
-        ObjectKind::Type,
-        "SELECT n.nspname::text, t.typname::text, \
-         CASE t.typtype WHEN 'e' THEN 'enum' WHEN 'd' THEN 'domain' WHEN 'r' THEN 'range' \
-         ELSE 'composite' END::text \
-         FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
-         WHERE (t.typtype IN ('e', 'd', 'r') OR (t.typtype = 'c' AND EXISTS \
-         (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'))) \
-         AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema' AND NOT EXISTS \
-         (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid AND d.deptype = 'e') \
-         ORDER BY 1, 2",
-    ),
-    (
-        ObjectKind::Extension,
-        "SELECT n.nspname::text, e.extname::text, e.extversion::text \
-         FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace \
-         WHERE n.nspname NOT LIKE 'pg\\_%' ORDER BY 1, 2",
-    ),
-];
+/// How a routine's parameter passes its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamMode {
+    In,
+    Out,
+    InOut,
+    Variadic,
+}
 
-const MY_OBJECTS: &[(ObjectKind, &str)] = &[
-    (
-        ObjectKind::Function,
-        "SELECT CAST(routine_schema AS CHAR), CAST(routine_name AS CHAR), \
-         CAST(COALESCE(dtd_identifier, '') AS CHAR) FROM information_schema.routines \
-         WHERE routine_type = 'FUNCTION' AND routine_schema NOT IN \
-         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
-    ),
-    (
-        ObjectKind::Procedure,
-        "SELECT CAST(routine_schema AS CHAR), CAST(routine_name AS CHAR), CAST('' AS CHAR) \
-         FROM information_schema.routines \
-         WHERE routine_type = 'PROCEDURE' AND routine_schema NOT IN \
-         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
-    ),
-    (
-        ObjectKind::Trigger,
-        "SELECT CAST(trigger_schema AS CHAR), CAST(trigger_name AS CHAR), \
-         CAST(CONCAT(action_timing, ' ', event_manipulation, ' on ', event_object_table) AS CHAR) \
-         FROM information_schema.triggers WHERE trigger_schema NOT IN \
-         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
-    ),
-    (
-        ObjectKind::Event,
-        "SELECT CAST(event_schema AS CHAR), CAST(event_name AS CHAR), CAST(status AS CHAR) \
-         FROM information_schema.events WHERE event_schema NOT IN \
-         ('mysql', 'information_schema', 'performance_schema', 'sys') ORDER BY 1, 2",
-    ),
-];
+impl ParamMode {
+    fn parse(mode: &str) -> Self {
+        match mode.trim().to_uppercase().as_str() {
+            "OUT" => Self::Out,
+            "INOUT" => Self::InOut,
+            "VARIADIC" => Self::Variadic,
+            _ => Self::In,
+        }
+    }
+}
 
-const SQLITE_OBJECTS: &[(ObjectKind, &str)] = &[
-    (
-        ObjectKind::Trigger,
-        "SELECT 'main', name, 'on ' || tbl_name FROM sqlite_master \
-         WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    ),
-    (
-        ObjectKind::Index,
-        "SELECT 'main', name, 'on ' || tbl_name FROM sqlite_master \
-         WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    ),
-];
+/// One parameter of a function or procedure, as the database describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    pub mode: ParamMode,
+    /// Empty for an unnamed PostgreSQL parameter.
+    pub name: String,
+    pub data_type: String,
+}
+
+// What the engine modules share. Each engine's own SQL stays in its module.
+
+/// An object's source as an engine read it: `None` when there's no such object,
+/// `Some(None)` when there is one but the database hides its source.
+type Source = Option<Option<String>>;
+
+/// Objects of one kind from rows of schema, name and detail.
+fn objects(
+    kind: ObjectKind,
+    rows: Vec<(String, String, String)>,
+) -> impl Iterator<Item = ObjectInfo> {
+    rows.into_iter()
+        .map(move |(schema, name, detail)| ObjectInfo {
+            schema,
+            kind,
+            name,
+            detail,
+        })
+}
+
+/// Parameters from rows of mode, name and type.
+fn parameters(rows: Vec<(String, String, String)>) -> Vec<Parameter> {
+    rows.into_iter()
+        .map(|(mode, name, data_type)| Parameter {
+            mode: ParamMode::parse(&mode),
+            name,
+            data_type,
+        })
+        .collect()
+}
+
+fn unsupported(kind: ObjectKind) -> anyhow::Error {
+    anyhow!(
+        "this database can't show the source of a {}",
+        kind.singular()
+    )
+}
+
+/// `CALL schema.name` for a procedure, `SELECT schema.name` for a function.
+fn call_head(adapter: Adapter, kind: ObjectKind, schema: &str, name: &str) -> String {
+    let verb = match kind {
+        ObjectKind::Procedure => "CALL",
+        _ => "SELECT",
+    };
+    let schema = adapter.quote_ident(schema);
+    let name = adapter.quote_ident(name);
+    format!("{verb} {schema}.{name}")
+}
+
+/// `/* a b */` from the non-empty parts. Nothing in them can end the comment early.
+fn sql_comment(parts: &[&str]) -> String {
+    let text: Vec<String> = parts
+        .iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| part.trim().replace("*/", "* /"))
+        .collect();
+    format!("/* {} */", text.join(" "))
+}
+
+/// The SQL in what an engine found for `what`, or why there is none.
+fn definition_text(what: &str, found: Source) -> Result<String> {
+    match found {
+        None => bail!("{what} not found"),
+        Some(None) => bail!(
+            "the database won't show the source of {what}: this user lacks the privilege to see it"
+        ),
+        Some(Some(sql)) => Ok(sql.trim().to_owned()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnInfo {
@@ -377,7 +430,7 @@ impl Db {
         let mut changed = false;
 
         macro_rules! run_all {
-            ($pool:expr, $begin:literal, $end:literal, $decode:ident) => {{
+            ($pool:expr, $begin:literal, $end:literal, $decode:path) => {{
                 let mut c = $pool.acquire().await?;
                 for (index, sql) in statements.iter().copied().enumerate() {
                     if read_only {
@@ -409,16 +462,21 @@ impl Db {
             }};
         }
         match self.pool(conn).await? {
-            Pool::Pg(pool) => run_all!(pool, "BEGIN READ ONLY", "ROLLBACK", pg_value),
+            Pool::Pg(pool) => run_all!(pool, "BEGIN READ ONLY", "ROLLBACK", postgres::value),
             Pool::My(pool) => {
-                run_all!(pool, "START TRANSACTION READ ONLY", "ROLLBACK", my_value)
+                run_all!(
+                    pool,
+                    "START TRANSACTION READ ONLY",
+                    "ROLLBACK",
+                    mysql::value
+                )
             }
             // SQLite has no read-only transactions; this switch makes it refuse writes.
             Pool::Sqlite(pool) => run_all!(
                 pool,
                 "PRAGMA query_only = ON",
                 "PRAGMA query_only = OFF",
-                sqlite_value
+                sqlite::value
             ),
         }
 
@@ -509,43 +567,11 @@ impl Db {
     /// What the database has besides tables and views. Each kind is best effort: a user
     /// who can't read one catalog still sees the rest.
     pub async fn list_objects(&self, conn: &Connection) -> Result<Vec<ObjectInfo>> {
-        type Rows = Vec<(String, String, String)>;
-        let mut objects = Vec::new();
-        let mut add = |kind: ObjectKind, rows: Rows| {
-            objects.extend(rows.into_iter().map(|(schema, name, detail)| ObjectInfo {
-                schema,
-                kind,
-                name,
-                detail,
-            }));
-        };
-        match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                for &(kind, sql) in PG_OBJECTS {
-                    add(
-                        kind,
-                        sqlx::query_as(sql).fetch_all(&p).await.unwrap_or_default(),
-                    );
-                }
-            }
-            Pool::My(p) => {
-                for &(kind, sql) in MY_OBJECTS {
-                    add(
-                        kind,
-                        sqlx::query_as(sql).fetch_all(&p).await.unwrap_or_default(),
-                    );
-                }
-            }
-            Pool::Sqlite(p) => {
-                for &(kind, sql) in SQLITE_OBJECTS {
-                    add(
-                        kind,
-                        sqlx::query_as(sql).fetch_all(&p).await.unwrap_or_default(),
-                    );
-                }
-            }
-        }
-        Ok(objects)
+        Ok(match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::list_objects(&p).await,
+            Pool::My(p) => mysql::list_objects(&p).await,
+            Pool::Sqlite(p) => sqlite::list_objects(&p).await,
+        })
     }
 
     /// Columns of `table`; `schema` defaults to `public` (PostgreSQL) or the
@@ -606,6 +632,42 @@ impl Db {
                 nullable: nullable == "YES",
             })
             .collect())
+    }
+
+    /// The statement that creates `object`, such as `CREATE PROCEDURE ...`, to show in
+    /// the editor. It's only read, never run.
+    pub async fn object_definition(
+        &self,
+        conn: &Connection,
+        object: &ObjectInfo,
+    ) -> Result<String> {
+        let found = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::object_definition(&p, object).await?,
+            Pool::My(p) => mysql::object_definition(&p, object).await?,
+            Pool::Sqlite(p) => sqlite::object_definition(&p, object).await?,
+        };
+        let what = format!(
+            "{} {}.{}",
+            object.kind.singular(),
+            object.schema,
+            object.name
+        );
+        definition_text(&what, found)
+    }
+
+    /// A call of a function or procedure to paste into the editor: `CALL` for a
+    /// procedure, `SELECT` for a function, with each value a comment naming the
+    /// parameter and its type. Nothing here runs; the user fills the values in and
+    /// presses Run. How output parameters are passed depends on the engine.
+    pub async fn call_template(&self, conn: &Connection, object: &ObjectInfo) -> Result<String> {
+        if !object.kind.is_routine() {
+            bail!("only functions and procedures can be called");
+        }
+        match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::call_template(&p, object).await,
+            Pool::My(p) => mysql::call_template(&p, object).await,
+            Pool::Sqlite(_) => bail!("SQLite has no functions or procedures"),
+        }
     }
 
     async fn pool(&self, conn: &Connection) -> Result<Pool> {
@@ -675,7 +737,7 @@ fn lost_unnamed_statement(error: &anyhow::Error) -> bool {
 /// Runs one statement as a prepared statement on `$conn`: streams up to `$max` rows
 /// for row-returning statements, otherwise reports the affected row count.
 macro_rules! run {
-    ($conn:expr, $sql:expr, $max:expr, $decode:ident) => {
+    ($conn:expr, $sql:expr, $max:expr, $decode:path) => {
         async {
             let query = sqlx::query(AssertSqlSafe($sql.to_owned())).persistent(false);
             if !safety::returns_rows($sql) {
@@ -729,111 +791,8 @@ macro_rules! run {
 }
 use run;
 
-/// Returns from the enclosing fn with the first type that decodes the column.
-macro_rules! decode_first {
-    ($row:expr, $i:expr; $($ty:ty => $conv:expr),* $(,)?) => {
-        $(
-            if let Ok(v) = $row.try_get::<$ty, _>($i) {
-                return $conv(v);
-            }
-        )*
-    };
-}
-
-fn text<T: ToString>(v: T) -> Value {
-    Value::String(v.to_string())
-}
-
-fn bytes(v: Vec<u8>) -> Value {
-    let hex: String = v.iter().take(64).map(|b| format!("{b:02x}")).collect();
-    let more = if v.len() > 64 { "…" } else { "" };
-    Value::String(format!("0x{hex}{more}"))
-}
-
-/// Last resort for types without a mapping: the raw text if it is printable.
-fn fallback<R: Row>(row: &R, i: usize, type_name: &str) -> Value
-where
-    for<'r> String: sqlx::Decode<'r, R::Database>,
-    usize: sqlx::ColumnIndex<R>,
-{
-    match row.try_get_unchecked::<String, _>(i) {
-        Ok(s) if !s.chars().any(|c| c.is_control() && c != '\n' && c != '\t') => Value::String(s),
-        _ => Value::String(format!("<{type_name}>")),
-    }
-}
-
-fn pg_value(row: &PgRow, i: usize) -> Value {
-    let type_name = match row.try_get_raw(i) {
-        Ok(raw) if raw.is_null() => return Value::Null,
-        Ok(raw) => raw.type_info().name().to_owned(),
-        Err(e) => return Value::String(format!("<{e}>")),
-    };
-    decode_first!(row, i;
-        bool => |v: bool| json!(v),
-        i16 => |v: i16| json!(v),
-        i32 => |v: i32| json!(v),
-        i64 => |v: i64| json!(v),
-        f32 => |v: f32| json!(v),
-        f64 => |v: f64| json!(v),
-        Decimal => text,
-        String => Value::String,
-        Uuid => text,
-        JsonValue => |v| v,
-        NaiveDateTime => text,
-        DateTime<Utc> => text,
-        NaiveDate => text,
-        NaiveTime => text,
-        Vec<u8> => bytes,
-    );
-    fallback(row, i, &type_name)
-}
-
-fn sqlite_value(row: &SqliteRow, i: usize) -> Value {
-    let type_name = match row.try_get_raw(i) {
-        Ok(raw) if raw.is_null() => return Value::Null,
-        Ok(raw) => raw.type_info().name().to_owned(),
-        Err(e) => return Value::String(format!("<{e}>")),
-    };
-    decode_first!(row, i;
-        i64 => |v: i64| json!(v),
-        f64 => |v: f64| json!(v),
-        String => Value::String,
-        Vec<u8> => bytes,
-    );
-    fallback(row, i, &type_name)
-}
-
-fn my_value(row: &MySqlRow, i: usize) -> Value {
-    let type_name = match row.try_get_raw(i) {
-        Ok(raw) if raw.is_null() => return Value::Null,
-        Ok(raw) => raw.type_info().name().to_owned(),
-        Err(e) => return Value::String(format!("<{e}>")),
-    };
-    // MySQL's bool decoder accepts every integer type; only TINYINT(1) is a boolean.
-    if type_name == "BOOLEAN"
-        && let Ok(v) = row.try_get::<bool, _>(i)
-    {
-        return json!(v);
-    }
-    decode_first!(row, i;
-        i64 => |v: i64| json!(v),
-        u64 => |v: u64| json!(v),
-        f64 => |v: f64| json!(v),
-        f32 => |v: f32| json!(v),
-        Decimal => text,
-        String => Value::String,
-        JsonValue => |v| v,
-        NaiveDateTime => text,
-        DateTime<Utc> => text,
-        NaiveDate => text,
-        NaiveTime => text,
-        Vec<u8> => bytes,
-    );
-    fallback(row, i, &type_name)
-}
-
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -844,5 +803,44 @@ mod tests {
         let _connecting = slot.lock().await;
         let open = tokio::time::timeout(Duration::from_secs(5), db.open_connections()).await;
         assert_eq!(open, Ok(HashSet::new()));
+    }
+
+    pub(super) fn param(mode: ParamMode, name: &str, data_type: &str) -> Parameter {
+        Parameter {
+            mode,
+            name: name.into(),
+            data_type: data_type.into(),
+        }
+    }
+
+    #[test]
+    fn parameter_modes_are_read_in_any_case() {
+        assert_eq!(ParamMode::parse("inout"), ParamMode::InOut);
+        assert_eq!(ParamMode::parse("OUT"), ParamMode::Out);
+        assert_eq!(ParamMode::parse("VARIADIC"), ParamMode::Variadic);
+        assert_eq!(ParamMode::parse(""), ParamMode::In);
+    }
+
+    #[test]
+    fn a_hidden_source_says_why() {
+        let what = "procedure shop.start_job";
+        let hidden = definition_text(what, Some(None)).unwrap_err().to_string();
+        assert!(hidden.contains("privilege"), "{hidden}");
+        assert!(hidden.contains(what), "{hidden}");
+        let missing = definition_text(what, None).unwrap_err().to_string();
+        assert!(missing.contains("not found"), "{missing}");
+        let found = definition_text(what, Some(Some("CREATE x\n".into()))).unwrap();
+        assert_eq!(found, "CREATE x");
+    }
+
+    #[test]
+    fn only_kinds_with_a_source_have_a_definition() {
+        assert!(ObjectKind::Procedure.has_definition());
+        assert!(ObjectKind::View.has_definition());
+        assert!(!ObjectKind::Sequence.has_definition());
+        assert!(!ObjectKind::Type.has_definition());
+        assert!(!ObjectKind::Extension.has_definition());
+        assert!(ObjectKind::Function.is_routine());
+        assert!(!ObjectKind::Trigger.is_routine());
     }
 }

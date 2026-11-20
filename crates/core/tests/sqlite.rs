@@ -5,7 +5,7 @@ use sqlx::Executor;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection as _};
 use tuplebase_core::config::{Adapter, Connection};
-use tuplebase_core::db::{Db, ExecOptions};
+use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
 
 const READ: ExecOptions = ExecOptions {
     read_only: true,
@@ -177,4 +177,49 @@ async fn a_missing_file_is_an_error_and_is_not_created() {
     conn.database = path.display().to_string();
     assert!(Db::new().test(&conn).await.is_err());
     assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn triggers_views_and_indexes_show_their_definitions() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    for sql in [
+        "CREATE INDEX users_name ON users (name)",
+        "CREATE TRIGGER users_touch AFTER UPDATE ON users BEGIN SELECT 1; END",
+    ] {
+        db.execute(&conn, sql, WRITE).await.unwrap();
+    }
+    let definition = async |kind, name: &str| {
+        let object = ObjectInfo {
+            schema: "main".into(),
+            kind,
+            name: name.into(),
+            detail: String::new(),
+        };
+        db.object_definition(&conn, &object).await
+    };
+    assert_eq!(
+        definition(ObjectKind::Trigger, "users_touch")
+            .await
+            .unwrap(),
+        "CREATE TRIGGER users_touch AFTER UPDATE ON users BEGIN SELECT 1; END"
+    );
+    assert_eq!(
+        definition(ObjectKind::View, "names").await.unwrap(),
+        "CREATE VIEW names AS SELECT name FROM users"
+    );
+    assert_eq!(
+        definition(ObjectKind::Index, "users_name").await.unwrap(),
+        "CREATE INDEX users_name ON users (name)"
+    );
+    let missing = definition(ObjectKind::Trigger, "nope").await.unwrap_err();
+    assert!(missing.to_string().contains("not found"), "{missing}");
+    assert!(definition(ObjectKind::Procedure, "users").await.is_err());
+    let routine = ObjectInfo {
+        schema: "main".into(),
+        kind: ObjectKind::Procedure,
+        name: "users".into(),
+        detail: String::new(),
+    };
+    assert!(db.call_template(&conn, &routine).await.is_err());
 }

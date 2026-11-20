@@ -1,12 +1,15 @@
 //! Schema browser: the tables, columns and other objects of the selected connection.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -56,10 +59,7 @@ enum Row {
         count: usize,
         open: bool,
     },
-    Object {
-        name: String,
-        detail: String,
-    },
+    Object(ObjectInfo),
     Note(&'static str),
 }
 
@@ -69,6 +69,8 @@ enum Target {
     Schema(String),
     Table(TableKey),
     Group(String, ObjectKind),
+    /// An object whose definition a click shows.
+    Object(ObjectInfo),
 }
 
 impl Row {
@@ -77,8 +79,54 @@ impl Row {
             Row::Schema { name, .. } => Some(Target::Schema(name.clone())),
             Row::Table { key, .. } => Some(Target::Table(key.clone())),
             Row::Group { schema, kind, .. } => Some(Target::Group(schema.clone(), *kind)),
-            Row::Column { .. } | Row::Object { .. } | Row::Note(_) => None,
+            Row::Object(object) if object.kind.has_definition() => {
+                Some(Target::Object(object.clone()))
+            }
+            Row::Column { .. } | Row::Object(_) | Row::Note(_) => None,
         }
+    }
+}
+
+/// What a click on an object asks the database for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Lookup {
+    /// The statement that creates it.
+    Definition,
+    /// A call of a function or procedure, with placeholders for its values.
+    Call,
+}
+
+/// Fetches the SQL a lookup puts in the editor. UI tests swap in a fake, since their
+/// runtime never runs I/O.
+pub(crate) type FetchSql = Rc<
+    dyn Fn(Connection, ObjectInfo, Lookup) -> Pin<Box<dyn Future<Output = anyhow::Result<String>>>>,
+>;
+
+fn fetch_from(db: Arc<Db>) -> FetchSql {
+    Rc::new(move |conn, object, lookup| {
+        let db = db.clone();
+        Box::pin(io(async move {
+            match lookup {
+                Lookup::Definition => db.object_definition(&conn, &object).await,
+                Lookup::Call => db.call_template(&conn, &object).await,
+            }
+        }))
+    })
+}
+
+/// Tells apart objects that share a name, such as overloaded functions.
+fn object_id(object: &ObjectInfo) -> String {
+    let ObjectInfo {
+        schema,
+        kind,
+        name,
+        detail,
+    } = object;
+    let id = format!("object-{schema}-{}-{name}", kind.plural());
+    if detail.is_empty() {
+        id
+    } else {
+        format!("{id}({detail})")
     }
 }
 
@@ -152,10 +200,7 @@ fn flatten(
                 open,
             });
             if open {
-                rows.extend(list.iter().map(|o| Row::Object {
-                    name: o.name.clone(),
-                    detail: o.detail.clone(),
-                }));
+                rows.extend(list.iter().map(|o| Row::Object((*o).clone())));
             }
         }
     }
@@ -173,6 +218,10 @@ pub(crate) enum Load {
 pub enum SchemaEvent {
     /// Show rows from a table using this SQL.
     Preview(String),
+    /// Put this SQL in the editor without running it, such as a procedure's definition.
+    Insert(String),
+    /// Looking something up failed; this says what went wrong.
+    Failed(String),
 }
 
 pub struct SchemaPanel {
@@ -190,6 +239,7 @@ pub struct SchemaPanel {
     focus: FocusHandle,
     /// The row arrow keys act on.
     cursor: Option<Target>,
+    pub(crate) fetch: FetchSql,
     _filter_subscription: Subscription,
     _focus_subscriptions: [Subscription; 2],
 }
@@ -216,6 +266,7 @@ impl SchemaPanel {
             cx.on_blur(&focus, window, |_, _, cx| cx.notify()),
         ];
         Self {
+            fetch: fetch_from(db.clone()),
             db,
             names,
             connection: None,
@@ -365,6 +416,59 @@ impl SchemaPanel {
         }
     }
 
+    /// Fetches the definition of `object`, or a call of it, for the editor.
+    fn look_up(&mut self, object: ObjectInfo, lookup: Lookup, cx: &mut Context<Self>) {
+        let Some(conn) = self.connection.clone() else {
+            return;
+        };
+        let name = conn.name.clone();
+        let what = match lookup {
+            Lookup::Definition => format!("Could not show the definition of {}", object.name),
+            Lookup::Call => format!("Could not write a call of {}", object.name),
+        };
+        let fetch = (self.fetch)(conn, object, lookup);
+        cx.spawn(async move |this, cx| {
+            let result = fetch.await;
+            this.update(cx, |this, cx| {
+                if !this.is_showing(&name) {
+                    return;
+                }
+                cx.emit(match result {
+                    Ok(sql) => SchemaEvent::Insert(sql),
+                    Err(e) => SchemaEvent::Failed(format!("{what}: {e:#}")),
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The right-click menu of a function or procedure.
+    fn routine_menu(
+        &self,
+        object: &ObjectInfo,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
+    {
+        let this = cx.entity().downgrade();
+        let object = object.clone();
+        move |menu, _, _| {
+            let item = |label: &'static str, lookup: Lookup| {
+                let (this, object) = (this.clone(), object.clone());
+                PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| this.look_up(object.clone(), lookup, cx))
+                        .ok();
+                })
+            };
+            let call = match object.kind {
+                ObjectKind::Procedure => "Insert CALL",
+                _ => "Insert SELECT",
+            };
+            menu.item(item("Show definition", Lookup::Definition))
+                .item(item(call, Lookup::Call))
+        }
+    }
+
     fn filter_text(&self, cx: &App) -> String {
         self.filter.read(cx).value().to_string()
     }
@@ -387,6 +491,7 @@ impl SchemaPanel {
             Target::Schema(name) => name.clone(),
             Target::Table(key) => key.table.clone(),
             Target::Group(_, kind) => kind.plural().to_owned(),
+            Target::Object(object) => object.name.clone(),
         })
     }
 
@@ -455,6 +560,9 @@ impl SchemaPanel {
             }) => self.toggle_table(key, cx),
             Some(Row::Table { key, .. }) => self.set_cursor(Target::Schema(key.schema), cx),
             Some(Row::Group { schema, .. }) => self.set_cursor(Target::Schema(schema), cx),
+            Some(Row::Object(object)) => {
+                self.set_cursor(Target::Group(object.schema, object.kind), cx)
+            }
             _ => {}
         }
     }
@@ -483,12 +591,14 @@ impl SchemaPanel {
         }
     }
 
-    /// Enter: shows a table's rows, and opens or closes anything else.
+    /// Enter: shows a table's rows or an object's definition, and opens or closes
+    /// anything else.
     fn open_cursor(&mut self, cx: &mut Context<Self>) {
         match self.cursor_row(cx) {
             Some(Row::Schema { name, .. }) => self.toggle_schema(&name, cx),
             Some(Row::Table { key, .. }) => self.preview(&key, cx),
             Some(Row::Group { schema, kind, .. }) => self.toggle_group(schema, kind, cx),
+            Some(Row::Object(object)) => self.look_up(object, Lookup::Definition, cx),
             _ => {}
         }
     }
@@ -554,6 +664,13 @@ impl SchemaPanel {
                 let id = format!("table-{}-{}", key.schema, key.table);
                 let group = SharedString::from(format!("row-{id}"));
                 let preview_key = key.clone();
+                let view = ObjectInfo {
+                    schema: key.schema.clone(),
+                    kind: ObjectKind::View,
+                    name: key.table.clone(),
+                    detail: String::new(),
+                };
+                let view_key = key.clone();
                 line()
                     .id(SharedString::from(id.clone()))
                     .test_support()
@@ -579,6 +696,22 @@ impl SchemaPanel {
                             .flex_none()
                             .invisible()
                             .group_hover(group, |s| s.visible())
+                            .when(is_view, |el| {
+                                el.child(
+                                    Button::new(SharedString::from(format!("definition-{id}")))
+                                        .cursor_pointer()
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::FileText)
+                                        .tooltip("Show the definition")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            let target = Target::Table(view_key.clone());
+                                            this.take_cursor(target, window, cx);
+                                            this.look_up(view.clone(), Lookup::Definition, cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new(SharedString::from(format!("preview-{id}")))
                                     .cursor_pointer()
@@ -642,18 +775,47 @@ impl SchemaPanel {
                     this.toggle_group(schema.clone(), kind, cx);
                 }))
                 .into_any_element(),
-            Row::Object { name, detail } => line()
-                .pl(px(34.))
-                .child(div().flex_1().min_w_0().truncate().text_xs().child(name))
-                .child(
-                    div()
-                        .max_w(px(120.))
-                        .truncate()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(detail),
-                )
-                .into_any_element(),
+            Row::Object(object) => {
+                let el = line()
+                    .pl(px(34.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .child(object.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(120.))
+                            .truncate()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(object.detail.clone()),
+                    );
+                // Kinds with no source, such as sequences, do nothing when clicked.
+                if !object.kind.has_definition() {
+                    return el.into_any_element();
+                }
+                let menu = object
+                    .kind
+                    .is_routine()
+                    .then(|| self.routine_menu(&object, cx));
+                let el = el
+                    .id(SharedString::from(object_id(&object)))
+                    .test_support()
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.take_cursor(Target::Object(object.clone()), window, cx);
+                        this.look_up(object.clone(), Lookup::Definition, cx);
+                    }));
+                match menu {
+                    Some(menu) => el.context_menu(menu).into_any_element(),
+                    None => el.into_any_element(),
+                }
+            }
             Row::Note(text) => line()
                 .pl(px(50.))
                 .text_xs()
@@ -806,7 +968,7 @@ mod tests {
                 Row::Table { key, .. } => key.table.clone(),
                 Row::Column { name, .. } => format!("  {name}"),
                 Row::Group { kind, count, .. } => format!("{}({count})", kind.plural()),
-                Row::Object { name, .. } => format!("  {name}"),
+                Row::Object(object) => format!("  {}", object.name),
                 Row::Note(text) => format!("  {text}"),
             })
             .collect()
