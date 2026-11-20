@@ -108,7 +108,8 @@ Changing one of these needs the user's explicit agreement, not just a passing re
 - **S1. Secrets never go in config files.** Config is plain, secret-free data; passwords
   live in the OS credential store. See [docs/CREDENTIALS.md](docs/CREDENTIALS.md).
 - **S2. Agents are read-only by default.** Writes need both the MCP opt-in and a writable
-  connection. Never weaken the guard in `core/src/safety.rs` and `core/src/db.rs`:
+  connection. Never weaken the guard in `core/src/safety.rs` and `core/src/db.rs`, or
+  the read-only statements in each engine module's `DIALECT` under `core/src/db/`:
   read keyword allowlist, prepared statements (one statement only), server-enforced
   read-only transaction (`PRAGMA query_only` on SQLite, which has no such transaction).
 
