@@ -354,7 +354,16 @@ impl Workspace {
         // Small local file read once before the first frame.
         let (config, status) = match Config::load() {
             Ok(config) => (config, Status::Idle),
-            Err(e) => (Config::default(), Status::Failed(format!("{e:#}").into())),
+            Err(e) => (
+                Config::default(),
+                Status::Failed(
+                    format!(
+                        "{e:#}. Your connections are not shown. The file is kept: if you \
+                         change anything, it is moved aside first, never overwritten."
+                    )
+                    .into(),
+                ),
+            ),
         };
         theme::set_appearance(config.appearance, Some(window), cx);
         cx.observe_window_appearance(window, |this, window, cx| {
