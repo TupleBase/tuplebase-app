@@ -57,6 +57,74 @@ pub enum Adapter {
     Sqlite,
 }
 
+/// How a database quotes an identifier such as a table name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentQuote {
+    /// `"name"`, with `"` doubled inside: standard SQL.
+    Double,
+    /// `` `name` ``, with `` ` `` doubled inside: MySQL and MariaDB.
+    Backtick,
+}
+
+/// Which rules `safety::split_statements` follows to cut a script into statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptFlavor {
+    /// Dollar quotes, nested block comments and `E'...'` escape strings; backticks are
+    /// not quotes.
+    Postgres,
+    /// `#` comments, backslash escapes, and routine bodies kept whole.
+    Mysql,
+    /// Plain SQL quotes and comments only.
+    Standard,
+}
+
+/// What every part of TupleBase may need to know about an engine without talking to it.
+/// One constant per engine, chosen by [`Adapter::info`]. The SQL that `db` runs on an
+/// engine lives in that engine's module under `db/` (ARCHITECTURE.md, L7).
+#[derive(Debug, PartialEq, Eq)]
+pub struct EngineInfo {
+    /// The name shown to people, such as `PostgreSQL`.
+    pub label: &'static str,
+    /// The port a server listens on unless told otherwise; 0 for a file database.
+    pub default_port: u16,
+    /// A local file, with no server, user or password.
+    pub is_file: bool,
+    pub quote: IdentQuote,
+    pub script: ScriptFlavor,
+}
+
+const POSTGRES: EngineInfo = EngineInfo {
+    label: "PostgreSQL",
+    default_port: 5432,
+    is_file: false,
+    quote: IdentQuote::Double,
+    script: ScriptFlavor::Postgres,
+};
+
+const MARIADB: EngineInfo = EngineInfo {
+    label: "MariaDB",
+    default_port: 3306,
+    is_file: false,
+    quote: IdentQuote::Backtick,
+    script: ScriptFlavor::Mysql,
+};
+
+const MYSQL: EngineInfo = EngineInfo {
+    label: "MySQL",
+    default_port: 3306,
+    is_file: false,
+    quote: IdentQuote::Backtick,
+    script: ScriptFlavor::Mysql,
+};
+
+const SQLITE: EngineInfo = EngineInfo {
+    label: "SQLite",
+    default_port: 0,
+    is_file: true,
+    quote: IdentQuote::Double,
+    script: ScriptFlavor::Standard,
+};
+
 impl Adapter {
     pub const ALL: [Adapter; 4] = [
         Adapter::Postgres,
@@ -65,25 +133,30 @@ impl Adapter {
         Adapter::Sqlite,
     ];
 
+    /// This engine's static facts. A new engine adds its constant here.
+    pub fn info(self) -> &'static EngineInfo {
+        match self {
+            Adapter::Postgres => &POSTGRES,
+            Adapter::Mariadb => &MARIADB,
+            Adapter::Mysql => &MYSQL,
+            Adapter::Sqlite => &SQLITE,
+        }
+    }
+
     /// Whether the database is a local file, with no server, user or password.
     pub fn is_file(self) -> bool {
-        self == Adapter::Sqlite
+        self.info().is_file
     }
 
     pub fn label(self) -> &'static str {
-        match self {
-            Adapter::Postgres => "PostgreSQL",
-            Adapter::Mariadb => "MariaDB",
-            Adapter::Mysql => "MySQL",
-            Adapter::Sqlite => "SQLite",
-        }
+        self.info().label
     }
 
     /// Quotes an identifier for this database.
     pub fn quote_ident(self, ident: &str) -> String {
-        match self {
-            Adapter::Postgres | Adapter::Sqlite => format!("\"{}\"", ident.replace('"', "\"\"")),
-            Adapter::Mariadb | Adapter::Mysql => format!("`{}`", ident.replace('`', "``")),
+        match self.info().quote {
+            IdentQuote::Double => format!("\"{}\"", ident.replace('"', "\"\"")),
+            IdentQuote::Backtick => format!("`{}`", ident.replace('`', "``")),
         }
     }
 
@@ -97,11 +170,7 @@ impl Adapter {
     }
 
     pub fn default_port(self) -> u16 {
-        match self {
-            Adapter::Postgres => 5432,
-            Adapter::Mariadb | Adapter::Mysql => 3306,
-            Adapter::Sqlite => 0,
-        }
+        self.info().default_port
     }
 }
 
@@ -935,6 +1004,44 @@ mod tests {
             auth: Auth::Password,
             source: None,
         }
+    }
+
+    #[test]
+    fn every_adapter_is_listed_once() {
+        // Fails to compile when a variant is added, as a reminder to add it to ALL too.
+        let position = |adapter: Adapter| match adapter {
+            Adapter::Postgres => 0,
+            Adapter::Mariadb => 1,
+            Adapter::Mysql => 2,
+            Adapter::Sqlite => 3,
+        };
+        for (i, adapter) in Adapter::ALL.into_iter().enumerate() {
+            assert_eq!(position(adapter), i);
+        }
+    }
+
+    #[test]
+    fn each_engine_has_its_own_facts() {
+        let labels = Adapter::ALL.map(Adapter::label);
+        assert_eq!(labels, ["PostgreSQL", "MariaDB", "MySQL", "SQLite"]);
+        let ports = Adapter::ALL.map(Adapter::default_port);
+        assert_eq!(ports, [5432, 3306, 3306, 0]);
+        for adapter in Adapter::ALL {
+            // Only a server has a port.
+            let info = adapter.info();
+            assert_eq!(info.is_file, info.default_port == 0, "{}", info.label);
+        }
+        assert!(Adapter::Sqlite.is_file());
+        assert_eq!(Adapter::Sqlite.quote_ident(r#"a"b"#), r#""a""b""#);
+        assert_eq!(Adapter::Mysql.quote_ident("a`b"), "`a``b`");
+        assert_eq!(
+            Adapter::Postgres.preview_sql("public", "users"),
+            r#"SELECT * FROM "public"."users" LIMIT 100"#
+        );
+        assert_eq!(Adapter::Postgres.info().script, ScriptFlavor::Postgres);
+        assert_eq!(Adapter::Mariadb.info().script, ScriptFlavor::Mysql);
+        assert_eq!(Adapter::Mysql.info().script, ScriptFlavor::Mysql);
+        assert_eq!(Adapter::Sqlite.info().script, ScriptFlavor::Standard);
     }
 
     #[test]

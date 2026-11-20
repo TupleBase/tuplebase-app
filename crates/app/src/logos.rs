@@ -13,22 +13,32 @@ static BRAND: LazyLock<Arc<Image>> = LazyLock::new(|| {
     ))
 });
 
-fn glyph(adapter: Adapter) -> &'static [u8] {
-    match adapter {
-        Adapter::Postgres => include_bytes!("../../../assets/logos/postgresql.svg"),
-        Adapter::Mariadb => include_bytes!("../../../assets/logos/mariadb.svg"),
-        Adapter::Mysql => include_bytes!("../../../assets/logos/mysql.svg"),
-        Adapter::Sqlite => include_bytes!("../../../assets/logos/sqlite.svg"),
-    }
+/// How a database looks in the app: its mark, and its brand color, deep enough to
+/// carry the white mark on either theme.
+struct Logo {
+    glyph: &'static [u8],
+    color: u32,
 }
 
-/// Each database's brand color, deep enough to carry a white mark on either theme.
-fn database_color(adapter: Adapter) -> u32 {
+/// Each engine's logo. A new engine adds its SVG to `assets/logos/` and an arm here.
+fn logo(adapter: Adapter) -> Logo {
     match adapter {
-        Adapter::Postgres => 0x336791,
-        Adapter::Mariadb => 0xA0522D,
-        Adapter::Mysql => 0x00758F,
-        Adapter::Sqlite => 0x0F80CC,
+        Adapter::Postgres => Logo {
+            glyph: include_bytes!("../../../assets/logos/postgresql.svg"),
+            color: 0x336791,
+        },
+        Adapter::Mariadb => Logo {
+            glyph: include_bytes!("../../../assets/logos/mariadb.svg"),
+            color: 0xA0522D,
+        },
+        Adapter::Mysql => Logo {
+            glyph: include_bytes!("../../../assets/logos/mysql.svg"),
+            color: 0x00758F,
+        },
+        Adapter::Sqlite => Logo {
+            glyph: include_bytes!("../../../assets/logos/sqlite.svg"),
+            color: 0x0F80CC,
+        },
     }
 }
 
@@ -38,12 +48,13 @@ fn parse_color(color: &str) -> Option<u32> {
 
 /// The color a connection shows: its own choice, or else its database's color.
 pub fn color_of(adapter: Adapter, color: &str) -> Hsla {
-    rgb(parse_color(color).unwrap_or_else(|| database_color(adapter))).into()
+    rgb(parse_color(color).unwrap_or_else(|| logo(adapter).color)).into()
 }
 
 /// A database's icon: its mark on a tile of its brand color. A connection's own color
 /// never changes it, so the icon always says which database this is.
 pub fn icon(adapter: Adapter, size: f32) -> Div {
+    let logo = logo(adapter);
     div()
         .flex()
         .flex_none()
@@ -51,10 +62,10 @@ pub fn icon(adapter: Adapter, size: f32) -> Div {
         .justify_center()
         .size(px(size))
         .rounded(px(size * 0.22))
-        .bg(rgb(database_color(adapter)))
+        .bg(rgb(logo.color))
         .child(
             Icon::default()
-                .data(glyph(adapter))
+                .data(logo.glyph)
                 .with_size(px((size * 0.78).round()))
                 .text_color(white()),
         )
@@ -74,9 +85,24 @@ pub fn brand(size: f32) -> Img {
 
 #[cfg(test)]
 mod tests {
-    use super::color_of;
+    use super::{color_of, logo};
     use gpui_kit::{Hsla, rgb};
     use tuplebase_core::config::Adapter;
+
+    #[test]
+    fn every_engine_has_its_own_logo() {
+        let logos = Adapter::ALL.map(logo);
+        for (adapter, logo) in Adapter::ALL.iter().zip(&logos) {
+            let is_svg = logo.glyph.windows(4).any(|w| w == b"<svg");
+            assert!(is_svg, "{} has no SVG mark", adapter.label());
+            assert_eq!(
+                logos.iter().filter(|l| l.color == logo.color).count(),
+                1,
+                "{} shares its color",
+                adapter.label()
+            );
+        }
+    }
 
     #[test]
     fn a_connection_color_replaces_the_database_color() {

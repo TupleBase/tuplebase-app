@@ -167,6 +167,27 @@ pub struct Parameter {
 
 // What the engine modules share. Each engine's own SQL stays in its module.
 
+/// An engine's fixed SQL, besides its queries: each engine module has one, `DIALECT`.
+/// The facts that need no SQL, such as its name and port, are in
+/// [`Adapter::info`](crate::config::Adapter::info).
+struct Dialect {
+    /// Runs before each statement when the caller or the connection is read-only (S2):
+    /// a server-enforced read-only transaction, or a switch that does the same.
+    read_only_begin: &'static str,
+    /// Runs after the statement, ending what `read_only_begin` started.
+    read_only_end: &'static str,
+    /// What [`Db::list_objects`] lists, with the query for each kind.
+    objects: &'static [(ObjectKind, &'static str)],
+}
+
+#[cfg(test)]
+impl Dialect {
+    /// The kinds of object [`Db::list_objects`] lists on this engine.
+    fn object_kinds(&self) -> impl Iterator<Item = ObjectKind> {
+        self.objects.iter().map(|&(kind, _)| kind)
+    }
+}
+
 /// An object's source as an engine read it: `None` when there's no such object,
 /// `Some(None)` when there is one but the database hides its source.
 type Source = Option<Option<String>>;
@@ -434,23 +455,28 @@ impl Db {
         let mut changed = false;
 
         macro_rules! run_all {
-            ($pool:expr, $begin:literal, $end:literal, $decode:path) => {{
+            ($pool:expr, $dialect:expr, $decode:path) => {{
+                let Dialect {
+                    read_only_begin: begin,
+                    read_only_end: end,
+                    ..
+                } = $dialect;
                 let mut c = $pool.acquire().await?;
                 for (index, sql) in statements.iter().copied().enumerate() {
                     if read_only {
-                        c.execute($begin).await?;
+                        c.execute(begin).await?;
                     }
                     let mut out = run!(&mut *c, sql, opts.max_rows, $decode);
                     // The statement never ran, and its types are known now: run it again,
                     // in a new read-only transaction when it had one.
                     if out.as_ref().is_err_and(lost_unnamed_statement) {
                         if read_only {
-                            c.execute($end).await?;
-                            c.execute($begin).await?;
+                            c.execute(end).await?;
+                            c.execute(begin).await?;
                         }
                         out = run!(&mut *c, sql, opts.max_rows, $decode);
                     }
-                    if read_only && c.execute($end).await.is_err() {
+                    if read_only && c.execute(end).await.is_err() {
                         c.close_on_drop();
                     }
                     let result = if total > 1 {
@@ -466,22 +492,9 @@ impl Db {
             }};
         }
         match self.pool(conn).await? {
-            Pool::Pg(pool) => run_all!(pool, "BEGIN READ ONLY", "ROLLBACK", postgres::value),
-            Pool::My(pool) => {
-                run_all!(
-                    pool,
-                    "START TRANSACTION READ ONLY",
-                    "ROLLBACK",
-                    mysql::value
-                )
-            }
-            // SQLite has no read-only transactions; this switch makes it refuse writes.
-            Pool::Sqlite(pool) => run_all!(
-                pool,
-                "PRAGMA query_only = ON",
-                "PRAGMA query_only = OFF",
-                sqlite::value
-            ),
+            Pool::Pg(pool) => run_all!(pool, postgres::DIALECT, postgres::value),
+            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value),
+            Pool::Sqlite(pool) => run_all!(pool, sqlite::DIALECT, sqlite::value),
         }
 
         let mut result = shown.expect("callers pass at least one statement");
@@ -495,72 +508,19 @@ impl Db {
 
     /// Column names across the connection's tables, for autocomplete.
     pub async fn list_column_names(&self, conn: &Connection) -> Result<Vec<String>> {
-        let rows: Vec<(String,)> = match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                sqlx::query_as(
-                    "SELECT DISTINCT column_name::text FROM information_schema.columns \
-                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                     ORDER BY 1 LIMIT 5000",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::My(p) => {
-                sqlx::query_as(
-                    "SELECT DISTINCT CAST(column_name AS CHAR) FROM information_schema.columns \
-                     WHERE table_schema NOT IN \
-                     ('mysql', 'information_schema', 'performance_schema', 'sys') \
-                     ORDER BY 1 LIMIT 5000",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::Sqlite(p) => {
-                sqlx::query_as(
-                    "SELECT DISTINCT p.name FROM sqlite_master m \
-                     JOIN pragma_table_info(m.name) p \
-                     WHERE m.type IN ('table', 'view') ORDER BY 1 LIMIT 5000",
-                )
-                .fetch_all(&p)
-                .await?
-            }
+        let rows = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::column_names(&p).await?,
+            Pool::My(p) => mysql::column_names(&p).await?,
+            Pool::Sqlite(p) => sqlite::column_names(&p).await?,
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
 
     pub async fn list_tables(&self, conn: &Connection) -> Result<Vec<TableInfo>> {
-        let rows: Vec<(String, String, String)> = match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                sqlx::query_as(
-                    "SELECT table_schema::text, table_name::text, table_type::text \
-                     FROM information_schema.tables \
-                     WHERE table_schema NOT IN ('pg_catalog', 'information_schema') \
-                     ORDER BY 1, 2",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::My(p) => {
-                sqlx::query_as(
-                    "SELECT CAST(table_schema AS CHAR), CAST(table_name AS CHAR), \
-                     CAST(table_type AS CHAR) FROM information_schema.tables \
-                     WHERE table_schema NOT IN \
-                     ('mysql', 'information_schema', 'performance_schema', 'sys') \
-                     ORDER BY 1, 2",
-                )
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::Sqlite(p) => {
-                sqlx::query_as(
-                    "SELECT 'main', name, \
-                     CASE type WHEN 'view' THEN 'VIEW' ELSE 'BASE TABLE' END \
-                     FROM sqlite_master \
-                     WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                )
-                .fetch_all(&p)
-                .await?
-            }
+        let rows = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::tables(&p).await?,
+            Pool::My(p) => mysql::tables(&p).await?,
+            Pool::Sqlite(p) => sqlite::tables(&p).await?,
         };
         Ok(rows
             .into_iter()
@@ -586,44 +546,10 @@ impl Db {
         schema: Option<&str>,
         table: &str,
     ) -> Result<Vec<ColumnInfo>> {
-        let rows: Vec<(String, String, String)> = match self.pool(conn).await? {
-            Pool::Pg(p) => {
-                sqlx::query_as(
-                    "SELECT column_name::text, data_type::text, is_nullable::text \
-                     FROM information_schema.columns \
-                     WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
-                )
-                .bind(schema.unwrap_or("public"))
-                .bind(table)
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::My(p) => {
-                sqlx::query_as(
-                    "SELECT CAST(column_name AS CHAR), CAST(column_type AS CHAR), \
-                     CAST(is_nullable AS CHAR) FROM information_schema.columns \
-                     WHERE table_schema = COALESCE(?, DATABASE()) AND table_name = ? \
-                     ORDER BY ordinal_position",
-                )
-                .bind(schema.or((!conn.database.is_empty()).then_some(conn.database.as_str())))
-                .bind(table)
-                .fetch_all(&p)
-                .await?
-            }
-            Pool::Sqlite(p) => {
-                let columns: Vec<(String, String, i64)> =
-                    sqlx::query_as("SELECT name, type, \"notnull\" FROM pragma_table_info(?)")
-                        .bind(table)
-                        .fetch_all(&p)
-                        .await?;
-                columns
-                    .into_iter()
-                    .map(|(name, data_type, not_null)| {
-                        let nullable = if not_null == 0 { "YES" } else { "NO" };
-                        (name, data_type, nullable.to_owned())
-                    })
-                    .collect()
-            }
+        let rows = match self.pool(conn).await? {
+            Pool::Pg(p) => postgres::columns(&p, schema, table).await?,
+            Pool::My(p) => mysql::columns(&p, schema, &conn.database, table).await?,
+            Pool::Sqlite(p) => sqlite::columns(&p, table).await?,
         };
         if rows.is_empty() {
             bail!("table \"{table}\" not found");
@@ -814,6 +740,55 @@ pub(super) mod tests {
             mode,
             name: name.into(),
             data_type: data_type.into(),
+        }
+    }
+
+    /// The dialect each adapter's pool uses. Fails to compile when an engine is added
+    /// without one.
+    fn dialect(adapter: Adapter) -> &'static Dialect {
+        match adapter {
+            Adapter::Postgres => &postgres::DIALECT,
+            Adapter::Mariadb | Adapter::Mysql => &mysql::DIALECT,
+            Adapter::Sqlite => &sqlite::DIALECT,
+        }
+    }
+
+    /// These statements are part of the read-only guard (S2): changing one changes it.
+    #[test]
+    fn read_only_statements_are_pinned() {
+        let statements = |adapter| {
+            let dialect = dialect(adapter);
+            (dialect.read_only_begin, dialect.read_only_end)
+        };
+        assert_eq!(
+            statements(Adapter::Postgres),
+            ("BEGIN READ ONLY", "ROLLBACK")
+        );
+        for adapter in [Adapter::Mariadb, Adapter::Mysql] {
+            assert_eq!(
+                statements(adapter),
+                ("START TRANSACTION READ ONLY", "ROLLBACK")
+            );
+        }
+        assert_eq!(
+            statements(Adapter::Sqlite),
+            ("PRAGMA query_only = ON", "PRAGMA query_only = OFF")
+        );
+    }
+
+    #[test]
+    fn each_engine_lists_its_own_kinds_of_object() {
+        use ObjectKind::*;
+        let kinds = |adapter| dialect(adapter).object_kinds().collect::<Vec<_>>();
+        assert_eq!(
+            kinds(Adapter::Postgres),
+            [Function, Procedure, Sequence, Type, Extension, Trigger]
+        );
+        assert_eq!(kinds(Adapter::Mysql), [Function, Procedure, Trigger, Event]);
+        assert_eq!(kinds(Adapter::Sqlite), [Trigger, Index]);
+        for adapter in Adapter::ALL {
+            // Views are listed with the tables.
+            assert!(!kinds(adapter).contains(&View));
         }
     }
 
