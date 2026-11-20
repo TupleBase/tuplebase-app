@@ -188,6 +188,7 @@ impl AwsPicker {
                             region: None,
                             kind: cloud::DiscoverErrorKind::Other,
                             message: format!("{e:#}"),
+                            detail: None,
                         }],
                         ..Discovery::default()
                     },
@@ -359,12 +360,26 @@ impl AwsPicker {
                         .region
                         .as_ref()
                         .map_or(String::new(), |r| format!("{r}: "));
-                    div()
-                        .id(SharedString::from(format!("aws-error-{i}")))
-                        .test_support()
-                        .text_sm()
-                        .text_color(danger)
-                        .child(format!("{place}{}", error.message))
+                    v_flex()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("aws-error-{i}")))
+                                .test_support()
+                                .text_sm()
+                                .text_color(danger)
+                                .child(format!("{place}{}", error.message)),
+                        )
+                        .when_some(error.detail.clone(), |el, detail| {
+                            el.child(
+                                div()
+                                    .id(SharedString::from(format!("aws-error-detail-{i}")))
+                                    .test_support()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(detail),
+                            )
+                        })
                 });
                 let nothing = discovery.found.is_empty() && discovery.errors.is_empty();
                 let results: Vec<_> = discovery
@@ -676,7 +691,8 @@ pub(crate) mod tests {
                         errors: vec![DiscoverError {
                             region: None,
                             kind: DiscoverErrorKind::SignIn,
-                            message: "Run `aws sso login --profile prod` and try again.".into(),
+                            message: "Run `aws sso login --profile prod`, then Retry.".into(),
+                            detail: Some("failed to read the SSO cache".into()),
                         }],
                         ..Discovery::default()
                     },
@@ -686,6 +702,7 @@ pub(crate) mod tests {
         });
         act(handle, cx, |window, cx| {
             assert!(window.find("aws-error-0").visible());
+            assert!(window.find("aws-error-detail-0").visible());
             assert!(window.try_find("aws-empty").is_none());
             window.click("aws-retry", cx);
         });

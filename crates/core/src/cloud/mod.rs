@@ -85,8 +85,10 @@ pub struct DiscoverError {
     /// The region, or `None` when nothing could be searched.
     pub region: Option<String>,
     pub kind: DiscoverErrorKind,
-    /// What to tell the user, including what to do about it.
+    /// What to tell the user, including what to do about it: one short line.
     pub message: String,
+    /// The technical cause, if there is more to it, to show less prominently.
+    pub detail: Option<String>,
 }
 
 /// What a search found, region by region.

@@ -279,6 +279,7 @@ pub async fn discover(profile: &str, regions: &[String]) -> Discovery {
                 region: None,
                 kind: DiscoverErrorKind::TimedOut,
                 message: "Timed out signing in to AWS.".into(),
+                detail: None,
             });
             return discovery;
         }
@@ -309,6 +310,7 @@ pub async fn discover(profile: &str, regions: &[String]) -> Discovery {
                 region: Some(region.clone()),
                 kind: DiscoverErrorKind::TimedOut,
                 message: format!("Timed out listing the databases in {region}."),
+                detail: None,
             }),
         }
     }
@@ -549,27 +551,48 @@ fn login_command(profile: &str) -> String {
 
 /// Why signing in failed, from [`sdk_config`]'s message.
 fn sign_in_error(profile: &str, message: &str) -> DiscoverError {
-    let (kind, message) = if message.contains("no AWS region") {
+    let who = match profile {
+        "" => "your default AWS credentials".to_owned(),
+        profile => format!("\"{profile}\""),
+    };
+    // What came after the summary, in parentheses: the technical cause.
+    let cause = message
+        .split_once(" (")
+        .map(|(_, rest)| rest.strip_suffix(')').unwrap_or(rest).to_owned());
+    let (kind, message, detail) = if message.contains("no AWS region") {
         (
             DiscoverErrorKind::NoRegion,
             "No region to search: add one, or set one in the AWS profile.".to_owned(),
+            None,
         )
     } else if message.contains("is not in your AWS config") {
-        (DiscoverErrorKind::Other, format!("{message}."))
-    } else {
+        (
+            DiscoverErrorKind::Other,
+            format!("The AWS profile {who} isn't in your AWS config."),
+            cause,
+        )
+    } else if message.starts_with(SSO_SIGN_IN_NEEDED) {
         (
             DiscoverErrorKind::SignIn,
             format!(
-                "Couldn't sign in to AWS ({message}). If your session expired, run `{}` \
-                 and try again.",
+                "Your AWS sign-in for {who} has expired or never happened. Run `{}`, then \
+                 Retry.",
                 login_command(profile)
             ),
+            cause,
+        )
+    } else {
+        (
+            DiscoverErrorKind::SignIn,
+            format!("Couldn't get AWS credentials for {who}."),
+            cause.or_else(|| Some(message.to_owned())),
         )
     };
     DiscoverError {
         region: None,
         kind,
         message,
+        detail,
     }
 }
 
@@ -609,6 +632,7 @@ fn region_error(region: &str, profile: &str, failure: ApiFailure) -> DiscoverErr
         region: Some(region.to_owned()),
         kind,
         message,
+        detail: None,
     }
 }
 
@@ -622,25 +646,24 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
         .build_https();
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).http_client(http.clone());
     if !profile.is_empty() {
-        // The default chain reads AWS_ACCESS_KEY_ID and friends before any profile, so
-        // keys in the environment would win over a profile the user chose. A named
-        // profile reads only that profile.
-        let provider_config = ProviderConfig::default().with_http_client(http);
-        let credentials = ProfileFileCredentialsProvider::builder()
-            .configure(&provider_config)
-            .profile_name(profile)
-            .build();
-        loader = loader
-            .profile_name(profile)
-            .credentials_provider(credentials);
+        loader = loader.profile_name(profile);
     }
     if !region.is_empty() {
         loader = loader.region(Region::new(region.to_owned()));
     }
+    // The region: the one given, else the profile's, else the default chain's.
     let config = loader.load().await;
-    let provider = config
-        .credentials_provider()
-        .context("no AWS credentials are set up on this machine")?;
+    let provider = if profile.is_empty() {
+        config
+            .credentials_provider()
+            .context("no AWS credentials are set up on this machine")?
+    } else {
+        // The default chain reads AWS_ACCESS_KEY_ID and friends before any profile, so
+        // keys in the environment would win over a profile the user chose. A named
+        // profile reads only that profile. A profile that assumes a role asks STS, which
+        // needs the region.
+        SharedCredentialsProvider::new(profile_credentials(profile, &config, http))
+    };
     let credentials = match provider.provide_credentials().await {
         Ok(credentials) => credentials,
         Err(e) if !profile_exists(profile).await => {
@@ -650,14 +673,14 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
             )
         }
         Err(e) => {
-            let mut login = "aws sso login".to_owned();
-            if !profile.is_empty() {
-                login = format!("{login} --profile {profile}");
+            let cause = causes(&e);
+            if is_sso_sign_in(&cause) {
+                bail!(
+                    "{SSO_SIGN_IN_NEEDED}: run `{}` ({cause})",
+                    login_command(profile)
+                );
             }
-            bail!(
-                "no usable AWS credentials ({}). If your session expired, run `{login}`",
-                causes(&e)
-            )
+            bail!("no usable AWS credentials ({cause})")
         }
     };
     if config.region().is_none() {
@@ -667,6 +690,38 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
         .into_builder()
         .credentials_provider(SharedCredentialsProvider::new(credentials))
         .build())
+}
+
+/// Credentials from the profile named `profile` only, with `config`'s region and HTTP
+/// client for whatever it has to ask, such as STS for a role.
+fn profile_credentials(
+    profile: &str,
+    config: &SdkConfig,
+    http: aws_sdk_ssm::config::SharedHttpClient,
+) -> ProfileFileCredentialsProvider {
+    let provider_config = provider_config(config, http);
+    ProfileFileCredentialsProvider::builder()
+        .configure(&provider_config)
+        .profile_name(profile)
+        .build()
+}
+
+fn provider_config(
+    config: &SdkConfig,
+    http: aws_sdk_ssm::config::SharedHttpClient,
+) -> ProviderConfig {
+    ProviderConfig::default()
+        .with_http_client(http)
+        .with_region(config.region().cloned())
+}
+
+/// The start of the error when an AWS SSO session has expired or was never started.
+const SSO_SIGN_IN_NEEDED: &str = "the AWS sign-in has expired or never happened";
+
+/// Whether a credentials failure is an SSO session that needs `aws sso login`.
+fn is_sso_sign_in(cause: &str) -> bool {
+    let cause = cause.to_ascii_lowercase();
+    cause.contains("sso") || cause.contains("token has expired")
 }
 
 /// Whether the AWS config files define `profile`. True for the default one, and when the
@@ -859,14 +914,30 @@ mod tests {
 
     #[test]
     fn discovery_errors_say_what_to_do() {
+        // As `sdk_config` words it.
+        let cause = "failed to read `/root/.aws/sso/cache/abc.json`: No such file";
         let expired = sign_in_error(
             "prod-sso",
-            "no usable AWS credentials (the SSO token expired). If your session expired, run \
-             `aws sso login --profile prod-sso`",
+            &format!("{SSO_SIGN_IN_NEEDED}: run `aws sso login --profile prod-sso` ({cause})"),
         );
         assert_eq!(expired.kind, DiscoverErrorKind::SignIn);
-        assert!(expired.message.contains("aws sso login --profile prod-sso"));
+        assert_eq!(
+            expired.message,
+            "Your AWS sign-in for \"prod-sso\" has expired or never happened. Run \
+             `aws sso login --profile prod-sso`, then Retry."
+        );
+        assert_eq!(expired.detail.as_deref(), Some(cause));
         assert_eq!(expired.region, None);
+        assert!(is_sso_sign_in(cause));
+
+        let role = sign_in_error("admin", "no usable AWS credentials (AccessDenied from STS)");
+        assert_eq!(role.message, "Couldn't get AWS credentials for \"admin\".");
+        assert!(
+            !role.message.contains("sso"),
+            "no SSO hint for another failure"
+        );
+        assert_eq!(role.detail.as_deref(), Some("AccessDenied from STS"));
+        assert!(!is_sso_sign_in("AccessDenied from STS"));
 
         let no_region = sign_in_error("", "no AWS region: set one on the connection");
         assert_eq!(no_region.kind, DiscoverErrorKind::NoRegion);
