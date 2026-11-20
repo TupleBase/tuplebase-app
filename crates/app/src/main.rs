@@ -13,7 +13,7 @@ mod theme;
 mod tree_nav;
 mod workspace;
 
-use gpui_kit::component::{GlobalState, Theme, TitleBar};
+use gpui_kit::component::{GlobalState, TitleBar};
 use gpui_kit::*;
 use workspace::{
     About, AddMcpToAgents, CheckForUpdates, DecreaseFontSize, IncreaseFontSize, OpenSettings,
@@ -82,7 +82,6 @@ fn main() {
                 ..TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
-                Theme::sync_system_appearance(Some(window), cx);
                 let workspace = cx.new(|cx| Workspace::new(window, cx));
                 workspace::register_menu_actions(&workspace, window.window_handle(), cx);
                 workspace

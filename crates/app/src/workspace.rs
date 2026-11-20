@@ -22,7 +22,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::{self, AgentState, AgentStatus};
 use tuplebase_core::config::{
-    Adapter, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name, parent_of,
+    Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name, parent_of,
     rebase_folder,
 };
 use tuplebase_core::db::{Db, ExecOptions};
@@ -356,8 +356,11 @@ impl Workspace {
             Ok(config) => (config, Status::Idle),
             Err(e) => (Config::default(), Status::Failed(format!("{e:#}").into())),
         };
-        cx.observe_window_appearance(window, |_, window, cx| {
-            Theme::sync_system_appearance(Some(window), cx);
+        theme::set_appearance(config.appearance, Some(window), cx);
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if this.config.appearance.is_system() {
+                theme::set_appearance(Appearance::System, Some(window), cx);
+            }
         })
         .detach();
         let mut this = Self::with_config(config, status, window, cx);
@@ -643,6 +646,21 @@ impl Workspace {
         if self.config.font_size != before {
             theme::set_font_size(self.config.font_size, cx);
             self.save_config(cx);
+        }
+    }
+
+    /// Settings' choice of light or dark colors.
+    fn set_appearance(
+        &mut self,
+        appearance: Appearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.appearance != appearance {
+            self.config.appearance = appearance;
+            theme::set_appearance(appearance, Some(window), cx);
+            self.save_config(cx);
+            cx.notify();
         }
     }
 
@@ -2475,17 +2493,17 @@ fn history_label(sql: &str) -> String {
 mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
     use super::{
-        About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, OpenSettings, Status,
-        TreeRow, UpdateState, Workspace, bind_keys, register_menu_actions,
+        About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, OpenSettings,
+        SettingsPage, Status, TreeRow, UpdateState, Workspace, bind_keys, register_menu_actions,
     };
-    use gpui_kit::component::{Theme, ThemeMode, WindowExt as _};
+    use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
         AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds,
         WindowOptions, point, px, size,
     };
     use serde_json::json;
-    use tuplebase_core::config::{Adapter, AwsAuth, AwsStore};
+    use tuplebase_core::config::{Adapter, Appearance, AwsAuth, AwsStore};
     use tuplebase_core::db::QueryResult;
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
@@ -2555,6 +2573,32 @@ mod tests {
             ]),
             "MCP server running for 4 agents: claude-code, codex"
         );
+    }
+
+    #[gpui_kit::test]
+    fn settings_switches_between_light_dark_and_system(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_settings(SettingsPage::General, window, cx);
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("appearance-dark", cx));
+        cx.update(|cx| {
+            assert_eq!(workspace.read(cx).config.appearance, Appearance::Dark);
+            assert!(cx.theme().mode.is_dark());
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("appearance-light", cx)
+        });
+        cx.update(|cx| {
+            assert_eq!(workspace.read(cx).config.appearance, Appearance::Light);
+            assert!(!cx.theme().mode.is_dark());
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("appearance-system", cx)
+        });
+        cx.update(|cx| assert!(workspace.read(cx).config.appearance.is_system()));
     }
 
     #[gpui_kit::test]

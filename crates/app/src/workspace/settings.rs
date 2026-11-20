@@ -12,6 +12,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::AgentState;
+use tuplebase_core::config::Appearance;
 
 use super::Workspace;
 
@@ -61,12 +62,43 @@ impl Workspace {
 
 fn general(workspace: &Entity<Workspace>) -> SettingPage {
     const CHECK_UPDATES: &str = "Check for updates at startup";
+    let appearance = workspace.clone();
     let updates = workspace.clone();
     let history = workspace.clone();
     SettingPage::new("General")
         .icon(IconName::Settings)
         .default_open(true)
         .resettable(false)
+        .group(
+            SettingGroup::new().title("Appearance").item(
+                SettingItem::new(
+                    "Theme",
+                    SettingField::render(move |_, _, cx| {
+                        let chosen = appearance.read(cx).config.appearance;
+                        ButtonGroup::new("appearance").outline().small().children(
+                            Appearance::ALL.map(|option| {
+                                let workspace = appearance.clone();
+                                Button::new(SharedString::from(format!(
+                                    "appearance-{}",
+                                    option.label().to_lowercase()
+                                )))
+                                .cursor_pointer()
+                                .label(option.label())
+                                .selected(option == chosen)
+                                .on_click(
+                                    move |_, window, cx| {
+                                        workspace.update(cx, |this, cx| {
+                                            this.set_appearance(option, window, cx);
+                                        });
+                                    },
+                                )
+                            }),
+                        )
+                    }),
+                )
+                .description("System follows your computer's light or dark setting."),
+            ),
+        )
         .group(
             SettingGroup::new().title("Updates").item(
                 SettingItem::new(
