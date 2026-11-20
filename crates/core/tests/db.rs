@@ -490,10 +490,12 @@ async fn postgres_custom_types_can_be_read_on_a_fresh_connection() {
         return;
     }
     let conn = connection(Adapter::Postgres);
+    // Its own type: `postgres_objects_beyond_tables_are_listed` drops and recreates
+    // `it_mood` while this test may be running.
     Db::new()
         .execute_script(
             &conn,
-            "DROP TYPE IF EXISTS it_mood; CREATE TYPE it_mood AS ENUM ('happy', 'sad')",
+            "DROP TYPE IF EXISTS it_fresh_enum; CREATE TYPE it_fresh_enum AS ENUM ('happy', 'sad')",
             WRITE,
         )
         .await
@@ -501,7 +503,7 @@ async fn postgres_custom_types_can_be_read_on_a_fresh_connection() {
     for opts in [READ, WRITE] {
         // A new `Db` has a new pool, so the type is unknown to it.
         let r = Db::new()
-            .execute(&conn, "SELECT 'happy'::it_mood AS mood", opts)
+            .execute(&conn, "SELECT 'happy'::it_fresh_enum AS mood", opts)
             .await
             .unwrap_or_else(|e| panic!("read_only: {}: {e:#}", opts.read_only));
         assert_eq!(r.columns, ["mood"]);
