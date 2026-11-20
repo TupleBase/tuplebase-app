@@ -1239,7 +1239,7 @@ mod tests {
             let kept = config.save_to(&path).unwrap().expect("moved aside");
             assert_eq!(
                 files_named(dir.path(), "connections.unreadable-"),
-                [kept.clone()]
+                std::slice::from_ref(&kept)
             );
             assert_eq!(fs::read(&kept).unwrap(), text);
             assert!(Config::load_from(&path).is_ok());
