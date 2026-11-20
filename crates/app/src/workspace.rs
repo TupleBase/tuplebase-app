@@ -534,18 +534,21 @@ impl Workspace {
             let added = blocking(move || Ok(agents::add_to(name)))
                 .await
                 .unwrap_or_default();
-            this.update(cx, |this, cx| {
-                for status in added {
-                    let mut shown = this.agents.iter_mut().flatten();
-                    if let Some(shown) = shown.find(|shown| shown.name == status.name) {
-                        shown.state = status.state;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.update_agents(added, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Puts each status on its agent's row, leaving the other rows as they are.
+    fn update_agents(&mut self, statuses: Vec<AgentStatus>, cx: &mut Context<Self>) {
+        for status in statuses {
+            let mut shown = self.agents.iter_mut().flatten();
+            if let Some(shown) = shown.find(|shown| shown.name == status.name) {
+                shown.state = status.state;
+            }
+        }
+        cx.notify();
     }
 
     fn finish_adding_mcp(
@@ -2577,6 +2580,29 @@ mod tests {
         });
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("add-mcp-Cursor").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn adding_to_one_agent_changes_only_its_row(cx: &mut TestAppContext) {
+        let status = |name, state| AgentStatus { name, state };
+        let (_, workspace) = open(Config::default(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.agents = Some(vec![
+                    status("Cursor", AgentState::Added),
+                    status("Codex", AgentState::NotAdded),
+                ]);
+                // A result read while Cursor was still being added must not undo it.
+                this.update_agents(vec![status("Codex", AgentState::Added)], cx);
+                assert_eq!(
+                    this.agents,
+                    Some(vec![
+                        status("Cursor", AgentState::Added),
+                        status("Codex", AgentState::Added),
+                    ])
+                );
+            });
         });
     }
 
