@@ -20,7 +20,9 @@ async fn a_profile_that_assumes_a_role_signs_in_through_sts() {
         &config,
         "[profile base]\naws_access_key_id = test\naws_secret_access_key = test\n\n\
          [profile admin]\nrole_arn = arn:aws:iam::123456789012:role/admin\n\
-         source_profile = base\nregion = eu-west-1\n",
+         source_profile = base\nregion = eu-west-1\n\n\
+         [profile regionless]\nrole_arn = arn:aws:iam::123456789012:role/admin\n\
+         source_profile = base\n",
     )
     .unwrap();
     // SAFETY: the only test in this binary, before anything reads the environment.
@@ -31,6 +33,8 @@ async fn a_profile_that_assumes_a_role_signs_in_through_sts() {
             dir.path().join("credentials"),
         );
         std::env::set_var("AWS_ENDPOINT_URL", FAKE_AWS);
+        // No region from EC2 instance metadata either.
+        std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
         for name in [
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
@@ -52,4 +56,7 @@ async fn a_profile_that_assumes_a_role_signs_in_through_sts() {
         assert_ne!(credentials.access_key_id(), "test");
         assert!(credentials.session_token().is_some());
     }
+    // A role profile with no region anywhere is told so, not sent to STS without one.
+    let error = aws::sdk_config("regionless", "").await.unwrap_err();
+    assert!(format!("{error:#}").contains("no AWS region"), "{error:#}");
 }

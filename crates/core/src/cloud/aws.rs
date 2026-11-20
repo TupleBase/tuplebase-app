@@ -656,6 +656,13 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
     }
     // The region: the one given, else the profile's, else the default chain's.
     let config = loader.load().await;
+    // Before signing in: without a region, a role profile would fail at STS instead.
+    if config.region().is_none() {
+        if !profile_exists(profile).await {
+            bail!("the AWS profile \"{profile}\" is not in your AWS config");
+        }
+        bail!("no AWS region: set one on the connection or in the AWS profile");
+    }
     let provider = if profile.is_empty() {
         config
             .credentials_provider()
@@ -686,9 +693,6 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
             bail!("no usable AWS credentials ({cause})")
         }
     };
-    if config.region().is_none() {
-        bail!("no AWS region: set one on the connection or in the AWS profile");
-    }
     Ok(config
         .into_builder()
         .credentials_provider(SharedCredentialsProvider::new(credentials))
@@ -721,10 +725,21 @@ fn provider_config(
 /// The start of the error when an AWS SSO session has expired or was never started.
 const SSO_SIGN_IN_NEEDED: &str = "the AWS sign-in has expired or never happened";
 
-/// Whether a credentials failure is an SSO session that needs `aws sso login`.
+/// Whether a credentials failure is an SSO session that needs `aws sso login`. The SDK's
+/// SSO error types are private, so this matches what they say: the SSO token (missing,
+/// unreadable or expired), its cache file, refreshing it through SSO OIDC, or the SSO
+/// service refusing it. Not a profile's name, and not other expired credentials.
 fn is_sso_sign_in(cause: &str) -> bool {
     let cause = cause.to_ascii_lowercase();
-    cause.contains("sso") || cause.contains("token has expired")
+    [
+        "sso token",
+        "sso oidc",
+        "/.aws/sso/cache/",
+        "\\.aws\\sso\\cache\\",
+        "unauthorizedexception: session token not found or invalid",
+    ]
+    .iter()
+    .any(|phrase| cause.contains(phrase))
 }
 
 /// Whether the AWS config files define `profile`. True for the default one, and when the
@@ -942,6 +957,24 @@ mod tests {
         );
         assert_eq!(role.detail.as_deref(), Some("AccessDenied from STS"));
         assert!(!is_sso_sign_in("AccessDenied from STS"));
+        // What the SDK says when the SSO sign-in is the problem.
+        for cause in [
+            "the SSO token has expired and cannot be refreshed",
+            "failed to load the cached SSO token: invalid JSON in cached SSO token file",
+            "call to SSO OIDC CreateToken for SSO token refresh failed: dispatch failure",
+            "service error: UnauthorizedException: Session token not found or invalid",
+            r"failed to read `C:\Users\me\.aws\sso\cache\abc.json`: not found",
+        ] {
+            assert!(is_sso_sign_in(cause), "{cause}");
+        }
+        // Not for a profile that merely has "sso" in its name, nor other expired keys.
+        for cause in [
+            "profile `prod-sso` assumes a role: AccessDenied: not authorized",
+            "ExpiredToken: The security token included in the request is expired",
+            "the token has expired",
+        ] {
+            assert!(!is_sso_sign_in(cause), "{cause}");
+        }
 
         let no_region = sign_in_error("", "no AWS region: set one on the connection");
         assert_eq!(no_region.kind, DiscoverErrorKind::NoRegion);
