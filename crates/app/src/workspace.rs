@@ -1140,13 +1140,10 @@ impl Workspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, target) = (this.clone(), name.clone());
             alert
-                .title(format!("Delete the connection “{name}”?"))
-                .description(
-                    "Only the saved connection and its password in the keychain are removed. \
-                     The database and its data are not touched.",
-                )
+                .title(format!("Delete “{name}”?"))
+                .description("Its saved password is removed from the keychain.")
                 .confirm()
-                .footer(dialogs::confirm_footer("Delete connection"))
+                .footer(dialogs::confirm_footer("Delete"))
                 .on_ok(move |_, _, cx| {
                     this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
                         .ok();
@@ -2094,15 +2091,13 @@ impl Workspace {
                 menu
             };
             menu.item(
-                PopupMenuItem::new("Edit connection")
-                    .on_click(menu_click(&this, move |this, window, cx| {
-                        this.edit_connection(edited.clone(), window, cx)
-                    })),
+                PopupMenuItem::new("Edit").on_click(menu_click(&this, move |this, window, cx| {
+                    this.edit_connection(edited.clone(), window, cx)
+                })),
             )
             .separator()
             .item(
-                // "connection", so it's never mistaken for dropping the database.
-                PopupMenuItem::new("Delete connection")
+                PopupMenuItem::new("Delete")
                     .on_click(menu_click(&this, move |this, window, cx| {
                         this.confirm_delete(name.clone(), window, cx)
                     })),
@@ -2140,14 +2135,14 @@ impl Workspace {
                 )),
             )
             .separator()
-            .item(PopupMenuItem::new("Rename folder").on_click(menu_click(
+            .item(PopupMenuItem::new("Rename").on_click(menu_click(
                 &this,
                 move |this, window, cx| {
                     this.begin_folder_edit(String::new(), Some(rename.clone()), window, cx);
                 },
             )))
             .item(
-                PopupMenuItem::new("Delete folder")
+                PopupMenuItem::new("Delete")
                     .on_click(menu_click(&this, move |this, window, cx| {
                         this.confirm_remove_folder(remove.clone(), window, cx)
                     })),
@@ -2891,7 +2886,26 @@ mod tests {
         window_action(handle, cx, |window, cx| window.click(2usize, cx));
         window_action(handle, cx, |window, cx| {
             assert!(window.has_active_dialog(cx));
+            // Its Cancel still reaches the dialog after the menu took focus.
+            window.click("cancel", cx);
         });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn right_clicking_a_folder_can_delete_it_after_asking(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.right_click("folder-Production", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click(4usize, cx));
+        window_action(handle, cx, |window, cx| window.click("ok", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+        cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
 
     #[gpui_kit::test]
