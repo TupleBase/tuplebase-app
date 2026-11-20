@@ -1,9 +1,11 @@
 // No console window for release builds on Windows.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod aws_picker;
 mod chat;
 mod completions;
 mod conn_form;
+mod conn_source;
 mod logos;
 mod results;
 mod row_detail;

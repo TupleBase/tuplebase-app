@@ -55,7 +55,9 @@ character replaced by `_`: connection `app-db` reads `TUPLEBASE_SECRET_APP_DB_PA
 ## Credentials kept in AWS
 
 A connection can take its credentials from AWS instead of the credential store. In the
-connection form, set **Credentials** to **AWS Secrets Manager** or **AWS Parameter Store**.
+connection form, set **Credentials** to **Secrets Manager**, **Parameter Store** or **IAM
+token**. A database found in AWS (see [below](#finding-databases-in-aws)) comes with the
+right one already chosen.
 
 `connections.json` then holds only where to look, never the value:
 
@@ -65,11 +67,11 @@ connection form, set **Credentials** to **AWS Secrets Manager** or **AWS Paramet
 
 | Field             | Meaning                                                                      |
 | ----------------- | ---------------------------------------------------------------------------- |
-| `type`            | `aws_secret` (Secrets Manager) or `aws_parameter` (Parameter Store)          |
+| `type`            | `aws_secret` (Secrets Manager), `aws_parameter` (Parameter Store) or `aws_iam` (IAM token) |
 | `profile`         | A profile from `~/.aws/config`. Leave out to use your default AWS credentials |
 | `region`          | Leave out to use the profile's region                                        |
-| `name`            | Secret name or ARN, or parameter name                                        |
-| `use_secret_host` | Also take the host, port and database from the secret                        |
+| `name`            | Secret name or ARN, or parameter name (not for `aws_iam`)                    |
+| `use_secret_host` | Also take the host, port and database from the secret (not for `aws_iam`)    |
 
 The value is read from AWS every time the connection opens and is kept in memory only, so a
 rotated password needs nothing from you. It can be:
@@ -86,6 +88,95 @@ Signing in to AWS stays outside the app. When an SSO session has expired, run
 `aws sso login --profile <name>` and connect again.
 
 The MCP server reads these the same way, with the AWS profile of the user it runs as.
+
+### IAM tokens
+
+With **IAM token**, there is no password at all: each time the app connects it makes an
+[RDS IAM auth token](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.IAMDBAuth.html)
+for the connection's user from your AWS profile. A token lasts 15 minutes, or less when
+the profile's credentials expire sooner (a role session, say), so while a connection is
+open the app makes a new one after two thirds of that, at most 10 minutes, for the
+connections it opens next. If a token runs out without a new one, for example because your SSO session expired
+or the computer slept, the next query connects again and says what went wrong, such as the
+`aws sso login` command to run. The token is signed for the database's own host name, also
+when you connect through an SSH tunnel. With no region set, it uses the one in an
+`*.rds.amazonaws.com` host name.
+
+A connection that names an AWS profile signs in with that profile only, even when
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` are set in the environment. With no
+profile, the usual AWS order applies: environment variables first, then the default
+profile, then the rest.
+
+```json
+"auth": { "type": "aws_iam", "profile": "prod-sso", "region": "eu-west-1" }
+```
+
+RDS takes a token only over an encrypted connection, so **Encryption** must be **Required**
+or **Verified**. The database needs IAM authentication turned on, and the database user
+must be set up for it (`GRANT rds_iam TO app_user;` on PostgreSQL,
+`CREATE USER app_user IDENTIFIED WITH AWSAuthenticationPlugin AS 'RDS';` on MySQL and
+MariaDB). On MySQL and MariaDB the token is sent in clear text inside the encrypted
+connection, as RDS requires; no other password is ever sent that way.
+
+A `connections.json` with an IAM token connection is written as `"version": 2`.
+**TupleBase 0.10.0 and older can't read a file with an IAM token connection.** They show
+no connections, and changing any setting there replaces the file with an empty one. Update
+TupleBase first on every computer that uses this file, before adding an IAM token
+connection.
+
+Before this version raises a version 1 file to version 2, it keeps the version 1 file as
+`connections.v1-backup.json` in the same folder and never deletes it. To go back to an
+older version, copy it over `connections.json`. Remove the IAM token connection and the
+file goes back to version 1. If it is later raised again with other connections in it, the
+earlier backup is kept as `connections.v1-backup-<time>.json` and the backup holds the
+newer file.
+
+This version never writes over a `connections.json` it can't read, for example one from a
+newer version. It starts without it, leaves the file as it is and says so in the status
+line. Only when you change something is the file renamed to
+`connections.unreadable-<time>.json`, and the status line names it. Rename it back once
+you run a version that reads it. A file that can't be opened at all, such as one another
+program holds locked, is never moved and nothing is saved until TupleBase is restarted
+and can read it.
+
+### Verifying an RDS certificate
+
+With **Encryption** set to **Verified**, a database at an `*.rds.amazonaws.com` (or
+`*.rds.amazonaws.com.cn`) host is also checked against
+[Amazon's RDS certificate authorities](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html),
+which come with the app.
+
+### Finding databases in AWS
+
+**New connection** → **Amazon Web Services** lists the RDS databases and Aurora clusters
+your AWS profile can see, in the regions you choose (the profile's own by default). The
+app remembers the profile and regions you searched last, in `state.json`. Pick one and the
+form is filled in: name, host and port, master user, database, and **Encryption**:
+**Verified** for a public database (the RDS certificate is checked), **Required** for a
+private one, which you reach through an SSH tunnel. Its credentials are:
+
+- the master user's secret, when RDS manages it in Secrets Manager;
+- otherwise an IAM token, when the database has IAM authentication on;
+- otherwise a password you type.
+
+An Aurora cluster is listed once, at its writer endpoint; the note names its reader
+endpoint. A database that isn't publicly accessible needs an SSH tunnel to a host in its
+VPC. Engines other than PostgreSQL, MySQL and MariaDB are listed but can't be used yet.
+
+The connection keeps where it was found, as `"source": { "provider": "aws", "resource":
+"<ARN>", "region": "<region>" }`. That is the database's ARN, never a secret.
+
+### Permissions
+
+| To                                | Your AWS identity needs                                          |
+| --------------------------------- | ---------------------------------------------------------------- |
+| Find databases                    | `rds:DescribeDBInstances` and `rds:DescribeDBClusters`           |
+| Read a secret                     | `secretsmanager:GetSecretValue`, plus `kms:Decrypt` for your own KMS key |
+| Read a parameter                  | `ssm:GetParameter`, plus `kms:Decrypt` for your own KMS key      |
+| Sign in with an IAM token         | `rds-db:connect` on `arn:aws:rds-db:<region>:<account>:dbuser:<resource id>/<user>` |
+
+The RDS-managed master secret is encrypted with a KMS key; with the default
+`aws/secretsmanager` key, `secretsmanager:GetSecretValue` is enough.
 
 ## Removing everything
 

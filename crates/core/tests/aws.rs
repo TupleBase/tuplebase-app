@@ -1,12 +1,12 @@
-//! Credentials kept in AWS, against the fake `aws` service in `docker-compose.yml`.
-//! Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
+//! Credentials kept in AWS and finding databases in RDS, against the fake `aws` service
+//! in `docker-compose.yml`. Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
 
 use std::sync::Once;
 
 use aws_sdk_ssm::types::ParameterType;
 use serde_json::json;
-use tuplebase_core::aws;
-use tuplebase_core::config::{Adapter, AwsAuth, AwsStore, Connection};
+use tuplebase_core::cloud::{self, aws};
+use tuplebase_core::config::{Adapter, Auth, AwsSecretRef, AwsStore, Connection, Provider};
 use tuplebase_core::db::{Db, ExecOptions};
 
 const READ: ExecOptions = ExecOptions {
@@ -62,6 +62,12 @@ async fn put_parameter(name: &str, value: &str) {
 
 /// A MariaDB connection that says nothing itself: no host, user or stored password.
 fn connection(name: &str, store: AwsStore, secret: &str) -> Connection {
+    let secret = AwsSecretRef {
+        profile: String::new(),
+        region: "eu-west-1".into(),
+        name: secret.into(),
+        use_secret_host: true,
+    };
     Connection {
         name: name.into(),
         folder: String::new(),
@@ -74,13 +80,11 @@ fn connection(name: &str, store: AwsStore, secret: &str) -> Connection {
         color: String::new(),
         tls: Default::default(),
         ssh: None,
-        auth: Some(AwsAuth {
-            store,
-            profile: String::new(),
-            region: "eu-west-1".into(),
-            name: secret.into(),
-            use_secret_host: true,
-        }),
+        auth: match store {
+            AwsStore::SecretsManager => Auth::AwsSecret(secret),
+            AwsStore::ParameterStore => Auth::AwsParameter(secret),
+        },
+        source: None,
     }
 }
 
@@ -130,7 +134,9 @@ async fn a_parameter_works_as_json_or_as_the_password_alone() {
         AwsStore::ParameterStore,
         "/it/maria/password",
     );
-    conn.auth.as_mut().unwrap().use_secret_host = false;
+    if let Auth::AwsParameter(parameter) = &mut conn.auth {
+        parameter.use_secret_host = false;
+    }
     conn.host = "127.0.0.1".into();
     conn.port = 53306;
     conn.database = "app".into();
@@ -164,4 +170,113 @@ async fn a_missing_secret_is_reported_by_name() {
     assert!(error.contains("\"it/nope\""), "{error}");
     assert!(error.contains("AWS Secrets Manager"), "{error}");
     assert!(error.contains("ResourceNotFoundException"), "{error}");
+}
+
+/// Accepts a database left in the fake RDS by an earlier run.
+fn created<T, E: aws_sdk_rds::error::ProvideErrorMetadata>(
+    result: Result<T, aws_sdk_rds::error::SdkError<E>>,
+) {
+    if let Err(e) = result {
+        let code = e
+            .as_service_error()
+            .and_then(|e| e.code())
+            .unwrap_or("none");
+        assert!(code.contains("AlreadyExists"), "creating failed: {code}");
+    }
+}
+
+#[tokio::test]
+async fn discovery_finds_instances_and_aurora_clusters_with_their_sign_in() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    // Regions no other test uses, so nothing else lands there.
+    const REGION: &str = "ap-southeast-2";
+    const EMPTY: &str = "ca-central-1";
+    use_fake_aws();
+    let rds = aws_sdk_rds::Client::new(&aws::sdk_config("", REGION).await.unwrap());
+    created(
+        rds.create_db_instance()
+            .db_instance_identifier("it-disc-orders")
+            .engine("postgres")
+            .db_instance_class("db.t3.micro")
+            .allocated_storage(20)
+            .master_username("orders_admin")
+            .db_name("orders")
+            .manage_master_user_password(true)
+            .publicly_accessible(true)
+            .send()
+            .await,
+    );
+    created(
+        rds.create_db_instance()
+            .db_instance_identifier("it-disc-iam")
+            .engine("mysql")
+            .db_instance_class("db.t3.micro")
+            .allocated_storage(20)
+            .master_username("iam_admin")
+            .master_user_password("not-used-123")
+            .enable_iam_database_authentication(true)
+            .send()
+            .await,
+    );
+    created(
+        rds.create_db_cluster()
+            .db_cluster_identifier("it-disc-shop")
+            .engine("aurora-postgresql")
+            .master_username("shop_admin")
+            .manage_master_user_password(true)
+            .send()
+            .await,
+    );
+    created(
+        rds.create_db_instance()
+            .db_instance_identifier("it-disc-shop-1")
+            .db_cluster_identifier("it-disc-shop")
+            .engine("aurora-postgresql")
+            .db_instance_class("db.r6g.large")
+            .send()
+            .await,
+    );
+
+    let regions = [REGION.to_owned(), EMPTY.to_owned()];
+    let discovery = cloud::discover(Provider::Aws, "", &regions).await;
+    assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
+    assert_eq!(discovery.empty_regions, [EMPTY]);
+    let find = |label: &str| {
+        let found = discovery.found.iter().find(|d| d.label == label);
+        found.unwrap_or_else(|| panic!("{label} is not in {:?}", discovery.found))
+    };
+
+    let orders = find("it-disc-orders");
+    assert_eq!(orders.adapter, Some(Adapter::Postgres));
+    assert_eq!(orders.user, "orders_admin");
+    assert_eq!(orders.database, "orders");
+    assert!(!orders.host.is_empty() && orders.port > 0);
+    assert!(orders.public);
+    assert!(orders.managed_secret.is_some());
+    assert!(
+        matches!(&orders.auth, Auth::AwsSecret(s) if !s.use_secret_host && s.region == REGION),
+        "{:?}",
+        orders.auth
+    );
+    assert_eq!(orders.source.region, REGION);
+    assert!(orders.source.resource.starts_with("arn:aws:rds:"));
+
+    let iam = find("it-disc-iam");
+    assert_eq!(iam.adapter, Some(Adapter::Mysql));
+    assert!(iam.iam_enabled);
+    assert!(matches!(iam.auth, Auth::AwsIam(_)), "{:?}", iam.auth);
+
+    let shop = find("it-disc-shop");
+    assert_eq!(shop.adapter, Some(Adapter::Postgres));
+    assert_eq!(shop.user, "shop_admin");
+    assert!(shop.managed_secret.is_some());
+    assert!(shop.note.as_deref().is_some_and(|n| n.contains("Aurora")));
+    assert!(
+        discovery.found.iter().all(|d| d.label != "it-disc-shop-1"),
+        "a cluster's instance is listed on its own"
+    );
+    assert!(shop.connection().is_some_and(|c| c.source.is_some()));
 }

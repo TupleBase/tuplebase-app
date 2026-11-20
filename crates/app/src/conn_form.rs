@@ -6,9 +6,13 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tuplebase_core::config::{Adapter, AwsAuth, AwsStore, Connection, SshConfig, TlsMode};
+use tuplebase_core::config::{
+    Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Source, SshConfig, TlsMode,
+};
 use tuplebase_core::ssh;
+use tuplebase_core::state::CloudSearch;
 
+use crate::conn_source::{ConnSource, ConnSourceEvent};
 use crate::logos;
 use crate::runtime::io;
 
@@ -30,9 +34,16 @@ pub enum ConnFormEvent {
         previous: Option<String>,
     },
     Cancel,
+    /// Remember where a search for databases in AWS looked.
+    SearchedAws(CloudSearch),
 }
 
 pub struct ConnForm {
+    /// The step before the form for a new connection: where the database is.
+    start: Option<Entity<ConnSource>>,
+    _start_subscription: Option<Subscription>,
+    /// What to know about a database that was found, shown above the form.
+    notice: Option<SharedString>,
     previous: Option<String>,
     adapter: Adapter,
     /// A new connection asks for the database first and shows the rest once it is chosen.
@@ -44,8 +55,12 @@ pub struct ConnForm {
     database: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
-    /// `None` means a password; otherwise where in AWS the credentials are.
-    aws_store: Option<AwsStore>,
+    /// Where the password comes from.
+    auth_kind: AuthKind,
+    /// Where the connection was discovered; kept as it is.
+    source: Option<Source>,
+    /// The host it was found at; `source` is dropped if the host changes.
+    source_host: String,
     aws_profile: Entity<InputState>,
     aws_region: Entity<InputState>,
     aws_name: Entity<InputState>,
@@ -68,9 +83,11 @@ impl EventEmitter<ConnFormEvent> for ConnForm {}
 
 impl ConnForm {
     /// `existing` pre-fills the form for editing; `folder` is where it gets saved.
+    /// `last_aws` is where the last search for databases in AWS looked.
     pub fn new(
         existing: Option<&Connection>,
         folder: String,
+        last_aws: CloudSearch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -96,11 +113,16 @@ impl ConnForm {
             },
             String::new(),
         );
-        let aws = existing.and_then(|c| c.auth.as_ref());
-        let aws_field = |f: fn(&AwsAuth) -> String| aws.map(f).unwrap_or_default();
-        let aws_profile = input("Default credentials", aws_field(|a| a.profile.clone()));
-        let aws_region = input("The profile's region", aws_field(|a| a.region.clone()));
-        let aws_name = input("prod/orders-db", aws_field(|a| a.name.clone()));
+        let auth = existing.map(|c| c.auth.clone()).unwrap_or_default();
+        let (profile, region) = auth.aws_profile().unwrap_or_default();
+        let secret = auth.secret().map(|(_, secret)| secret);
+        let aws_profile = input("Default credentials", profile.to_owned());
+        let aws_region = input("The profile's region", region.to_owned());
+        let aws_name = input(
+            "prod/orders-db",
+            secret.map(|s| s.name.clone()).unwrap_or_default(),
+        );
+        let use_secret_host = secret.is_some_and(|s| s.use_secret_host);
         let ssh = existing.and_then(|c| c.ssh.as_ref());
         let ssh_field = |f: fn(&SshConfig) -> String| ssh.map(f).unwrap_or_default();
         let ssh_host = input("bastion.example.com", ssh_field(|s| s.host.clone()));
@@ -116,7 +138,18 @@ impl ConnForm {
             String::new(),
         );
         let ssh_fingerprint = input("SHA256:…", ssh_field(|s| s.fingerprint.clone()));
+        // A new connection first asks where the database is.
+        let (start, start_subscription) = if existing.is_none() {
+            let start = cx.new(|_| ConnSource::new(last_aws));
+            let subscription = cx.subscribe_in(&start, window, Self::on_start_event);
+            (Some(start), Some(subscription))
+        } else {
+            (None, None)
+        };
         Self {
+            start,
+            _start_subscription: start_subscription,
+            notice: None,
             previous: existing.map(|c| c.name.clone()),
             adapter: existing.map_or(Adapter::Postgres, |c| c.adapter),
             chosen: existing.is_some(),
@@ -127,11 +160,13 @@ impl ConnForm {
             database,
             user,
             password,
-            aws_store: aws.map(|a| a.store),
+            auth_kind: auth.kind(),
+            source: existing.and_then(|c| c.source.clone()),
+            source_host: existing.map(|c| c.host.clone()).unwrap_or_default(),
             aws_profile,
             aws_region,
             aws_name,
-            use_secret_host: aws.is_some_and(|a| a.use_secret_host),
+            use_secret_host,
             readonly: existing.is_some_and(|c| c.readonly),
             color: existing.map(|c| c.color.clone()).unwrap_or_default(),
             tls: existing.map_or(TlsMode::default(), |c| c.tls),
@@ -147,9 +182,95 @@ impl ConnForm {
         }
     }
 
+    fn on_start_event(
+        &mut self,
+        _: &Entity<ConnSource>,
+        event: &ConnSourceEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConnSourceEvent::Manual => self.close_start(cx),
+            ConnSourceEvent::Use { connection, note } => {
+                self.prefill(connection, window, cx);
+                self.notice = note.clone().map(Into::into);
+                self.close_start(cx);
+            }
+            ConnSourceEvent::SearchedAws(search) => {
+                cx.emit(ConnFormEvent::SearchedAws(search.clone()));
+            }
+        }
+    }
+
+    fn close_start(&mut self, cx: &mut Context<Self>) {
+        self.start = None;
+        self._start_subscription = None;
+        cx.notify();
+    }
+
+    /// The step before the form, while it is shown.
+    #[cfg(test)]
+    pub fn start(&self) -> Option<&Entity<ConnSource>> {
+        self.start.as_ref()
+    }
+
+    /// Fills the form with a connection that was found, to check and save as new.
+    pub fn prefill(&mut self, conn: &Connection, window: &mut Window, cx: &mut Context<Self>) {
+        let mut set = |input: &Entity<InputState>, value: String| {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        };
+        set(&self.name, conn.name.clone());
+        set(&self.host, conn.host.clone());
+        set(&self.port, conn.port.to_string());
+        set(&self.database, conn.database.clone());
+        set(&self.user, conn.user.clone());
+        let (profile, region) = conn.auth.aws_profile().unwrap_or_default();
+        set(&self.aws_profile, profile.to_owned());
+        set(&self.aws_region, region.to_owned());
+        let secret = conn.auth.secret().map(|(_, secret)| secret);
+        set(
+            &self.aws_name,
+            secret.map(|s| s.name.clone()).unwrap_or_default(),
+        );
+        self.use_secret_host = secret.is_some_and(|s| s.use_secret_host);
+        self.adapter = conn.adapter;
+        self.chosen = true;
+        self.auth_kind = conn.auth.kind();
+        self.tls = conn.tls;
+        self.source = conn.source.clone();
+        self.source_host = conn.host.clone();
+        cx.notify();
+    }
+
     /// Whether the secret names the host, so the Host and Port fields are hidden.
     fn host_from_secret(&self) -> bool {
-        self.aws_store.is_some() && self.use_secret_host && !self.adapter.is_file()
+        self.uses_secret() && self.use_secret_host && !self.adapter.is_file()
+    }
+
+    /// Whether the credentials come from a secret or parameter in AWS.
+    fn uses_secret(&self) -> bool {
+        matches!(self.auth_kind, AuthKind::AwsSecret | AuthKind::AwsParameter)
+    }
+
+    /// The credentials as chosen, from the visible fields only.
+    fn auth(&self, cx: &App) -> Auth {
+        let text = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let secret = || AwsSecretRef {
+            profile: text(&self.aws_profile),
+            region: text(&self.aws_region),
+            name: text(&self.aws_name),
+            use_secret_host: self.use_secret_host,
+        };
+        match self.auth_kind {
+            _ if self.adapter.is_file() => Auth::Password,
+            AuthKind::Password => Auth::Password,
+            AuthKind::AwsSecret => Auth::AwsSecret(secret()),
+            AuthKind::AwsParameter => Auth::AwsParameter(secret()),
+            AuthKind::AwsIam => Auth::AwsIam(AwsIamAuth {
+                profile: text(&self.aws_profile),
+                region: text(&self.aws_region),
+            }),
+        }
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
@@ -193,17 +314,8 @@ impl ConnForm {
             None
         };
         let uses_ssh = ssh.is_some();
-        let auth = self
-            .aws_store
-            .filter(|_| !self.adapter.is_file())
-            .map(|store| AwsAuth {
-                store,
-                profile: text(&self.aws_profile, cx),
-                region: text(&self.aws_region, cx),
-                name: text(&self.aws_name, cx),
-                use_secret_host: self.use_secret_host,
-            });
-        let password = visible(&self.password, auth.is_none(), cx);
+        let auth = self.auth(cx);
+        let password = visible(&self.password, auth.is_password(), cx);
         let ssh_password = text(&self.ssh_password, cx);
         cx.emit(ConnFormEvent::Save {
             connection: Connection {
@@ -219,6 +331,11 @@ impl ConnForm {
                 tls: self.tls,
                 ssh,
                 auth,
+                // Where it was found no longer applies to another server, such as one a
+                // secret names.
+                source: self.source.clone().filter(|_| {
+                    !self.host_from_secret() && text(&self.host, cx) == self.source_host
+                }),
             },
             password: (!password.is_empty()).then_some(password),
             ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),
@@ -348,44 +465,55 @@ impl ConnForm {
         ))
     }
 
-    fn render_auth(
-        &self,
-        store: Option<AwsStore>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let label = store.map_or("Password", AwsStore::label);
-        choice("auth", label, self.aws_store == store, cx).on_click(cx.listener(
+    fn render_auth(&self, kind: AuthKind, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        choice("auth", kind.label(), self.auth_kind == kind, cx).on_click(cx.listener(
             move |this, _, _, cx| {
-                this.aws_store = store;
+                this.choose_auth(kind);
                 cx.notify();
             },
         ))
     }
 
-    fn render_aws(&self, store: AwsStore, cx: &mut Context<Self>) -> impl IntoElement {
-        let name_label = match store {
-            AwsStore::SecretsManager => "Secret name or ARN",
-            AwsStore::ParameterStore => "Parameter name",
-        };
-        v_flex()
+    fn choose_auth(&mut self, kind: AuthKind) {
+        self.auth_kind = kind;
+        // RDS takes an IAM token only over an encrypted connection.
+        if kind == AuthKind::AwsIam && self.tls == TlsMode::Prefer {
+            self.tls = TlsMode::Require;
+        }
+    }
+
+    fn render_aws(&self, kind: AuthKind, cx: &mut Context<Self>) -> impl IntoElement {
+        let profile = h_flex()
+            .gap_3()
+            .child(field(
+                "AWS profile",
+                Input::new(&self.aws_profile).id("conn-aws-profile"),
+                cx,
+            ))
+            .child(field(
+                "Region",
+                Input::new(&self.aws_region).id("conn-aws-region"),
+                cx,
+            ));
+        let column = v_flex()
             .gap_3()
             .pl_4()
             .border_l_2()
             .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(field(
-                        "AWS profile",
-                        Input::new(&self.aws_profile).id("conn-aws-profile"),
-                        cx,
-                    ))
-                    .child(field(
-                        "Region",
-                        Input::new(&self.aws_region).id("conn-aws-region"),
-                        cx,
-                    )),
-            )
+            .child(profile);
+        let name_label = match kind {
+            AuthKind::AwsSecret => "Secret name or ARN",
+            AuthKind::AwsParameter => "Parameter name",
+            AuthKind::Password | AuthKind::AwsIam => {
+                return column.child(hint(
+                    "A token for the user below is made from your AWS profile each time you \
+                     connect. The user needs rds-db:connect, and the database IAM \
+                     authentication turned on.",
+                    cx,
+                ));
+            }
+        };
+        column
             .child(
                 field(
                     name_label,
@@ -517,21 +645,22 @@ impl ConnForm {
     }
 
     fn render_credentials(&self, cx: &mut Context<Self>) -> Div {
-        let aws_store = self.aws_store;
+        let kind = self.auth_kind;
         v_flex()
             .gap_3()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(self.render_auth(None, cx))
-                    .children(AwsStore::ALL.map(|s| self.render_auth(Some(s), cx))),
+                    .children(AuthKind::ALL.map(|k| self.render_auth(k, cx))),
             )
-            .when_some(aws_store, |el, store| el.child(self.render_aws(store, cx)))
+            .when(kind != AuthKind::Password, |el| {
+                el.child(self.render_aws(kind, cx))
+            })
             .child(
                 h_flex()
                     .gap_3()
                     .child(field("User", Input::new(&self.user).id("conn-user"), cx))
-                    .when(aws_store.is_none(), |el| {
+                    .when(kind == AuthKind::Password, |el| {
                         el.child(field(
                             "Password",
                             Input::new(&self.password).id("conn-password").mask_toggle(),
@@ -552,6 +681,18 @@ impl ConnForm {
                         .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
                     cx,
                 ))
+                .when(self.source.is_some(), |el| {
+                    el.child(
+                        hint(
+                            "Verified checks the certificate with Amazon's RDS authorities. \
+                             Through an SSH tunnel, choose Required: the certificate names \
+                             the database, not the tunnel.",
+                            cx,
+                        )
+                        .id("conn-tls-hint")
+                        .test_support(),
+                    )
+                })
                 .child(
                     Checkbox::new("use-ssh")
                         .cursor_pointer()
@@ -695,11 +836,24 @@ impl Render for ConnForm {
             }
             sections.push(("Security", self.render_security(cx)));
         }
-        let sections: Vec<_> = sections
+        let mut sections: Vec<AnyElement> = sections
             .into_iter()
             .enumerate()
-            .map(|(index, (title, body))| section(index + 1, title, body, cx))
+            .map(|(index, (title, body))| section(index + 1, title, body, cx).into_any_element())
             .collect();
+        if let Some(start) = self.start.clone() {
+            sections = vec![start.into_any_element()];
+        } else if let Some(notice) = self.notice.clone() {
+            let notice = div()
+                .id("conn-notice")
+                .test_support()
+                .p_3()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().muted)
+                .text_sm()
+                .child(notice);
+            sections.insert(0, notice.into_any_element());
+        }
         let column = || v_flex().w(px(560.)).gap_4();
         v_flex()
             .size_full()
