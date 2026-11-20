@@ -169,8 +169,8 @@ pub fn add_to_all() -> Vec<AgentStatus> {
     })
 }
 
-/// Adds the server to the one installed agent called `name` and reports every agent, so
-/// the others keep the state they had. Writes a file; call it off the UI thread.
+/// Adds the server to the one installed agent called `name` and reports that agent only.
+/// Writes a file; call it off the UI thread.
 pub fn add_to(name: &str) -> Vec<AgentStatus> {
     target().map_or_else(Vec::new, |t| {
         add_in(
@@ -190,32 +190,30 @@ fn installed(home: &Path, os: Os) -> impl Iterator<Item = Agent> {
 
 fn statuses_in(home: &Path, os: Os, server: &str) -> Vec<AgentStatus> {
     installed(home, os)
-        .map(|agent| AgentStatus {
-            name: agent.name,
-            state: current_state(&agent, server),
+        .map(|agent| {
+            let change =
+                read_config(&agent.config).and_then(|text| change(agent.format, &text, server));
+            let state = match change {
+                Ok(None) => AgentState::Added,
+                Ok(Some(_)) => AgentState::NotAdded,
+                Err(e) => AgentState::Failed(format!("{e:#}")),
+            };
+            AgentStatus {
+                name: agent.name,
+                state,
+            }
         })
         .collect()
 }
 
-fn current_state(agent: &Agent, server: &str) -> AgentState {
-    match read_config(&agent.config).and_then(|text| change(agent.format, &text, server)) {
-        Ok(None) => AgentState::Added,
-        Ok(Some(_)) => AgentState::NotAdded,
-        Err(e) => AgentState::Failed(format!("{e:#}")),
-    }
-}
-
-/// Adds the server to the agent called `only`, or to all of them, and reports every agent.
+/// Adds the server to the agent called `only`, or to all of them, and reports those.
 fn add_in(home: &Path, os: Os, server: &str, only: Option<&str>) -> Vec<AgentStatus> {
     installed(home, os)
+        .filter(|agent| only.is_none_or(|name| name == agent.name))
         .map(|agent| {
-            let state = if only.is_some_and(|name| name != agent.name) {
-                current_state(&agent, server)
-            } else {
-                match add(&agent, server) {
-                    Ok(()) => AgentState::Added,
-                    Err(e) => AgentState::Failed(format!("{e:#}")),
-                }
+            let state = match add(&agent, server) {
+                Ok(()) => AgentState::Added,
+                Err(e) => AgentState::Failed(format!("{e:#}")),
             };
             AgentStatus {
                 name: agent.name,
@@ -401,8 +399,8 @@ mod tests {
         added(home.path(), ".cursor");
         added(home.path(), ".codex");
         let result = add_in(home.path(), Os::Linux, SERVER, Some("Codex"));
+        assert_eq!(result.len(), 1);
         assert_eq!(state_of(&result, "Codex"), AgentState::Added);
-        assert_eq!(state_of(&result, "Cursor"), AgentState::NotAdded);
         assert!(!home.path().join(".cursor/mcp.json").exists());
     }
 

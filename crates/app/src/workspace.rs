@@ -528,13 +528,19 @@ impl Workspace {
     }
 
     /// Settings' button for one agent. The page shows the result on that agent's row.
+    /// Only that row changes, so adds to two agents at once can't undo each other.
     fn add_mcp_to_agent(&self, name: &'static str, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let statuses = blocking(move || Ok(agents::add_to(name)))
+            let added = blocking(move || Ok(agents::add_to(name)))
                 .await
                 .unwrap_or_default();
             this.update(cx, |this, cx| {
-                this.agents = Some(statuses);
+                for status in added {
+                    let mut shown = this.agents.iter_mut().flatten();
+                    if let Some(shown) = shown.find(|shown| shown.name == status.name) {
+                        shown.state = status.state;
+                    }
+                }
                 cx.notify();
             })
             .ok();
