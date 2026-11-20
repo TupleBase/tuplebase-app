@@ -1,17 +1,37 @@
-//! The TupleBase theme. The palette is the brand's neutrals; the only color in the app
-//! comes from the database logos.
+//! The TupleBase theme. The palette is the brand's neutrals plus one accent, a teal of
+//! the wordmark's hue, kept for what is chosen or about to run: the primary button, focus,
+//! the selected row and connection, links. Other color comes from the database logos.
+//! The fonts are bundled, so the app reads the same on every system.
 
+use std::borrow::Cow;
 use std::rc::Rc;
 
-use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
+use gpui_kit::component::{
+    ActiveTheme as _, StyledExt as _, Theme, ThemeMode, ThemeRegistry, h_flex,
+};
 use gpui_kit::*;
 use tuplebase_core::config::Appearance;
 
 /// How much smaller code is than the rest of the text, in pixels.
 const CODE_FONT_GAP: f32 = 2.;
 
-/// Loads the bundled themes. Call after `gpui_kit::init`.
+/// Inter for the interface, JetBrains Mono for SQL and values. Both under the SIL Open
+/// Font License; see `assets/fonts`.
+const FONTS: [&[u8]; 7] = [
+    include_bytes!("../../../assets/fonts/Inter-Regular.ttf"),
+    include_bytes!("../../../assets/fonts/Inter-Medium.ttf"),
+    include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf"),
+    include_bytes!("../../../assets/fonts/Inter-Bold.ttf"),
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../../../assets/fonts/JetBrainsMono-Italic.ttf"),
+];
+
+/// Loads the bundled fonts and themes. Call after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
+    cx.text_system()
+        .add_fonts(FONTS.iter().map(|font| Cow::Borrowed(*font)).collect())
+        .expect("bundled fonts are valid");
     ThemeRegistry::global_mut(cx)
         .load_themes_from_str(include_str!("theme.json"))
         .expect("bundled theme is valid");
@@ -49,4 +69,27 @@ pub fn set_font_size(size: u8, cx: &mut App) {
         theme.font_size = px(size);
         theme.mono_font_size = px(code_size);
     });
+}
+
+/// The bar on top of a panel: one height, padding and title style for every panel.
+/// Add the panel's buttons as children; they sit on the right.
+pub fn panel_header(title: impl Into<SharedString>, cx: &App) -> Div {
+    let theme = cx.theme();
+    h_flex()
+        .flex_none()
+        .h(rems(2.5))
+        .pl_3()
+        .pr_1p5()
+        .gap_0p5()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .font_semibold()
+                .child(title.into()),
+        )
 }

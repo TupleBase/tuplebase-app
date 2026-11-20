@@ -94,13 +94,7 @@ impl Render for RowDetail {
             .border_l_1()
             .border_color(theme.border)
             .child(
-                h_flex()
-                    .p_2()
-                    .gap_1()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(div().pl_1().text_sm().font_semibold().child("Row"))
-                    .child(div().flex_1())
+                crate::theme::panel_header("Row", cx)
                     .child(
                         Button::new("row-detail-copy")
                             .cursor_pointer()

@@ -203,9 +203,9 @@ impl ChatPanel {
                     div()
                         .max_w(relative(0.85))
                         .px_3()
-                        .py_1p5()
-                        .rounded_lg()
-                        .bg(theme.secondary)
+                        .py_2()
+                        .rounded_xl()
+                        .bg(theme.sidebar_accent)
                         .text_sm()
                         .child(text.clone()),
                 )
@@ -224,7 +224,7 @@ impl ChatPanel {
                 };
                 v_flex()
                     // Sits close to the tool calls around it.
-                    .my(px(-4.))
+                    .my(px(-6.))
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .font_family(theme.mono_font_family.clone())
@@ -232,7 +232,15 @@ impl ChatPanel {
                         h_flex()
                             .id(SharedString::from(format!("chat-tool-{ix}")))
                             .test_support()
+                            // A chip: the call stands apart from the answer around it.
+                            .self_start()
                             .gap_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.muted)
                             .child(
                                 Icon::new(chevron)
                                     .xsmall()
@@ -308,36 +316,29 @@ impl Render for ChatPanel {
             .test_support()
             .size_full()
             .child(
-                h_flex()
-                    .p_2()
-                    .gap_1()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(div().pl_1().text_sm().font_semibold().child(AGENT_NAME))
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("chat-clear")
-                                    .cursor_pointer()
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::default().data(CLEAR_ICON))
-                                    .tooltip("Clear chat")
-                                    .disabled(self.entries.is_empty())
-                                    .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
-                            )
-                            .child(
-                                Button::new("chat-close")
-                                    .cursor_pointer()
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Close)
-                                    .tooltip("Close")
-                                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Close))),
-                            ),
-                    ),
+                crate::theme::panel_header(AGENT_NAME, cx).child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            Button::new("chat-clear")
+                                .cursor_pointer()
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::default().data(CLEAR_ICON))
+                                .tooltip("Clear chat")
+                                .disabled(self.entries.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
+                        )
+                        .child(
+                            Button::new("chat-close")
+                                .cursor_pointer()
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip("Close")
+                                .on_click(cx.listener(|_, _, _, cx| cx.emit(ChatEvent::Close))),
+                        ),
+                ),
             )
             .child(
                 v_flex()
@@ -367,11 +368,11 @@ impl Render for ChatPanel {
             )
             .child(
                 h_flex()
-                    .p_2()
-                    .gap_1()
+                    .p_3()
+                    .gap_2()
                     .border_t_1()
                     .border_color(border)
-                    .child(Input::new(&self.input).id("chat-input").small())
+                    .child(Input::new(&self.input).id("chat-input"))
                     .child(
                         Button::new("chat-send")
                             .cursor_pointer()
