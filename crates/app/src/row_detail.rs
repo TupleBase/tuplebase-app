@@ -77,21 +77,18 @@ impl RowDetail {
             color: Some(theme.muted_foreground),
             ..Default::default()
         };
-        let styles = [
-            (Token::Key, syntax("property")),
-            (Token::Punctuation, muted),
-            (Token::Text, syntax("string")),
-            (Token::Number, syntax("number")),
-            (Token::Boolean, syntax("boolean")),
-            (Token::Null, syntax("comment")),
-        ];
+        let style = |token| match token {
+            Token::Key => syntax("property"),
+            Token::Punctuation => muted,
+            Token::Text => syntax("string"),
+            Token::Number => syntax("number"),
+            Token::Boolean => syntax("boolean"),
+            Token::Null => syntax("comment"),
+        };
         let decorations = self
             .tokens
             .iter()
-            .filter_map(|(range, token)| {
-                let (_, style) = styles.iter().find(|(t, _)| t == token)?;
-                Some(TextDecoration::new(range.clone(), *style))
-            })
+            .map(|(range, token)| TextDecoration::new(range.clone(), style(*token)))
             .collect();
         self.colors.set(decorations, cx);
     }
@@ -140,16 +137,12 @@ impl Writer {
             Value::Bool(b) => self.push(&b.to_string(), Token::Boolean),
             Value::Number(n) => self.push(&n.to_string(), Token::Number),
             Value::String(text) => self.push(&format!("\"{text}\""), Token::Text),
-            Value::Array(items) => self.list(
-                ("[", "]"),
-                items.iter().map(|item| (None, item)),
-                items.len(),
-                indent,
-            ),
+            Value::Array(items) => {
+                self.list(("[", "]"), items.iter().map(|item| (None, item)), indent)
+            }
             Value::Object(fields) => self.list(
                 ("{", "}"),
                 fields.iter().map(|(key, value)| (Some(key), value)),
-                fields.len(),
                 indent,
             ),
         }
@@ -158,10 +151,10 @@ impl Writer {
     fn list<'a>(
         &mut self,
         (open, close): (&str, &str),
-        items: impl Iterator<Item = (Option<&'a String>, &'a Value)>,
-        len: usize,
+        items: impl ExactSizeIterator<Item = (Option<&'a String>, &'a Value)>,
         indent: usize,
     ) {
+        let len = items.len();
         self.push(open, Token::Punctuation);
         if len == 0 {
             self.push(close, Token::Punctuation);
