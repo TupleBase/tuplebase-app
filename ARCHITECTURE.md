@@ -35,7 +35,7 @@ scripts/                   install, packaging, release helpers
 | ------------- | ----------------------------------------------------- | ------------------------------------------------------ |
 | `config`      | connection settings and the config directory          | nothing                                                |
 | `secrets`     | passwords in the OS credential store                  | nothing                                                |
-| `state`       | unsaved SQL, query history, panel sizes               | `config`                                               |
+| `state`       | unsaved SQL, query history, panel sizes, last search  | `config`                                               |
 | `safety`      | statement classification for the read-only guard      | `config`                                               |
 | `ssh`         | SSH tunnels                                           | `config`                                               |
 | `cloud`       | cloud providers, one file each (`cloud/aws.rs`)       | `config`                                               |
@@ -66,6 +66,8 @@ scripts/                   install, packaging, release helpers
 | `workspace`          | the main window: connection sidebar, SQL editor, results    |
 | `workspace/settings` | the Settings dialog                                         |
 | `conn_form`          | the add and edit connection form                            |
+| `conn_source`        | the first step of adding one: where the database is         |
+| `aws_picker`         | finding a database in AWS to fill in the form               |
 | `schema`             | the schema browser                                          |
 | `results`            | the table that shows a query result                         |
 | `row_detail`         | the panel that shows one result row field by field          |

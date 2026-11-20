@@ -986,7 +986,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = cx.new(|cx| ConnForm::new(existing.as_ref(), folder, window, cx));
+        let last_aws = self.session.aws_search.clone();
+        let form = cx.new(|cx| ConnForm::new(existing.as_ref(), folder, last_aws, window, cx));
         self._form_subscription = Some(cx.subscribe(&form, |this, form, event, cx| match event {
             ConnFormEvent::Save {
                 connection,
@@ -1004,6 +1005,10 @@ impl Workspace {
             ConnFormEvent::Cancel => {
                 this.form = None;
                 cx.notify();
+            }
+            ConnFormEvent::SearchedAws(search) => {
+                this.session.aws_search = search.clone();
+                this.schedule_session_save(cx);
             }
         }));
         self.form = Some(form);
@@ -3091,7 +3096,13 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        // A new connection asks for the database first; the rest follows the choice.
+        // A new connection asks where the database is, then which one it is; the rest
+        // follows the choice.
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("save").is_none());
+            assert!(window.try_find("adapter-PostgreSQL").is_none());
+            window.click("source-manual", cx);
+        });
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("save").is_none());
             assert!(window.try_find("conn-name").is_none());
@@ -3226,6 +3237,7 @@ mod tests {
     /// Opens the form for a new connection and chooses PostgreSQL, which shows the rest.
     fn open_new_form(handle: AnyWindowHandle, cx: &mut TestAppContext) {
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         window_action(handle, cx, |window, cx| {
             window.click("adapter-PostgreSQL", cx)
         });
@@ -3235,6 +3247,7 @@ mod tests {
     fn sqlite_only_asks_for_a_file(cx: &mut TestAppContext) {
         let (handle, _) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         window_action(handle, cx, |window, cx| window.click("adapter-SQLite", cx));
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("conn-host").is_none());
@@ -3327,6 +3340,79 @@ mod tests {
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
             assert!(form.read(cx).error.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_database_found_in_aws_fills_in_a_new_connection(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("save").is_none());
+            window.click("source-aws", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("aws-find", cx));
+        // The search itself runs on the runtime, which tests don't; give its answer.
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let source = form.read(cx).start().cloned().expect("source step shown");
+            let picker = source.read(cx).aws_picker().cloned().expect("AWS step");
+            picker.update(cx, |picker, cx| {
+                picker.set_discovery(
+                    tuplebase_core::cloud::Discovery {
+                        found: vec![crate::aws_picker::tests::found(
+                            "orders",
+                            Some(Adapter::Postgres),
+                        )],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("aws-use", cx));
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            assert!(form.read(cx).start().is_none());
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save {
+                    connection,
+                    previous,
+                    ..
+                } = event
+                {
+                    *saved.borrow_mut() = Some((connection.clone(), previous.clone()));
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("conn-notice").visible());
+            assert!(window.try_find("conn-password").is_none());
+            assert!(window.find("conn-aws-profile").visible());
+            window.click("save", cx);
+        });
+        let (connection, previous) = saved.borrow_mut().take().expect("the form saved");
+        // A new connection, not an edit of one with the same name.
+        assert_eq!(previous, None);
+        assert_eq!(connection.name, "orders");
+        assert_eq!(connection.host, "orders.abc.eu-west-1.rds.amazonaws.com");
+        assert_eq!((connection.port, connection.user.as_str()), (5432, "admin"));
+        assert_eq!(connection.tls, TlsMode::Require);
+        assert_eq!(
+            connection.auth,
+            Auth::AwsIam(AwsIamAuth {
+                profile: "prod".into(),
+                region: "eu-west-1".into(),
+            })
+        );
+        assert!(connection.source.is_some());
+        cx.update(|cx| {
+            // Where it looked is remembered for next time.
+            let search = &workspace.read(cx).session.aws_search;
+            assert!(search.regions.is_empty() && search.profile.is_empty());
         });
     }
 

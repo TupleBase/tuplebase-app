@@ -10,7 +10,9 @@ use tuplebase_core::config::{
     Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Source, SshConfig, TlsMode,
 };
 use tuplebase_core::ssh;
+use tuplebase_core::state::CloudSearch;
 
+use crate::conn_source::{ConnSource, ConnSourceEvent};
 use crate::logos;
 use crate::runtime::io;
 
@@ -32,9 +34,16 @@ pub enum ConnFormEvent {
         previous: Option<String>,
     },
     Cancel,
+    /// Remember where a search for databases in AWS looked.
+    SearchedAws(CloudSearch),
 }
 
 pub struct ConnForm {
+    /// The step before the form for a new connection: where the database is.
+    start: Option<Entity<ConnSource>>,
+    _start_subscription: Option<Subscription>,
+    /// What to know about a database that was found, shown above the form.
+    notice: Option<SharedString>,
     previous: Option<String>,
     adapter: Adapter,
     /// A new connection asks for the database first and shows the rest once it is chosen.
@@ -72,9 +81,11 @@ impl EventEmitter<ConnFormEvent> for ConnForm {}
 
 impl ConnForm {
     /// `existing` pre-fills the form for editing; `folder` is where it gets saved.
+    /// `last_aws` is where the last search for databases in AWS looked.
     pub fn new(
         existing: Option<&Connection>,
         folder: String,
+        last_aws: CloudSearch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -125,7 +136,18 @@ impl ConnForm {
             String::new(),
         );
         let ssh_fingerprint = input("SHA256:…", ssh_field(|s| s.fingerprint.clone()));
+        // A new connection first asks where the database is.
+        let (start, start_subscription) = if existing.is_none() {
+            let start = cx.new(|_| ConnSource::new(last_aws));
+            let subscription = cx.subscribe_in(&start, window, Self::on_start_event);
+            (Some(start), Some(subscription))
+        } else {
+            (None, None)
+        };
         Self {
+            start,
+            _start_subscription: start_subscription,
+            notice: None,
             previous: existing.map(|c| c.name.clone()),
             adapter: existing.map_or(Adapter::Postgres, |c| c.adapter),
             chosen: existing.is_some(),
@@ -155,6 +177,65 @@ impl ConnForm {
             fetching_fingerprint: false,
             error: None,
         }
+    }
+
+    fn on_start_event(
+        &mut self,
+        _: &Entity<ConnSource>,
+        event: &ConnSourceEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConnSourceEvent::Manual => self.close_start(cx),
+            ConnSourceEvent::Use { connection, note } => {
+                self.prefill(connection, window, cx);
+                self.notice = note.clone().map(Into::into);
+                self.close_start(cx);
+            }
+            ConnSourceEvent::SearchedAws(search) => {
+                cx.emit(ConnFormEvent::SearchedAws(search.clone()));
+            }
+        }
+    }
+
+    fn close_start(&mut self, cx: &mut Context<Self>) {
+        self.start = None;
+        self._start_subscription = None;
+        cx.notify();
+    }
+
+    /// The step before the form, while it is shown.
+    #[cfg(test)]
+    pub fn start(&self) -> Option<&Entity<ConnSource>> {
+        self.start.as_ref()
+    }
+
+    /// Fills the form with a connection that was found, to check and save as new.
+    pub fn prefill(&mut self, conn: &Connection, window: &mut Window, cx: &mut Context<Self>) {
+        let mut set = |input: &Entity<InputState>, value: String| {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        };
+        set(&self.name, conn.name.clone());
+        set(&self.host, conn.host.clone());
+        set(&self.port, conn.port.to_string());
+        set(&self.database, conn.database.clone());
+        set(&self.user, conn.user.clone());
+        let (profile, region) = conn.auth.aws_profile().unwrap_or_default();
+        set(&self.aws_profile, profile.to_owned());
+        set(&self.aws_region, region.to_owned());
+        let secret = conn.auth.secret().map(|(_, secret)| secret);
+        set(
+            &self.aws_name,
+            secret.map(|s| s.name.clone()).unwrap_or_default(),
+        );
+        self.use_secret_host = secret.is_some_and(|s| s.use_secret_host);
+        self.adapter = conn.adapter;
+        self.chosen = true;
+        self.auth_kind = conn.auth.kind();
+        self.tls = conn.tls;
+        self.source = conn.source.clone();
+        cx.notify();
     }
 
     /// Whether the secret names the host, so the Host and Port fields are hidden.
@@ -735,11 +816,24 @@ impl Render for ConnForm {
             }
             sections.push(("Security", self.render_security(cx)));
         }
-        let sections: Vec<_> = sections
+        let mut sections: Vec<AnyElement> = sections
             .into_iter()
             .enumerate()
-            .map(|(index, (title, body))| section(index + 1, title, body, cx))
+            .map(|(index, (title, body))| section(index + 1, title, body, cx).into_any_element())
             .collect();
+        if let Some(start) = self.start.clone() {
+            sections = vec![start.into_any_element()];
+        } else if let Some(notice) = self.notice.clone() {
+            let notice = div()
+                .id("conn-notice")
+                .test_support()
+                .p_3()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().muted)
+                .text_sm()
+                .child(notice);
+            sections.insert(0, notice.into_any_element());
+        }
         let column = || v_flex().w(px(560.)).gap_4();
         v_flex()
             .size_full()
