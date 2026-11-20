@@ -479,3 +479,32 @@ async fn sqlite_indexes_and_triggers_are_listed() {
         Some("on t")
     );
 }
+
+/// A fresh connection doesn't know a custom type yet. Looking it up must not lose the
+/// statement that asked for it: PostgreSQL drops the unnamed prepared statement whenever
+/// another query runs on the connection.
+#[tokio::test]
+async fn postgres_custom_types_can_be_read_on_a_fresh_connection() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let conn = connection(Adapter::Postgres);
+    Db::new()
+        .execute_script(
+            &conn,
+            "DROP TYPE IF EXISTS it_mood; CREATE TYPE it_mood AS ENUM ('happy', 'sad')",
+            WRITE,
+        )
+        .await
+        .unwrap();
+    for opts in [READ, WRITE] {
+        // A new `Db` has a new pool, so the type is unknown to it.
+        let r = Db::new()
+            .execute(&conn, "SELECT 'happy'::it_mood AS mood", opts)
+            .await
+            .unwrap_or_else(|e| panic!("read_only: {}: {e:#}", opts.read_only));
+        assert_eq!(r.columns, ["mood"]);
+        assert_eq!(r.rows, [[json!("happy")]]);
+    }
+}
