@@ -1,6 +1,6 @@
 cask "tuplebase" do
-  version "0.7.0"
-  sha256 "8311cb3840e6fadbe2ef3a993e6bb4e061789b19b18cae0bbda8c9e4a6082639"
+  version "0.8.0"
+  sha256 "92f2b34ece8111fa3738161759d2ef043eccb627ab467aa028a1e4ee61f983c6"
 
   url "https://github.com/TupleBase/tuplebase-app/releases/download/v#{version}/TupleBase-#{version}-macos-arm64.dmg"
   name "TupleBase"
