@@ -124,6 +124,8 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
             })
         }
         Auth::AwsIam(iam) => {
+            // Before making a token, so none is ever sent without encryption.
+            conn.check_iam_encryption()?;
             // Signed for the database's own name, even when a tunnel carries the traffic.
             let token = store
                 .iam_token(iam, &conn.host, conn.port, &conn.user)
@@ -280,6 +282,20 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("ResourceNotFoundException"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn no_iam_token_is_made_for_a_connection_that_may_be_unencrypted() {
+        // A file edited by hand skips the check on save.
+        let fake = Fake::default();
+        let mut plain = conn(Auth::AwsIam(AwsIamAuth {
+            profile: "prod".into(),
+            region: "eu-west-1".into(),
+        }));
+        plain.tls = TlsMode::Prefer;
+        let error = resolve_with(&fake, &plain).await.err().unwrap().to_string();
+        assert!(error.contains("encrypted connection"), "{error}");
+        assert!(fake.asked.lock().unwrap().is_empty(), "no token was made");
     }
 
     #[tokio::test]

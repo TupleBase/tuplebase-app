@@ -342,6 +342,20 @@ impl Connection {
         }
     }
 
+    /// RDS refuses IAM tokens over a connection that isn't encrypted, and a token sent
+    /// in the clear could be read on the way. Checked on save and again on connect, for
+    /// files edited by hand.
+    pub fn check_iam_encryption(&self) -> Result<()> {
+        if matches!(self.auth, Auth::AwsIam(_)) && self.tls == TlsMode::Prefer {
+            bail!(
+                "an IAM token needs an encrypted connection: set Encryption to Required \
+                 or Verified for \"{}\"",
+                self.name
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("connection name is required");
@@ -374,14 +388,7 @@ impl Connection {
             if self.user.trim().is_empty() {
                 bail!("user is required for \"{}\"", self.name);
             }
-            // RDS refuses IAM tokens over a connection that isn't encrypted.
-            if matches!(self.auth, Auth::AwsIam(_)) && self.tls == TlsMode::Prefer {
-                bail!(
-                    "an IAM token needs an encrypted connection: set Encryption to Required \
-                     or Verified for \"{}\"",
-                    self.name
-                );
-            }
+            self.check_iam_encryption()?;
         }
         let color_is_valid = self.color.is_empty()
             || (self.color.len() == 7

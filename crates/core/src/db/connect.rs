@@ -195,8 +195,8 @@ fn mysql_options(
         opts = opts.ssl_ca_from_pem(pem.to_vec());
     }
     // RDS asks for an IAM token in clear text, inside the encryption that IAM requires.
-    // No other password may be sent that way.
-    if matches!(conn.auth, Auth::AwsIam(_)) {
+    // No other password may be sent that way, and never without encryption.
+    if matches!(conn.auth, Auth::AwsIam(_)) && conn.tls != TlsMode::Prefer {
         opts = opts.enable_cleartext_plugin(true);
     }
     opts
@@ -268,6 +268,27 @@ mod tests {
             auth: Auth::Password,
             source: None,
         }
+    }
+
+    #[test]
+    fn the_clear_text_plugin_is_only_for_iam_over_encryption() {
+        let cleartext = |auth: Auth, tls: TlsMode| {
+            let mut conn = rds(tls);
+            conn.adapter = Adapter::Mysql;
+            conn.auth = auth;
+            let options = mysql_options(&conn, "127.0.0.1", 3306, Some("x"));
+            format!("{options:?}").contains("enable_cleartext_plugin: true")
+        };
+        let iam = || {
+            Auth::AwsIam(crate::config::AwsIamAuth {
+                profile: String::new(),
+                region: "eu-west-1".into(),
+            })
+        };
+        assert!(cleartext(iam(), TlsMode::Require));
+        assert!(cleartext(iam(), TlsMode::Verify));
+        assert!(!cleartext(iam(), TlsMode::Prefer));
+        assert!(!cleartext(Auth::Password, TlsMode::Require));
     }
 
     #[test]
