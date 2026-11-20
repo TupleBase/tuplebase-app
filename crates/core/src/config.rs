@@ -563,6 +563,29 @@ fn keep_base_version(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where a file this version couldn't read is kept: next to it, named with the
+/// time, and never overwriting an earlier copy.
+fn unreadable_copy(path: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("connections");
+    (0..)
+        .map(|n| {
+            let suffix = if n == 0 {
+                String::new()
+            } else {
+                format!("-{n}")
+            };
+            path.with_file_name(format!("{stem}.unreadable-{stamp}{suffix}.json"))
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused name exists")
+}
+
 pub fn config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join(CONFIG_FILE))
 }
@@ -605,10 +628,7 @@ impl Config {
             Ok(config) => return (config, None),
             Err(e) => format!("{e:#}"),
         };
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        let kept = path.with_file_name(format!("connections.unreadable-{stamp}.json"));
+        let kept = unreadable_copy(path);
         match fs::rename(path, &kept) {
             Ok(()) => (
                 Self::default(),
@@ -638,10 +658,22 @@ impl Config {
 
     /// Writes the config. The first time it raises a file to [`VERSION_IAM`], which
     /// older versions can't read, it keeps a copy of the old file as
-    /// [`BASE_VERSION_BACKUP`].
+    /// [`BASE_VERSION_BACKUP`]. A file already there that this version can't read is
+    /// moved aside first rather than overwritten, so its connections are never lost.
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(reason) = &self.unsaved_because {
             bail!("not saved: {reason}");
+        }
+        if path.exists() && Self::load_from(path).is_err() {
+            // It became unreadable after loading, e.g. a newer TupleBase saved it.
+            let kept = unreadable_copy(path);
+            fs::rename(path, &kept).with_context(|| {
+                format!(
+                    "keeping the unreadable {} as {}",
+                    path.display(),
+                    kept.display()
+                )
+            })?;
         }
         let mut config = self.clone();
         config.sync_version();
@@ -1480,6 +1512,31 @@ mod tests {
     fn update_check_defaults_to_on_for_existing_files() {
         let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
         assert!(config.check_for_updates);
+    }
+
+    #[test]
+    fn saving_over_a_file_this_version_cannot_read_keeps_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        // As written by a newer TupleBase.
+        let newer = r#"{"version": 2, "connections": [{"name": "kept"}]}"#;
+        fs::write(&path, newer).unwrap();
+        assert!(Config::load_from(&path).is_err());
+
+        Config::default().save_to(&path).unwrap();
+
+        assert!(Config::load_from(&path).is_ok());
+        let kept: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), newer);
+
+        // A readable file is simply replaced, with no copy made.
+        Config::default().save_to(&path).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]
