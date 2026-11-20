@@ -348,6 +348,9 @@ pub struct Workspace {
     /// A newer version found by the update check, and how far along it is.
     update_state: Option<UpdateState>,
     _form_subscription: Option<Subscription>,
+    /// Where saving moved a connections file this version can't read, until the status
+    /// line has shown it past the connect that follows saving a connection.
+    kept_note: Option<SharedString>,
 }
 
 impl Workspace {
@@ -685,13 +688,30 @@ impl Workspace {
     /// Shows in the status line why saving failed, or where it moved a connections file
     /// this version can't read; says nothing after an ordinary save.
     fn show_saved(&mut self, saved: anyhow::Result<Option<PathBuf>>, cx: &mut Context<Self>) {
-        let status = match saved {
+        self.status = match saved {
             Ok(None) => return,
-            Ok(Some(kept)) => Status::Done(kept_unreadable_message(&kept).into()),
+            Ok(Some(kept)) => {
+                let note = SharedString::from(kept_unreadable_message(&kept));
+                self.kept_note = Some(note.clone());
+                Status::Done(note)
+            }
             Err(e) => Status::Failed(format!("{e:#}").into()),
         };
-        self.status = status;
         cx.notify();
+    }
+
+    /// The status once connecting to `name` is done; a note about a kept connections
+    /// file stays in it rather than being replaced.
+    fn show_connected(&mut self, name: &str, result: anyhow::Result<()>) {
+        let note = self.kept_note.take();
+        let with_note = |text: String| match &note {
+            Some(note) => format!("{text}. {note}"),
+            None => text,
+        };
+        self.status = match result {
+            Ok(()) => Status::Done(with_note(format!("Connected to {name}")).into()),
+            Err(e) => Status::Failed(with_note(format!("{e:#}")).into()),
+        };
     }
 
     fn begin_folder_edit(
@@ -956,6 +976,7 @@ impl Workspace {
             collapsed: HashSet::new(),
             update_state: None,
             _form_subscription: None,
+            kept_note: None,
         }
     }
 
@@ -996,10 +1017,7 @@ impl Workspace {
                 if this.selected.as_deref() != Some(name.as_str()) {
                     return;
                 }
-                this.status = match result {
-                    Ok(()) => Status::Done(format!("Connected to {name}").into()),
-                    Err(e) => Status::Failed(format!("{e:#}").into()),
-                };
+                this.show_connected(&name, result);
                 cx.notify();
             })
             .ok();
@@ -3371,6 +3389,29 @@ mod tests {
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
             assert!(form.read(cx).error.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_kept_connections_file_stays_in_the_status_line_past_connecting(cx: &mut TestAppContext) {
+        let (_, workspace) = open(config_with_connection(), cx);
+        let kept = std::path::PathBuf::from("/cfg/connections.unreadable-1.json");
+        workspace.update(cx, |this, cx| {
+            this.show_saved(Ok(Some(kept.clone())), cx);
+            assert!(matches!(&this.status, Status::Done(s) if s.contains("connections.unreadable-1.json")));
+            // Saving a connection selects it, and connecting reports back.
+            this.show_connected("db", Ok(()));
+            let Status::Done(text) = &this.status else {
+                panic!("done expected");
+            };
+            assert!(text.starts_with("Connected to db. "), "{text}");
+            assert!(text.contains("connections.unreadable-1.json"), "{text}");
+            // Said once: the next connect is reported as usual.
+            this.show_connected("db", Ok(()));
+            assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == "Connected to db"));
+            // A plain save leaves the status line alone.
+            this.show_saved(Ok(None), cx);
+            assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == "Connected to db"));
         });
     }
 
