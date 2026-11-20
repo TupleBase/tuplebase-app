@@ -9,7 +9,7 @@ use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::decode::{bytes, decode_first, fallback, text, type_name_or_return};
 use super::{
-    ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
+    Dialect, ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
     sql_comment, unsupported,
 };
 use crate::config::Adapter;
@@ -99,6 +99,12 @@ const PARAMETERS: &str = "SELECT COALESCE(x.parameter_mode, 'IN')::text, \
      WHERE x.specific_schema = $1 AND x.specific_name LIKE '%\\_' || $2::bigint::text \
      ORDER BY x.ordinal_position";
 
+pub(super) const DIALECT: Dialect = Dialect {
+    read_only_begin: "BEGIN READ ONLY",
+    read_only_end: "ROLLBACK",
+    objects: OBJECTS,
+};
+
 pub(super) async fn column_names(pool: &PgPool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(
         "SELECT DISTINCT column_name::text FROM information_schema.columns \
@@ -141,7 +147,7 @@ pub(super) async fn columns(
 
 pub(super) async fn list_objects(pool: &PgPool) -> Vec<ObjectInfo> {
     let mut found = Vec::new();
-    for &(kind, sql) in OBJECTS {
+    for &(kind, sql) in DIALECT.objects {
         let rows = sqlx::query_as(sql)
             .fetch_all(pool)
             .await

@@ -15,7 +15,7 @@ use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo, ValueRef};
 
 use super::decode::{bytes, decode_first, fallback, text, type_name_or_return};
 use super::{
-    ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
+    Dialect, ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
     sql_comment, unsupported,
 };
 use crate::config::Adapter;
@@ -78,6 +78,12 @@ const PARAMETERS: &str = "SELECT CAST(COALESCE(parameter_mode, 'IN') AS CHAR), \
      WHERE specific_schema = ? AND specific_name = ? AND routine_type = ? \
      AND ordinal_position > 0 ORDER BY ordinal_position";
 
+pub(super) const DIALECT: Dialect = Dialect {
+    read_only_begin: "START TRANSACTION READ ONLY",
+    read_only_end: "ROLLBACK",
+    objects: OBJECTS,
+};
+
 pub(super) async fn column_names(pool: &MySqlPool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(
         "SELECT DISTINCT CAST(column_name AS CHAR) FROM information_schema.columns \
@@ -124,7 +130,7 @@ pub(super) async fn columns(
 
 pub(super) async fn list_objects(pool: &MySqlPool) -> Vec<ObjectInfo> {
     let mut found = Vec::new();
-    for &(kind, sql) in OBJECTS {
+    for &(kind, sql) in DIALECT.objects {
         let rows = sqlx::query_as(sql)
             .fetch_all(pool)
             .await

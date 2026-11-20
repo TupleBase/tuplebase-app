@@ -7,7 +7,7 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Row, TypeInfo, ValueRef};
 
 use super::decode::{bytes, decode_first, fallback, type_name_or_return};
-use super::{ObjectInfo, ObjectKind, Source, objects, unsupported};
+use super::{Dialect, ObjectInfo, ObjectKind, Source, objects, unsupported};
 
 /// Each query returns schema, name and detail.
 const OBJECTS: &[(ObjectKind, &str)] = &[
@@ -22,6 +22,13 @@ const OBJECTS: &[(ObjectKind, &str)] = &[
          WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     ),
 ];
+
+/// SQLite has no read-only transactions; this switch makes it refuse writes.
+pub(super) const DIALECT: Dialect = Dialect {
+    read_only_begin: "PRAGMA query_only = ON",
+    read_only_end: "PRAGMA query_only = OFF",
+    objects: OBJECTS,
+};
 
 pub(super) async fn column_names(pool: &SqlitePool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(
@@ -68,7 +75,7 @@ pub(super) async fn columns(
 
 pub(super) async fn list_objects(pool: &SqlitePool) -> Vec<ObjectInfo> {
     let mut found = Vec::new();
-    for &(kind, sql) in OBJECTS {
+    for &(kind, sql) in DIALECT.objects {
         let rows = sqlx::query_as(sql)
             .fetch_all(pool)
             .await
