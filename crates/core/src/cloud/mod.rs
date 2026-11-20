@@ -44,8 +44,9 @@ impl Discovered {
         self.adapter.is_some() && !self.host.is_empty()
     }
 
-    /// The connection it suggests: its name, endpoint, master user and database, with
-    /// encryption required. `None` if it can't be used.
+    /// The connection it suggests: its name, endpoint, master user and database, with its
+    /// certificate verified if it is public, else encryption required. `None` if it
+    /// can't be used.
     pub fn connection(&self) -> Option<Connection> {
         let adapter = self.adapter.filter(|_| self.usable())?;
         Some(Connection {
@@ -58,7 +59,14 @@ impl Discovered {
             user: self.user.clone(),
             readonly: false,
             color: String::new(),
-            tls: TlsMode::Require,
+            // A public database's certificate can be checked (Amazon's RDS authorities come
+            // with the app). Through an SSH tunnel the app reaches 127.0.0.1, which the
+            // certificate doesn't name, so a private one only requires encryption.
+            tls: if self.public {
+                TlsMode::Verify
+            } else {
+                TlsMode::Require
+            },
             ssh: None,
             auth: self.auth.clone(),
             source: Some(self.source.clone()),
@@ -144,7 +152,11 @@ mod tests {
     fn a_found_database_fills_in_a_valid_connection() {
         let conn = found().connection().unwrap();
         assert_eq!(conn.name, "orders");
+        // Private: reached through a tunnel, where the certificate can't match.
         assert_eq!(conn.tls, TlsMode::Require);
+        let mut public = found();
+        public.public = true;
+        assert_eq!(public.connection().unwrap().tls, TlsMode::Verify);
         assert_eq!(conn.source, Some(found().source));
         let mut config = crate::config::Config::default();
         config.upsert(conn, None).unwrap();

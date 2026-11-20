@@ -144,8 +144,9 @@ which come with the app.
 **New connection** → **Amazon Web Services** lists the RDS databases and Aurora clusters
 your AWS profile can see, in the regions you choose (the profile's own by default). The
 app remembers the profile and regions you searched last, in `state.json`. Pick one and the
-form is filled in: name, host and port, master user, database, and **Encryption:
-Required**. Its credentials are:
+form is filled in: name, host and port, master user, database, and **Encryption**:
+**Verified** for a public database (the RDS certificate is checked), **Required** for a
+private one, which you reach through an SSH tunnel. Its credentials are:
 
 - the master user's secret, when RDS manages it in Secrets Manager;
 - otherwise an IAM token, when the database has IAM authentication on;

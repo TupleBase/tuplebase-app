@@ -673,6 +673,18 @@ impl ConnForm {
                         .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
                     cx,
                 ))
+                .when(self.source.is_some(), |el| {
+                    el.child(
+                        hint(
+                            "Verified checks the certificate with Amazon's RDS authorities. \
+                             Through an SSH tunnel, choose Required: the certificate names \
+                             the database, not the tunnel.",
+                            cx,
+                        )
+                        .id("conn-tls-hint")
+                        .test_support(),
+                    )
+                })
                 .child(
                     Checkbox::new("use-ssh")
                         .cursor_pointer()

@@ -3423,6 +3423,7 @@ mod tests {
             assert!(window.find("conn-notice").visible());
             assert!(window.try_find("conn-password").is_none());
             assert!(window.find("conn-aws-profile").visible());
+            assert!(window.try_find("conn-tls-hint").is_some());
             window.click("save", cx);
         });
         let (connection, previous) = saved.borrow_mut().take().expect("the form saved");

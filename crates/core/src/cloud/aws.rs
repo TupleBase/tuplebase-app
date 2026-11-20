@@ -502,10 +502,13 @@ fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
             "Aurora cluster: connects to the writer. Readers are at {readers}."
         ));
     }
-    if !found.public {
+    if found.public {
+        notes.push("Encryption: Verified, with Amazon's RDS certificates.".into());
+    } else {
         notes.push(
             "Not reachable from the internet: connect through an SSH tunnel to a host in \
-             its VPC."
+             its VPC. Encryption is Required rather than Verified, since through a tunnel \
+             the certificate names another host."
                 .into(),
         );
     }
@@ -878,7 +881,8 @@ mod tests {
             })
         );
         assert_eq!(found[2].auth, Auth::Password);
-        assert_eq!(found[2].note, None);
+        assert!(found[2].note.as_deref().unwrap().contains("Verified"));
+        assert_eq!(found[2].connection().unwrap().tls, TlsMode::Verify);
         let conn = found[1].connection().unwrap();
         assert_eq!(
             (conn.adapter, conn.user.as_str()),
