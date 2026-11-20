@@ -600,16 +600,19 @@ async fn postgres_objects_show_their_definitions_and_calls() {
         proc_def.contains("PROCEDURE public.it_def_proc"),
         "{proc_def}"
     );
-    assert_eq!(
-        trigger_def.unwrap(),
-        "CREATE TRIGGER it_def_trg BEFORE INSERT ON it_def_tbl \
-         FOR EACH ROW EXECUTE FUNCTION it_def_trg_fn()"
+    // How the server prints a body varies between versions.
+    let trigger_def = trigger_def.unwrap();
+    assert!(
+        trigger_def.starts_with("CREATE TRIGGER it_def_trg BEFORE INSERT ON"),
+        "{trigger_def}"
     );
+    assert!(trigger_def.contains("it_def_trg_fn()"), "{trigger_def}");
     let view_def = view_def.unwrap();
     assert!(
-        view_def.starts_with("CREATE VIEW \"public\".\"it_def_view\" AS\nSELECT id"),
+        view_def.starts_with("CREATE VIEW \"public\".\"it_def_view\" AS\nSELECT"),
         "{view_def}"
     );
+    assert!(view_def.contains("it_def_tbl"), "{view_def}");
     assert_eq!(
         proc_call.unwrap(),
         "CALL \"public\".\"it_def_proc\"(/* job_id integer */, /* INOUT note text */, \
@@ -688,15 +691,20 @@ async fn mariadb_objects_show_their_definitions_and_calls() {
     assert!(proc_def.contains("PROCEDURE `it_def_proc`"), "{proc_def}");
     let fn_def = fn_def.unwrap();
     assert!(fn_def.contains("FUNCTION `it_def_fn`"), "{fn_def}");
+    // A trigger comes back as typed, with a DEFINER added; a view as the server rewrote it.
     let trigger_def = trigger_def.unwrap();
+    assert!(trigger_def.starts_with("CREATE"), "{trigger_def}");
     assert!(
-        trigger_def.contains("TRIGGER `it_def_trg`"),
+        trigger_def.contains("TRIGGER") && trigger_def.contains("it_def_trg"),
         "{trigger_def}"
     );
     let event_def = event_def.unwrap();
     assert!(event_def.contains("EVENT `it_def_evt`"), "{event_def}");
     let view_def = view_def.unwrap();
-    assert!(view_def.contains("VIEW `it_def_view`"), "{view_def}");
+    assert!(
+        view_def.contains("VIEW") && view_def.contains("it_def_view"),
+        "{view_def}"
+    );
     let proc_call = proc_call.unwrap();
     assert!(
         proc_call.starts_with("CALL `app`.`it_def_proc`(/* job_id int"),
