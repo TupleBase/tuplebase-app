@@ -222,3 +222,32 @@ async fn triggers_views_and_indexes_show_their_definitions() {
     };
     assert!(db.call_template(&conn, &routine).await.is_err());
 }
+
+#[tokio::test]
+async fn a_trigger_definition_runs_back_as_a_script() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    let created = "CREATE TRIGGER users_score AFTER INSERT ON users BEGIN \
+                   UPDATE users SET score = CASE WHEN NEW.score IS NULL THEN 0 ELSE NEW.score END \
+                   WHERE id = NEW.id; UPDATE users SET email = 'new' WHERE id = NEW.id; END";
+    db.execute(&conn, created, WRITE).await.unwrap();
+    let trigger = ObjectInfo {
+        schema: "main".into(),
+        kind: ObjectKind::Trigger,
+        name: "users_score".into(),
+        detail: String::new(),
+    };
+    let before = db.object_definition(&conn, &trigger).await.unwrap();
+    // One script, as the editor would run it after the user adds the DROP. Separate
+    // calls can land on pooled connections that don't agree on the schema yet.
+    let script = format!(
+        "DROP TRIGGER users_score;\n{before};\n\
+         INSERT INTO users (id, name) VALUES (3, 'Linus');\n\
+         SELECT score, email FROM users WHERE id = 3"
+    );
+    let ran = db.execute_script(&conn, &script, WRITE).await.unwrap();
+    assert_eq!(ran.statements, 4);
+    // Both statements of the trigger's body ran.
+    assert_eq!(ran.result.rows, vec![vec![json!(0.0), json!("new")]]);
+    assert_eq!(db.object_definition(&conn, &trigger).await.unwrap(), before);
+}

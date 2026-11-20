@@ -721,3 +721,94 @@ async fn mariadb_objects_show_their_definitions_and_calls() {
         "{fn_call}"
     );
 }
+
+// A definition shown in the editor can be run back: drop the object, run its definition
+// as a script the way the editor's Run does, and the same object is back.
+
+#[tokio::test]
+async fn postgres_a_procedure_definition_runs_back_as_a_script() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Postgres));
+    let drop = "DROP PROCEDURE IF EXISTS it_rt_proc(int)";
+    db.execute(&conn, drop, WRITE).await.unwrap();
+    db.execute(
+        &conn,
+        "CREATE PROCEDURE it_rt_proc(INOUT n int) LANGUAGE plpgsql AS $$\n\
+         BEGIN\n  n := n + 1;\n  IF n > 0 THEN\n    n := n * 2;\n  END IF;\nEND$$",
+        WRITE,
+    )
+    .await
+    .unwrap();
+    let proc = object(
+        "public",
+        ObjectKind::Procedure,
+        "it_rt_proc",
+        "INOUT n integer",
+    );
+    let before = db.object_definition(&conn, &proc).await.unwrap();
+    db.execute(&conn, drop, WRITE).await.unwrap();
+    let run = db.execute_script(&conn, &before, WRITE).await;
+    let after = db.object_definition(&conn, &proc).await;
+    db.execute(&conn, drop, WRITE).await.unwrap();
+    run.unwrap_or_else(|e| panic!("{e:#}\n{before}"));
+    assert_eq!(after.unwrap(), before);
+}
+
+#[tokio::test]
+async fn mariadb_a_procedure_definition_runs_back_as_a_script() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Mariadb));
+    let drop = "DROP PROCEDURE IF EXISTS it_rt_proc";
+    db.execute(&conn, drop, WRITE).await.unwrap();
+    db.execute(
+        &conn,
+        "CREATE PROCEDURE it_rt_proc(INOUT n INT)\n\
+         BEGIN\n  SET n = n + 1;\n  IF n > 0 THEN\n    SET n = n * 2;\n  END IF;\nEND",
+        WRITE,
+    )
+    .await
+    .unwrap();
+    let proc = object("app", ObjectKind::Procedure, "it_rt_proc", "");
+    let before = db.object_definition(&conn, &proc).await.unwrap();
+    db.execute(&conn, drop, WRITE).await.unwrap();
+    let run = db.execute_script(&conn, &before, WRITE).await;
+    // The procedure the script made works: 1 becomes (1 + 1) * 2.
+    let called = db
+        .execute_script(
+            &conn,
+            "SET @n = 1; CALL it_rt_proc(@n); SELECT @n AS n",
+            WRITE,
+        )
+        .await;
+    let after = db.object_definition(&conn, &proc).await;
+    db.execute(&conn, drop, WRITE).await.unwrap();
+    run.unwrap_or_else(|e| panic!("{e:#}\n{before}"));
+    assert_eq!(after.unwrap(), before);
+    assert_eq!(called.unwrap().result.rows, vec![vec![json!(4)]]);
+}
+
+#[tokio::test]
+async fn mariadb_a_routine_body_does_not_let_a_read_only_script_write() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let (db, conn) = (Db::new(), connection(Adapter::Mariadb));
+    let script = "CREATE PROCEDURE it_ro_proc() BEGIN SELECT 1; DELETE FROM users; END";
+    let error = db.execute_script(&conn, script, READ).await.unwrap_err();
+    assert!(format!("{error:#}").contains("read-only"), "{error:#}");
+    let error = db.execute(&conn, script, READ).await.unwrap_err();
+    assert!(format!("{error:#}").contains("read-only"), "{error:#}");
+    let listed = db.list_objects(&conn).await.unwrap();
+    assert_eq!(listed_name(&listed, "it_ro_proc"), None);
+}
+
+fn listed_name(objects: &[ObjectInfo], name: &str) -> Option<ObjectKind> {
+    objects.iter().find(|o| o.name == name).map(|o| o.kind)
+}
