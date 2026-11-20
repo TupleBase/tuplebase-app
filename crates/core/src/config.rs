@@ -222,17 +222,13 @@ fn default_ssh_port() -> u16 {
 }
 
 /// The AWS service that holds a connection's credentials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AwsStore {
-    #[serde(rename = "aws_secret")]
     SecretsManager,
-    #[serde(rename = "aws_parameter")]
     ParameterStore,
 }
 
 impl AwsStore {
-    pub const ALL: [AwsStore; 2] = [AwsStore::SecretsManager, AwsStore::ParameterStore];
-
     pub fn label(self) -> &'static str {
         match self {
             AwsStore::SecretsManager => "AWS Secrets Manager",
@@ -241,12 +237,10 @@ impl AwsStore {
     }
 }
 
-/// Take the credentials from AWS on every connect, instead of the OS credential store.
-/// Only this pointer is saved; see [`crate::aws`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AwsAuth {
-    #[serde(rename = "type")]
-    pub store: AwsStore,
+/// Where in AWS a secret or parameter is. Only this pointer is saved; the value is read
+/// on every connect (see [`crate::cloud::aws`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsSecretRef {
     /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub profile: String,
@@ -258,6 +252,110 @@ pub struct AwsAuth {
     /// Also take the host, port and database from the secret.
     #[serde(default)]
     pub use_secret_host: bool,
+}
+
+/// Sign in to the database with a short-lived RDS IAM token made from an AWS profile.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwsIamAuth {
+    /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    /// The database's region. Empty means the one in its `*.rds.amazonaws.com` host
+    /// name, or else the profile's.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region: String,
+}
+
+/// Where a connection's password comes from. Saved as `auth`, tagged by `type`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Auth {
+    /// The OS credential store (see [`crate::secrets`]). Not written to the file.
+    #[default]
+    Password,
+    /// A secret in AWS Secrets Manager.
+    AwsSecret(AwsSecretRef),
+    /// A parameter in AWS Systems Manager Parameter Store.
+    AwsParameter(AwsSecretRef),
+    /// An RDS IAM auth token for the connection's user, made on every connect.
+    AwsIam(AwsIamAuth),
+}
+
+impl Auth {
+    pub fn is_password(&self) -> bool {
+        *self == Auth::Password
+    }
+
+    pub fn kind(&self) -> AuthKind {
+        match self {
+            Auth::Password => AuthKind::Password,
+            Auth::AwsSecret(_) => AuthKind::AwsSecret,
+            Auth::AwsParameter(_) => AuthKind::AwsParameter,
+            Auth::AwsIam(_) => AuthKind::AwsIam,
+        }
+    }
+
+    /// The secret or parameter it reads, and the store that holds it.
+    pub fn secret(&self) -> Option<(AwsStore, &AwsSecretRef)> {
+        match self {
+            Auth::AwsSecret(secret) => Some((AwsStore::SecretsManager, secret)),
+            Auth::AwsParameter(parameter) => Some((AwsStore::ParameterStore, parameter)),
+            Auth::Password | Auth::AwsIam(_) => None,
+        }
+    }
+
+    /// The AWS profile and region it uses, if it uses AWS.
+    pub fn aws_profile(&self) -> Option<(&str, &str)> {
+        match self {
+            Auth::AwsSecret(r) | Auth::AwsParameter(r) => Some((&r.profile, &r.region)),
+            Auth::AwsIam(iam) => Some((&iam.profile, &iam.region)),
+            Auth::Password => None,
+        }
+    }
+}
+
+/// The choices the connection form offers, one per [`Auth`] variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthKind {
+    Password,
+    AwsSecret,
+    AwsParameter,
+    AwsIam,
+}
+
+impl AuthKind {
+    pub const ALL: [AuthKind; 4] = [
+        AuthKind::Password,
+        AuthKind::AwsSecret,
+        AuthKind::AwsParameter,
+        AuthKind::AwsIam,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AuthKind::Password => "Password",
+            AuthKind::AwsSecret => "Secrets Manager",
+            AuthKind::AwsParameter => "Parameter Store",
+            AuthKind::AwsIam => "IAM token",
+        }
+    }
+}
+
+/// The cloud a connection was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    Aws,
+}
+
+/// Where a connection was discovered, so it can be found there again. Never a secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Source {
+    pub provider: Provider,
+    /// The resource's identifier there, such as an RDS ARN.
+    pub resource: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub region: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,9 +381,17 @@ pub struct Connection {
     pub tls: TlsMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh: Option<SshConfig>,
-    /// `None` means a password from the OS credential store.
+    /// Where the password comes from. Left out of the file for the OS credential store;
+    /// `null`, which older versions could write, means that too.
+    #[serde(
+        default,
+        deserialize_with = "null_is_password",
+        skip_serializing_if = "Auth::is_password"
+    )]
+    pub auth: Auth,
+    /// Where the connection was discovered, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AwsAuth>,
+    pub source: Option<Source>,
 }
 
 impl Connection {
@@ -298,11 +404,25 @@ impl Connection {
                 || self.database.clone(),
                 |n| n.to_string_lossy().into_owned(),
             )
-        } else if let Some(auth) = self.auth.as_ref().filter(|a| a.use_secret_host) {
-            auth.name.clone()
+        } else if let Some((_, secret)) = self.auth.secret().filter(|(_, s)| s.use_secret_host) {
+            secret.name.clone()
         } else {
             self.host.clone()
         }
+    }
+
+    /// RDS refuses IAM tokens over a connection that isn't encrypted, and a token sent
+    /// in the clear could be read on the way. Checked on save and again on connect, for
+    /// files edited by hand.
+    pub fn check_iam_encryption(&self) -> Result<()> {
+        if matches!(self.auth, Auth::AwsIam(_)) && self.tls == TlsMode::Prefer {
+            bail!(
+                "an IAM token needs an encrypted connection: set Encryption to Required \
+                 or Verified for \"{}\"",
+                self.name
+            );
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -316,18 +436,18 @@ impl Connection {
             if self.ssh.is_some() {
                 bail!("SSH tunnels don't apply to database files");
             }
-            if self.auth.is_some() {
+            if !self.auth.is_password() {
                 bail!("AWS credentials don't apply to database files");
             }
-        } else if let Some(auth) = &self.auth {
+        } else if let Some((_, secret)) = self.auth.secret() {
             // The user can come from the secret, and so can the host.
-            if auth.name.trim().is_empty() {
+            if secret.name.trim().is_empty() {
                 bail!(
                     "a secret or parameter name is required for \"{}\"",
                     self.name
                 );
             }
-            if !auth.use_secret_host && self.host.trim().is_empty() {
+            if !secret.use_secret_host && self.host.trim().is_empty() {
                 bail!("host is required for \"{}\"", self.name);
             }
         } else {
@@ -337,6 +457,7 @@ impl Connection {
             if self.user.trim().is_empty() {
                 bail!("user is required for \"{}\"", self.name);
             }
+            self.check_iam_encryption()?;
         }
         let color_is_valid = self.color.is_empty()
             || (self.color.len() == 7
@@ -382,6 +503,10 @@ impl FolderNode<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
+    /// The file format: [`VERSION_IAM`] once a connection uses an IAM token, which older
+    /// versions of the app can't read, so that they refuse the file instead of failing to
+    /// parse it; otherwise [`VERSION_BASE`]. Kept up to date by [`Config::upsert`] and
+    /// [`Config::remove`].
     pub version: u32,
     /// Sidebar folder paths, so that empty folders are kept.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -397,6 +522,14 @@ pub struct Config {
     /// Light or dark colors, or whichever the system uses.
     #[serde(default, skip_serializing_if = "Appearance::is_system")]
     pub appearance: Appearance,
+    /// Why this config must not be saved: the file it stands in for couldn't be read, and
+    /// saving would delete what is in it. Never in the file.
+    #[serde(skip)]
+    pub unsaved_because: Option<String>,
+}
+
+fn null_is_password<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Auth, D::Error> {
+    Ok(Option::<Auth>::deserialize(d)?.unwrap_or_default())
 }
 
 /// The app's colors.
@@ -426,6 +559,11 @@ impl Appearance {
     }
 }
 
+/// The file format every version of the app reads.
+pub const VERSION_BASE: u32 = 1;
+/// The file format of a config with an IAM token connection.
+pub const VERSION_IAM: u32 = 2;
+
 pub const DEFAULT_FONT_SIZE: u8 = 15;
 /// The smallest and largest text the app offers.
 pub const FONT_SIZES: RangeInclusive<u8> = 10..=28;
@@ -441,12 +579,13 @@ fn default_font_size() -> u8 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: VERSION_BASE,
             folders: Vec::new(),
             connections: Vec::new(),
             check_for_updates: true,
             font_size: DEFAULT_FONT_SIZE,
             appearance: Appearance::System,
+            unsaved_because: None,
         }
     }
 }
@@ -464,13 +603,91 @@ pub fn config_dir() -> Result<PathBuf> {
 
 /// Writes a file via a temp file and rename, so a crash never leaves half a file.
 pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    write_bytes_atomic(path, format!("{text}\n").as_bytes())
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, format!("{text}\n")).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// The file's bytes, or `None` when there is no file.
+fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Where the last file older versions can read is kept, once it is upgraded.
+pub const BASE_VERSION_BACKUP: &str = "connections.v1-backup.json";
+
+/// Keeps the [`VERSION_BASE`] file at `path` as [`BASE_VERSION_BACKUP`] beside it, before
+/// it is raised to [`VERSION_IAM`]. A backup that isn't a whole version 1 file, such as one
+/// cut short, is written again. A good one that differs, from an earlier upgrade, is kept
+/// as `connections.v1-backup-<time>.json` first, so no copy older versions can read is lost.
+fn keep_base_version(path: &Path) -> Result<()> {
+    let Some(current) = read_file(path)? else {
+        return Ok(());
+    };
+    if !Config::parse(&current).is_ok_and(|c| c.version == VERSION_BASE) {
+        return Ok(());
+    }
+    let backup = path.with_file_name(BASE_VERSION_BACKUP);
+    match fs::read(&backup) {
+        Ok(old) if old == current => return Ok(()),
+        Ok(old) if Config::parse(&old).is_ok_and(|c| c.version == VERSION_BASE) => {
+            let older = unused_name(path, BASE_VERSION_BACKUP.trim_end_matches(".json"));
+            fs::rename(&backup, &older)
+                .with_context(|| format!("keeping {} as {}", backup.display(), older.display()))?;
+        }
+        // Missing, or not a version 1 file this version reads: write it (again).
+        _ => {}
+    }
+    write_bytes_atomic(&backup, &current)
+}
+
+/// `<prefix>-<time>.json` beside `path`, with `-N` added so it never names a file that
+/// exists.
+fn unused_name(path: &Path, prefix: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    (0..)
+        .map(|n| {
+            let suffix = if n == 0 {
+                String::new()
+            } else {
+                format!("-{n}")
+            };
+            path.with_file_name(format!("{prefix}-{stamp}{suffix}.json"))
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused name exists")
+}
+
+/// Where a file this version couldn't read is kept: next to it, named with the
+/// time, and never overwriting an earlier copy.
+fn unreadable_copy(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("connections");
+    unused_name(path, &format!("{stem}.unreadable"))
+}
+
+/// What to tell the user once saving moved a file this version can't read to `kept`.
+pub fn kept_unreadable_message(kept: &Path) -> String {
+    format!(
+        "Your earlier connections file, which this version can't read, was kept as {}.",
+        kept.display()
+    )
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -483,27 +700,119 @@ impl Config {
         Self::load_from(&config_path()?)
     }
 
-    pub fn save(&self) -> Result<()> {
+    /// Saves the user's config; see [`Config::save_to`].
+    pub fn save(&self) -> Result<Option<PathBuf>> {
         self.save_to(&config_path()?)
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match read_file(path)? {
+            None => Ok(Self::default()),
+            Some(bytes) => {
+                Self::parse(&bytes).with_context(|| format!("parsing {}", path.display()))
+            }
         }
-        let text =
-            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut config: Config =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        if config.version != 1 {
+    }
+
+    /// A config file's contents, if this version reads them.
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut config: Config = serde_json::from_slice(bytes)?;
+        if !(VERSION_BASE..=VERSION_IAM).contains(&config.version) {
             bail!("unsupported config version {}", config.version);
         }
         config.resize_font(0);
+        config.sync_version();
         Ok(config)
     }
 
-    pub fn save_to(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &serde_json::to_string_pretty(self)?)
+    /// Loads the user's config like [`Config::load`], but a file that can't be used
+    /// doesn't stop the app and is left exactly as it is. Also returns what to tell the
+    /// user, then.
+    pub fn load_or_keep() -> Result<(Self, Option<String>)> {
+        Ok(Self::load_or_keep_from(&config_path()?))
+    }
+
+    /// The config starts empty when the file can't be used:
+    /// - one this version can't parse, such as a newer version's, is moved aside by
+    ///   [`Config::save_to`], and only when something is saved;
+    /// - one that can't be read at all, perhaps only for now, is never saved over.
+    pub fn load_or_keep_from(path: &Path) -> (Self, Option<String>) {
+        let bytes = match read_file(path) {
+            Ok(None) => return (Self::default(), None),
+            Ok(Some(bytes)) => bytes,
+            Err(e) => {
+                let config = Self {
+                    unsaved_because: Some(format!(
+                        "{} couldn't be read, so it isn't written over",
+                        path.display()
+                    )),
+                    ..Self::default()
+                };
+                let message = format!(
+                    "Couldn't read your connections ({e:#}). The file is left untouched and \
+                     changes won't be saved; restart TupleBase once it can be read."
+                );
+                return (config, Some(message));
+            }
+        };
+        match Self::parse(&bytes) {
+            Ok(config) => (config, None),
+            Err(e) => (
+                Self::default(),
+                Some(format!(
+                    "This version can't read your connections file {} ({e:#}). It is left \
+                     untouched; if you change anything, it is first kept beside it as \
+                     connections.unreadable-<time>.json, never written over.",
+                    path.display()
+                )),
+            ),
+        }
+    }
+
+    /// Writes the config. A file already there that this version can't parse is moved
+    /// aside first rather than overwritten, so its connections are never lost; returns
+    /// where it went. A file that can't be read at all is left alone and nothing is
+    /// saved. The first time it raises a file to [`VERSION_IAM`], which older versions
+    /// can't read, it keeps a copy of the old file as [`BASE_VERSION_BACKUP`].
+    pub fn save_to(&self, path: &Path) -> Result<Option<PathBuf>> {
+        if let Some(reason) = &self.unsaved_because {
+            bail!("not saved: {reason}");
+        }
+        let existing = read_file(path).with_context(|| {
+            format!(
+                "not saved: {} couldn't be checked, so it isn't written over",
+                path.display()
+            )
+        })?;
+        let mut kept = None;
+        if existing.is_some_and(|bytes| Self::parse(&bytes).is_err()) {
+            // E.g. a newer TupleBase wrote it.
+            let to = unreadable_copy(path);
+            fs::rename(path, &to).with_context(|| {
+                format!(
+                    "keeping the unreadable {} as {}",
+                    path.display(),
+                    to.display()
+                )
+            })?;
+            kept = Some(to);
+        }
+        let mut config = self.clone();
+        config.sync_version();
+        if config.version > VERSION_BASE {
+            keep_base_version(path)?;
+        }
+        write_atomic(path, &serde_json::to_string_pretty(&config)?)?;
+        Ok(kept)
+    }
+
+    /// Sets the oldest file format that holds every connection.
+    fn sync_version(&mut self) {
+        let iam = self
+            .connections
+            .iter()
+            .any(|c| matches!(c.auth, Auth::AwsIam(_)));
+        self.version = if iam { VERSION_IAM } else { VERSION_BASE };
     }
 
     /// Makes the app's text `steps` pixels larger, or smaller for a negative number,
@@ -663,12 +972,14 @@ impl Config {
             Some(i) => self.connections[i] = conn,
             None => self.connections.push(conn),
         }
+        self.sync_version();
         Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
         let before = self.connections.len();
         self.connections.retain(|c| c.name != name);
+        self.sync_version();
         self.connections.len() != before
     }
 }
@@ -690,7 +1001,8 @@ mod tests {
             color: String::new(),
             tls: TlsMode::default(),
             ssh: None,
-            auth: None,
+            auth: Auth::Password,
+            source: None,
         }
     }
 
@@ -817,20 +1129,30 @@ mod tests {
         assert!(!json.contains("tls") && !json.contains("ssh") && !json.contains("auth"));
     }
 
-    fn aws(name: &str) -> AwsAuth {
-        AwsAuth {
-            store: AwsStore::SecretsManager,
+    fn aws(name: &str) -> Auth {
+        Auth::AwsSecret(AwsSecretRef {
             profile: "prod-sso".into(),
             region: String::new(),
             name: name.into(),
             use_secret_host: false,
+        })
+    }
+
+    fn iam(name: &str) -> Connection {
+        Connection {
+            tls: TlsMode::Require,
+            auth: Auth::AwsIam(AwsIamAuth {
+                profile: "prod-sso".into(),
+                region: "eu-west-1".into(),
+            }),
+            ..pg(name)
         }
     }
 
     #[test]
     fn aws_auth_is_saved_as_a_pointer() {
         let mut conn = pg("a");
-        conn.auth = Some(aws("prod/orders"));
+        conn.auth = aws("prod/orders");
         let json = serde_json::to_value(&conn).unwrap();
         assert_eq!(
             json["auth"],
@@ -848,22 +1170,402 @@ mod tests {
     fn aws_auth_needs_a_name_and_can_supply_the_user_and_host() {
         let mut config = Config::default();
         let mut conn = pg("a");
-        conn.auth = Some(aws(""));
+        conn.auth = aws("");
         assert!(config.upsert(conn.clone(), None).is_err());
 
-        conn.auth = Some(aws("prod/orders"));
+        conn.auth = aws("prod/orders");
         conn.user.clear();
         assert!(config.upsert(conn.clone(), None).is_ok());
 
         conn.host.clear();
         assert!(config.upsert(conn.clone(), Some("a")).is_err());
-        conn.auth.as_mut().unwrap().use_secret_host = true;
+        let Auth::AwsSecret(secret) = &mut conn.auth else {
+            unreachable!()
+        };
+        secret.use_secret_host = true;
         assert!(config.upsert(conn.clone(), Some("a")).is_ok());
         assert_eq!(conn.location(), "prod/orders");
 
         let mut file = sqlite("/data/app.sqlite");
-        file.auth = Some(aws("prod/orders"));
+        file.auth = aws("prod/orders");
         assert!(config.upsert(file, None).is_err());
+    }
+
+    /// A config written before IAM tokens existed, as the app wrote it.
+    const V1_FILE: &str = r#"{
+  "version": 1,
+  "folders": [
+    "Prod"
+  ],
+  "connections": [
+    {
+      "name": "plain",
+      "folder": "Prod",
+      "adapter": "postgres",
+      "host": "db.example.com",
+      "port": 5432,
+      "database": "app",
+      "user": "dev",
+      "readonly": false
+    },
+    {
+      "name": "secret",
+      "adapter": "mariadb",
+      "host": "",
+      "port": 3306,
+      "user": "",
+      "readonly": true,
+      "tls": "require",
+      "auth": {
+        "type": "aws_secret",
+        "profile": "prod-sso",
+        "region": "eu-west-1",
+        "name": "prod/orders-db",
+        "use_secret_host": true
+      }
+    },
+    {
+      "name": "parameter",
+      "adapter": "mysql",
+      "host": "10.0.0.5",
+      "port": 3306,
+      "user": "app",
+      "readonly": false,
+      "auth": {
+        "type": "aws_parameter",
+        "name": "/prod/password",
+        "use_secret_host": false
+      }
+    }
+  ],
+  "check_for_updates": true,
+  "font_size": 15
+}"#;
+
+    #[test]
+    fn a_version_1_file_loads_and_saves_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, format!("{V1_FILE}\n")).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.version, VERSION_BASE);
+        assert!(config.connections[0].auth.is_password());
+        assert_eq!(
+            config.connections[1].auth,
+            Auth::AwsSecret(AwsSecretRef {
+                profile: "prod-sso".into(),
+                region: "eu-west-1".into(),
+                name: "prod/orders-db".into(),
+                use_secret_host: true,
+            })
+        );
+        assert_eq!(
+            config.connections[2]
+                .auth
+                .secret()
+                .map(|(store, s)| (store, &*s.name)),
+            Some((AwsStore::ParameterStore, "/prod/password"))
+        );
+        config.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), format!("{V1_FILE}\n"));
+    }
+
+    #[test]
+    fn an_iam_connection_raises_the_version_and_removing_it_lowers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let mut config = Config::default();
+        config.upsert(pg("plain"), None).unwrap();
+        config.save_to(&path).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""version": 1"#)
+        );
+
+        config.upsert(iam("iam"), None).unwrap();
+        assert_eq!(config.version, VERSION_IAM);
+        config.save_to(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""version": 2"#), "{text}");
+        assert_eq!(Config::load_from(&path).unwrap(), config);
+
+        config.remove("iam");
+        assert_eq!(config.version, VERSION_BASE);
+        config.save_to(&path).unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains(r#""version": 1"#)
+        );
+    }
+
+    #[test]
+    fn unknown_versions_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, r#"{ "version": 3 }"#).unwrap();
+        let error = format!("{:#}", Config::load_from(&path).unwrap_err());
+        assert!(error.contains("unsupported config version 3"), "{error}");
+        fs::write(&path, r#"{ "version": 2 }"#).unwrap();
+        assert!(Config::load_from(&path).is_ok());
+    }
+
+    /// The files in `dir` whose names contain `part`.
+    fn files_named(dir: &Path, part: &str) -> Vec<PathBuf> {
+        let mut found: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains(part))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_file_this_version_cannot_parse_is_left_alone_until_something_is_saved() {
+        let texts: [&[u8]; 3] = [
+            br#"{ "version": 3, "connections": [] }"#,
+            b"not json",
+            b"\xff\xfe not utf-8",
+        ];
+        for text in texts {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(CONFIG_FILE);
+            fs::write(&path, text).unwrap();
+            let (mut config, message) = Config::load_or_keep_from(&path);
+            let message = message.expect("the user is told");
+            assert!(message.contains("left untouched"), "{message}");
+            assert_eq!(config.connections, []);
+            // Loading changes nothing on disk.
+            assert_eq!(fs::read(&path).unwrap(), text);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+            // Saving moves it aside, byte for byte, and says where.
+            config.resize_font(1);
+            let kept = config.save_to(&path).unwrap().expect("moved aside");
+            assert_eq!(
+                files_named(dir.path(), "connections.unreadable-"),
+                std::slice::from_ref(&kept)
+            );
+            assert_eq!(fs::read(&kept).unwrap(), text);
+            assert!(Config::load_from(&path).is_ok());
+            let told = kept_unreadable_message(&kept);
+            assert!(told.contains(&*kept.to_string_lossy()), "{told}");
+            // Later saves write over their own file and leave the kept one alone.
+            config.resize_font(1);
+            assert_eq!(config.save_to(&path).unwrap(), None);
+            assert_eq!(fs::read(&kept).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_never_saved_over_or_moved() {
+        // A directory can't be read as a file on any system, even by root.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("inside"), "kept").unwrap();
+        let (config, message) = Config::load_or_keep_from(&path);
+        let message = message.expect("the user is told");
+        assert!(message.contains("won't be saved"), "{message}");
+        let error = config.save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("not saved"), "{error}");
+        // Even a config from a successful load doesn't write over what it can't check.
+        let error = Config::default().save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("not saved"), "{error}");
+        assert!(path.is_dir());
+        assert_eq!(fs::read_to_string(path.join("inside")).unwrap(), "kept");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_config_standing_in_for_a_file_kept_in_place_is_never_saved() {
+        // What a file that couldn't be read gives: saving would delete what is in it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, "not json").unwrap();
+        let config = Config {
+            unsaved_because: Some("it couldn't be read".into()),
+            ..Config::default()
+        };
+        let error = config.save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("not saved"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    #[test]
+    fn a_readable_file_loads_as_usual() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, V1_FILE).unwrap();
+        let (config, message) = Config::load_or_keep_from(&path);
+        assert_eq!(message, None);
+        assert_eq!(config, Config::load_from(&path).unwrap());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// `config` with a connection that uses an IAM token, which raises it to version 2.
+    fn with_iam(config: &Config) -> Config {
+        let mut config = config.clone();
+        let mut iam = config.connections[0].clone();
+        iam.name = "iam".into();
+        iam.tls = TlsMode::Require;
+        iam.auth = Auth::AwsIam(AwsIamAuth {
+            profile: String::new(),
+            region: "eu-west-1".into(),
+        });
+        config.upsert(iam, None).unwrap();
+        config
+    }
+
+    #[test]
+    fn a_backup_cut_short_is_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let backup = dir.path().join(BASE_VERSION_BACKUP);
+        fs::write(&path, V1_FILE).unwrap();
+        // As a copy interrupted midway would leave it.
+        fs::write(&backup, &V1_FILE[..V1_FILE.len() / 2]).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        with_iam(&config).save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), V1_FILE);
+        assert_eq!(files_named(dir.path(), ".tmp"), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_later_upgrade_keeps_the_earlier_backup_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let backup = dir.path().join(BASE_VERSION_BACKUP);
+        fs::write(&path, V1_FILE).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        with_iam(&config).save_to(&path).unwrap();
+        // The IAM connection is removed, the file goes back to version 1 and changes...
+        let mut later = config.clone();
+        later.resize_font(2);
+        later.save_to(&path).unwrap();
+        let later_v1 = fs::read_to_string(&path).unwrap();
+        assert_ne!(later_v1, V1_FILE);
+        // ...and is raised again: the backup is the newer file, the older one kept.
+        with_iam(&later).save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), later_v1);
+        let older = files_named(dir.path(), "connections.v1-backup-");
+        assert_eq!(older.len(), 1, "{older:?}");
+        assert_eq!(fs::read_to_string(&older[0]).unwrap(), V1_FILE);
+        // Raising the same version 1 file again changes nothing.
+        later.save_to(&path).unwrap();
+        with_iam(&later).save_to(&path).unwrap();
+        assert_eq!(files_named(dir.path(), "connections.v1-backup-").len(), 1);
+    }
+
+    #[test]
+    fn the_first_save_as_version_2_keeps_the_version_1_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, V1_FILE).unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        config.save_to(&path).unwrap();
+        let v1 = fs::read_to_string(&path).unwrap();
+        let backup = dir.path().join(BASE_VERSION_BACKUP);
+        assert!(!backup.exists(), "no backup while the file stays version 1");
+        let mut iam = config.connections[0].clone();
+        iam.name = "iam".into();
+        iam.tls = TlsMode::Require;
+        iam.auth = Auth::AwsIam(AwsIamAuth {
+            profile: String::new(),
+            region: "eu-west-1".into(),
+        });
+        config.upsert(iam, None).unwrap();
+        config.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), v1);
+        // Later saves leave the backup as it was.
+        config.resize_font(2);
+        config.save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), v1);
+    }
+
+    #[test]
+    fn a_null_auth_is_the_credential_store() {
+        let conn: Connection = serde_json::from_str(
+            r#"{ "name": "a", "adapter": "postgres", "host": "h", "port": 5432,
+                 "database": "", "user": "u", "auth": null }"#,
+        )
+        .unwrap();
+        assert_eq!(conn.auth, Auth::Password);
+    }
+
+    #[test]
+    fn each_auth_is_saved_with_its_type() {
+        let cases = [
+            (Auth::Password, None),
+            (
+                aws("s"),
+                Some(
+                    r#"{"type":"aws_secret","profile":"prod-sso","name":"s","use_secret_host":false}"#,
+                ),
+            ),
+            (
+                Auth::AwsParameter(AwsSecretRef {
+                    name: "/p".into(),
+                    ..Default::default()
+                }),
+                Some(r#"{"type":"aws_parameter","name":"/p","use_secret_host":false}"#),
+            ),
+            (
+                Auth::AwsIam(AwsIamAuth::default()),
+                Some(r#"{"type":"aws_iam"}"#),
+            ),
+        ];
+        for (auth, expected) in cases {
+            let conn = Connection {
+                auth: auth.clone(),
+                ..pg("a")
+            };
+            let json = serde_json::to_value(&conn).unwrap();
+            let written = json.get("auth").map(|a| a.to_string());
+            assert_eq!(written.as_deref(), expected);
+            let back: Connection = serde_json::from_value(json).unwrap();
+            assert_eq!(back.auth, auth);
+        }
+    }
+
+    #[test]
+    fn a_source_is_saved_without_secrets() {
+        let conn = Connection {
+            source: Some(Source {
+                provider: Provider::Aws,
+                resource: "arn:aws:rds:eu-west-1:123456789012:db:orders".into(),
+                region: "eu-west-1".into(),
+            }),
+            ..pg("a")
+        };
+        let json = serde_json::to_value(&conn).unwrap();
+        assert_eq!(
+            json["source"],
+            serde_json::json!({
+                "provider": "aws",
+                "resource": "arn:aws:rds:eu-west-1:123456789012:db:orders",
+                "region": "eu-west-1",
+            })
+        );
+        assert_eq!(serde_json::from_value::<Connection>(json).unwrap(), conn);
+    }
+
+    #[test]
+    fn an_iam_token_needs_a_user_a_host_and_encryption() {
+        let mut config = Config::default();
+        let mut conn = iam("a");
+        conn.tls = TlsMode::Prefer;
+        let error = config.upsert(conn.clone(), None).unwrap_err().to_string();
+        assert!(error.contains("encrypted"), "{error}");
+        conn.tls = TlsMode::Verify;
+        assert!(config.upsert(conn.clone(), None).is_ok());
+        conn.user.clear();
+        assert!(config.upsert(conn.clone(), Some("a")).is_err());
+        conn.user = "dev".into();
+        conn.host.clear();
+        assert!(config.upsert(conn, Some("a")).is_err());
     }
 
     #[test]
@@ -1069,6 +1771,31 @@ mod tests {
     fn update_check_defaults_to_on_for_existing_files() {
         let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
         assert!(config.check_for_updates);
+    }
+
+    #[test]
+    fn saving_over_a_file_this_version_cannot_read_keeps_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        // As written by a newer TupleBase.
+        let newer = r#"{"version": 2, "connections": [{"name": "kept"}]}"#;
+        fs::write(&path, newer).unwrap();
+        assert!(Config::load_from(&path).is_err());
+
+        Config::default().save_to(&path).unwrap();
+
+        assert!(Config::load_from(&path).is_ok());
+        let kept: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".unreadable-"))
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(fs::read_to_string(&kept[0]).unwrap(), newer);
+
+        // A readable file is simply replaced, with no copy made.
+        Config::default().save_to(&path).unwrap();
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     #[test]

@@ -31,45 +31,49 @@ scripts/                   install, packaging, release helpers
 
 ## Inside `core`
 
-| Module       | Owns                                                  | Imports from `core`                        |
-| ------------ | ----------------------------------------------------- | ------------------------------------------ |
-| `config`     | connection settings and the config directory          | nothing                                    |
-| `secrets`    | passwords in the OS credential store                  | nothing                                    |
-| `state`      | unsaved SQL, query history, panel sizes               | `config`                                   |
-| `safety`     | statement classification for the read-only guard      | `config`                                   |
-| `ssh`        | SSH tunnels                                           | `config`                                   |
-| `aws`        | credentials read from Secrets Manager and SSM         | `config`                                   |
-| `mcp_status` | heartbeat files of running MCP servers                | `config`                                   |
-| `app_status` | the file naming the connections open in the app       | `config`                                   |
-| `updates`    | the GitHub release check                              | `config`                                   |
-| `db`         | the database API, pools, running SQL, the read-only guard | `config` `secrets` `ssh` `aws` `safety` |
-| `db/postgres`| PostgreSQL's own SQL, read-only statements, value decoding | `config`, and `db` (its parent)       |
-| `db/mysql`   | MySQL's and MariaDB's own SQL, read-only statements, value decoding | `config`, and `db` (its parent) |
-| `db/sqlite`  | SQLite's own SQL, read-only switch, value decoding    | `config`, and `db` (its parent)            |
-| `db/decode`  | value decoding the engine modules share               | nothing                                    |
-| `agents`     | the MCP server's entry in each agent's config file    | `updates`                                  |
-| `chat`       | running the user's agent for the chat panel           | `config` `agents`                          |
+| Module         | Owns                                                      | Imports from `core`                                     |
+| -------------- | --------------------------------------------------------- | ------------------------------------------------------- |
+| `config`       | connection settings and the config directory              | nothing                                                 |
+| `secrets`      | passwords in the OS credential store                      | nothing                                                 |
+| `state`        | unsaved SQL, query history, panel sizes, last search      | `config`                                                |
+| `safety`       | statement classification for the read-only guard          | `config`                                                |
+| `ssh`          | SSH tunnels                                               | `config`                                                |
+| `cloud`        | cloud providers, one file each (`cloud/aws.rs`)           | `config`                                                |
+| `credentials`  | the password each auth method signs in with               | `config` `secrets` `cloud`                              |
+| `mcp_status`   | heartbeat files of running MCP servers                    | `config`                                                |
+| `app_status`   | the file naming the connections open in the app           | `config`                                                |
+| `updates`      | the GitHub release check                                  | `config`                                                |
+| `db`           | the database API, pools, running SQL, the read-only guard | `config` `ssh` `safety`                                 |
+| `db/connect`   | opening a pool: credentials, tunnel, each engine's options | `config` `secrets` `ssh` `credentials` `cloud`, and `db` |
+| `db/postgres`  | PostgreSQL's own SQL, read-only statements, value decoding | `config`, and `db` (its parent)                         |
+| `db/mysql`     | MySQL's and MariaDB's SQL, read-only statements, decoding | `config`, and `db` (its parent)                         |
+| `db/sqlite`    | SQLite's own SQL, read-only switch, value decoding        | `config`, and `db` (its parent)                         |
+| `db/decode`    | value decoding the engine modules share                   | nothing                                                 |
+| `agents`       | the MCP server's entry in each agent's config file        | `updates`                                               |
+| `chat`         | running the user's agent for the chat panel               | `config` `agents`                                       |
 
 - **L5. Imports inside `core` go one way, with no cycles.** `config` and `secrets` import
   no sibling module. A module that only needs settings imports `config` alone. `db`,
   `agents` and `chat` combine the others, and nothing below imports them. A submodule,
   such as `db/postgres`, may import its parent and its siblings; nothing outside the
-  parent imports it. Update the table when a module's imports change.
+  parent imports it. `credentials` combines `secrets` and `cloud` for `db`; only
+  `db/connect` uses it. Update the table when a module's imports change.
 - **L6. One module owns each outside system.** SQL and drivers in `db` and `safety`, the
-  credential store in `secrets`, the AWS SDK in `aws`, SSH in `ssh`, each file format in
-  the module that names it. Other modules call that module instead of the system.
+  credential store in `secrets`, each cloud provider's SDK in its own `cloud` module (the
+  AWS SDK in `cloud::aws`), SSH in `ssh`, each file format in the module that names it.
+  Other modules call that module instead of the system.
 - **L7. Engine-specific SQL lives in its engine module under `db/`.** `db.rs` keeps the
   public API and what every engine shares; a method that needs engine-specific SQL picks
   the engine module by the pool and calls it. MySQL and MariaDB share `db/mysql.rs`,
   which names any difference between them where it occurs. A feature only one engine has,
   such as MySQL events, lives only in that engine's module. The module's `DIALECT` holds
   its fixed statements, such as the read-only ones `db.rs` runs around each statement (S2).
+  Opening a pool is in `db/connect.rs`, with one connect-options function per engine.
   What needs no SQL (name, default port, file or server, quoting, script splitting) is in
   one `EngineInfo` per engine in `config`, from `Adapter::info`, so every module can read
   it. Match on `Adapter` and `Pool` without a catch-all, so a new engine makes the compiler
   list each place to fill in. A new engine is a new module plus one arm per feature; see
-  [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md). Only connecting (the pool and its
-  options) is still outside the engine modules.
+  [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md).
 
 ## Inside `app`
 
@@ -79,6 +83,8 @@ scripts/                   install, packaging, release helpers
 | `workspace`          | the main window: connection sidebar, SQL editor, results    |
 | `workspace/settings` | the Settings dialog                                         |
 | `conn_form`          | the add and edit connection form                            |
+| `conn_source`        | the first step of adding one: where the database is         |
+| `aws_picker`         | finding a database in AWS to fill in the form               |
 | `schema`             | the schema browser                                          |
 | `results`            | the table that shows a query result                         |
 | `row_detail`         | the panel that shows one result row field by field          |
@@ -134,7 +140,8 @@ Changing one of these needs the user's explicit agreement, not just a passing re
 | Change                           | Place                                                      |
 | -------------------------------- | ---------------------------------------------------------- |
 | New database engine or SQL       | its module under `core/src/db/` (L7), and `core/src/safety.rs` for the guard |
-| New way to get credentials       | its own `core` module, called from `db`                    |
+| New way to get credentials       | an `Auth` variant in `core/src/config.rs`, its arm in `core/src/credentials.rs`, and its system's own module |
+| New cloud provider               | `core/src/cloud/<name>.rs`, and an arm in `cloud::discover` |
 | New setting saved to disk        | `core/src/config.rs`, or `core/src/state.rs` if not a connection setting |
 | New panel, dialog or form        | its own `app` module (A2)                                  |
 | New item in Settings             | `app/src/workspace/settings.rs`                            |

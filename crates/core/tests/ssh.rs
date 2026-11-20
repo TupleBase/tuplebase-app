@@ -61,7 +61,8 @@ async fn tunneled(name: &str, adapter: Adapter, db_host: &str, port: u16) -> Con
             key_path: String::new(),
             fingerprint,
         }),
-        auth: None,
+        auth: Default::default(),
+        source: None,
     }
 }
 

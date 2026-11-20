@@ -61,7 +61,8 @@ table has a very long name. The data is in `dev/demo-postgres.sql` and `dev/demo
 which run only when a database is first created. To load a changed file, run `make down`, then
 `make dev`.
 
-The fake AWS serves Secrets Manager and Parameter Store. To use it from the app or the AWS
+The fake AWS serves Secrets Manager, Parameter Store and RDS (listing only: its databases
+don't accept logins). To use it from the app or the AWS
 CLI, set `AWS_ENDPOINT_URL=http://127.0.0.1:54566`, `AWS_ACCESS_KEY_ID=test` and
 `AWS_SECRET_ACCESS_KEY=test`.
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -22,8 +23,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::{self, AgentState, AgentStatus};
 use tuplebase_core::config::{
-    Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name, parent_of,
-    rebase_folder,
+    Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
+    kept_unreadable_message, parent_of, rebase_folder,
 };
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
@@ -347,14 +348,25 @@ pub struct Workspace {
     /// A newer version found by the update check, and how far along it is.
     update_state: Option<UpdateState>,
     _form_subscription: Option<Subscription>,
+    /// Where saving moved a connections file this version can't read, until the status
+    /// line has shown it past the connect that follows saving a connection.
+    kept_note: Option<SharedString>,
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Small local file read once before the first frame.
-        let (config, status) = match Config::load() {
-            Ok(config) => (config, Status::Idle),
-            Err(e) => (Config::default(), Status::Failed(format!("{e:#}").into())),
+        // A file that can't be used is left as it is, never saved over (see `core::config`).
+        let (config, status) = match Config::load_or_keep() {
+            Ok((config, None)) => (config, Status::Idle),
+            Ok((config, Some(message))) => (config, Status::Failed(message.into())),
+            Err(e) => {
+                let config = Config {
+                    unsaved_because: Some(format!("{e:#}")),
+                    ..Config::default()
+                };
+                (config, Status::Failed(format!("{e:#}").into()))
+            }
         };
         theme::set_appearance(config.appearance, Some(window), cx);
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -667,15 +679,39 @@ impl Workspace {
     fn save_config(&self, cx: &mut Context<Self>) {
         let config = self.config.clone();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = blocking(move || config.save()).await {
-                this.update(cx, |this, cx| {
-                    this.status = Status::Failed(format!("{e:#}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
+            let saved = blocking(move || config.save()).await;
+            this.update(cx, |this, cx| this.show_saved(saved, cx)).ok();
         })
         .detach();
+    }
+
+    /// Shows in the status line why saving failed, or where it moved a connections file
+    /// this version can't read; says nothing after an ordinary save.
+    fn show_saved(&mut self, saved: anyhow::Result<Option<PathBuf>>, cx: &mut Context<Self>) {
+        self.status = match saved {
+            Ok(None) => return,
+            Ok(Some(kept)) => {
+                let note = SharedString::from(kept_unreadable_message(&kept));
+                self.kept_note = Some(note.clone());
+                Status::Done(note)
+            }
+            Err(e) => Status::Failed(format!("{e:#}").into()),
+        };
+        cx.notify();
+    }
+
+    /// The status once connecting to `name` is done; a note about a kept connections
+    /// file stays in it rather than being replaced.
+    fn show_connected(&mut self, name: &str, result: anyhow::Result<()>) {
+        let note = self.kept_note.take();
+        let with_note = |text: String| match &note {
+            Some(note) => format!("{text}. {note}"),
+            None => text,
+        };
+        self.status = match result {
+            Ok(()) => Status::Done(with_note(format!("Connected to {name}")).into()),
+            Err(e) => Status::Failed(with_note(format!("{e:#}")).into()),
+        };
     }
 
     fn begin_folder_edit(
@@ -940,6 +976,7 @@ impl Workspace {
             collapsed: HashSet::new(),
             update_state: None,
             _form_subscription: None,
+            kept_note: None,
         }
     }
 
@@ -980,10 +1017,7 @@ impl Workspace {
                 if this.selected.as_deref() != Some(name.as_str()) {
                     return;
                 }
-                this.status = match result {
-                    Ok(()) => Status::Done(format!("Connected to {name}").into()),
-                    Err(e) => Status::Failed(format!("{e:#}").into()),
-                };
+                this.show_connected(&name, result);
                 cx.notify();
             })
             .ok();
@@ -1004,7 +1038,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let form = cx.new(|cx| ConnForm::new(existing.as_ref(), folder, window, cx));
+        let last_aws = self.session.aws_search.clone();
+        let form = cx.new(|cx| ConnForm::new(existing.as_ref(), folder, last_aws, window, cx));
         self._form_subscription = Some(cx.subscribe(&form, |this, form, event, cx| match event {
             ConnFormEvent::Save {
                 connection,
@@ -1022,6 +1057,10 @@ impl Workspace {
             ConnFormEvent::Cancel => {
                 this.form = None;
                 cx.notify();
+            }
+            ConnFormEvent::SearchedAws(search) => {
+                this.session.aws_search = search.clone();
+                this.schedule_session_save(cx);
             }
         }));
         self.form = Some(form);
@@ -1048,12 +1087,12 @@ impl Workspace {
         let saved = config.clone();
         cx.spawn(async move |this, cx| {
             let result = blocking(move || {
-                saved.save()?;
+                let kept = saved.save()?;
                 let renamed = previous.as_ref().filter(|p| **p != connection.name);
                 if let Some(old) = renamed {
                     secrets::rename(old, &connection.name)?;
                 }
-                if connection.auth.is_some() {
+                if !connection.auth.is_password() {
                     // The credentials now come from AWS; don't keep an unused password.
                     secrets::delete_password(&connection.name)?;
                 } else if let Some(pw) = &password {
@@ -1062,11 +1101,11 @@ impl Workspace {
                 if let Some(secret) = &ssh_password {
                     secrets::set_ssh_password(&connection.name, secret)?;
                 }
-                Ok(previous)
+                Ok((previous, kept))
             })
             .await;
             let forget = match &result {
-                Ok(Some(previous)) => Some(previous.clone()),
+                Ok((Some(previous), _)) => Some(previous.clone()),
                 _ => None,
             };
             let renamed_from = forget.clone().filter(|old| *old != name);
@@ -1079,7 +1118,7 @@ impl Workspace {
                 .ok();
             }
             this.update(cx, |this, cx| match result {
-                Ok(_) => {
+                Ok((_, kept)) => {
                     this.config = config;
                     if let Some(old) = &renamed_from {
                         this.session.rename_connection(old, &name);
@@ -1087,6 +1126,7 @@ impl Workspace {
                     }
                     this.collapsed.remove(&folder);
                     this.select(name, cx);
+                    this.show_saved(Ok(kept), cx);
                 }
                 Err(e) => form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx)),
             })
@@ -1137,8 +1177,9 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let forget_name = name.clone();
             let result = blocking(move || {
-                config.save()?;
-                secrets::delete_all(&name)
+                let kept = config.save()?;
+                secrets::delete_all(&name)?;
+                Ok(kept)
             })
             .await;
             io(async move {
@@ -1147,13 +1188,7 @@ impl Workspace {
             })
             .await
             .ok();
-            if let Err(e) = result {
-                this.update(cx, |this, cx| {
-                    this.status = Status::Failed(format!("{e:#}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
+            this.update(cx, |this, cx| this.show_saved(result, cx)).ok();
         })
         .detach();
     }
@@ -2119,6 +2154,8 @@ impl Workspace {
             Status::Failed(s) => (s.clone(), theme.danger),
         };
         div()
+            .id("status-line")
+            .test_support()
             .flex_none()
             .min_h(px(28.))
             .px_3()
@@ -2342,7 +2379,9 @@ impl Workspace {
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let failed = matches!(self.status, Status::Failed(_));
+        // A failure, or where an unreadable connections file was kept: both matter most
+        // here, when no connections could be shown.
+        let failed = matches!(self.status, Status::Failed(_)) || self.kept_note.is_some();
         v_flex()
             .size_full()
             .child(
@@ -2547,7 +2586,7 @@ mod tests {
     };
     use serde_json::json;
     use std::rc::Rc;
-    use tuplebase_core::config::{Adapter, Appearance, AwsAuth, AwsStore};
+    use tuplebase_core::config::{Adapter, Appearance, Auth, AwsIamAuth, AwsSecretRef, TlsMode};
     use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult};
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
@@ -2586,7 +2625,8 @@ mod tests {
             color: String::new(),
             tls: Default::default(),
             ssh: None,
-            auth: None,
+            auth: Default::default(),
+            source: None,
         };
         config.upsert(conn, None).unwrap();
         config
@@ -3109,7 +3149,13 @@ mod tests {
         })
         .unwrap();
         cx.run_until_parked();
-        // A new connection asks for the database first; the rest follows the choice.
+        // A new connection asks where the database is, then which one it is; the rest
+        // follows the choice.
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("save").is_none());
+            assert!(window.try_find("adapter-PostgreSQL").is_none());
+            window.click("source-manual", cx);
+        });
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("save").is_none());
             assert!(window.try_find("conn-name").is_none());
@@ -3244,6 +3290,7 @@ mod tests {
     /// Opens the form for a new connection and chooses PostgreSQL, which shows the rest.
     fn open_new_form(handle: AnyWindowHandle, cx: &mut TestAppContext) {
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         window_action(handle, cx, |window, cx| {
             window.click("adapter-PostgreSQL", cx)
         });
@@ -3253,6 +3300,7 @@ mod tests {
     fn sqlite_only_asks_for_a_file(cx: &mut TestAppContext) {
         let (handle, _) = open(Config::default(), cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         window_action(handle, cx, |window, cx| window.click("adapter-SQLite", cx));
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("conn-host").is_none());
@@ -3294,7 +3342,7 @@ mod tests {
         open_new_form(handle, cx);
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("conn-aws-name").is_none());
-            window.click("auth-AWS Secrets Manager", cx);
+            window.click("auth-Secrets Manager", cx);
         });
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("conn-password").is_none());
@@ -3335,14 +3383,255 @@ mod tests {
         assert_eq!(connection.host, "");
         assert_eq!(
             connection.auth,
-            Some(AwsAuth {
-                store: AwsStore::SecretsManager,
+            Auth::AwsSecret(AwsSecretRef {
                 profile: "prod-sso".into(),
                 region: String::new(),
                 name: "prod/orders".into(),
                 use_secret_host: true,
             })
         );
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            assert!(form.read(cx).error.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn where_a_kept_connections_file_went_shows_on_the_empty_screen(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let kept = std::path::PathBuf::from("/cfg/connections.unreadable-1.json");
+                this.show_saved(Ok(Some(kept)), cx);
+            });
+            assert!(window.try_find("status-line").is_none());
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("status-line").visible());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_kept_connections_file_stays_in_the_status_line_past_connecting(cx: &mut TestAppContext) {
+        let (_, workspace) = open(config_with_connection(), cx);
+        let kept = std::path::PathBuf::from("/cfg/connections.unreadable-1.json");
+        workspace.update(cx, |this, cx| {
+            this.show_saved(Ok(Some(kept.clone())), cx);
+            assert!(matches!(&this.status, Status::Done(s) if s.contains("connections.unreadable-1.json")));
+            // Saving a connection selects it, and connecting reports back.
+            this.show_connected("db", Ok(()));
+            let Status::Done(text) = &this.status else {
+                panic!("done expected");
+            };
+            assert!(text.starts_with("Connected to db. "), "{text}");
+            assert!(text.contains("connections.unreadable-1.json"), "{text}");
+            // Said once: the next connect is reported as usual.
+            this.show_connected("db", Ok(()));
+            assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == "Connected to db"));
+            // A plain save leaves the status line alone.
+            this.show_saved(Ok(None), cx);
+            assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == "Connected to db"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_found_connection_moved_to_another_host_forgets_where_it_was_found(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
+        let found = crate::aws_picker::tests::found("orders", Some(Adapter::Postgres))
+            .connection()
+            .unwrap();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update_window(handle, |_, window, cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            form.update(cx, |form, cx| form.prefill(&found, window, cx));
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    saved.borrow_mut().push(connection.source.is_some());
+                }
+            })
+            .detach();
+        })
+        .unwrap();
+        // Saved as found, it keeps its source (see the test below); here the host changes.
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-host", cx);
+            window.input(".example.com", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        assert_eq!(*saved.borrow(), [false]);
+    }
+
+    #[gpui_kit::test]
+    fn a_found_connection_taking_its_host_from_a_secret_forgets_where_it_was_found(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
+        let found = crate::aws_picker::tests::found("orders", Some(Adapter::Postgres))
+            .connection()
+            .unwrap();
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        cx.update_window(handle, |_, window, cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            form.update(cx, |form, cx| form.prefill(&found, window, cx));
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    saved.borrow_mut().push(connection.source.is_some());
+                }
+            })
+            .detach();
+        })
+        .unwrap();
+        window_action(handle, cx, |window, cx| {
+            window.click("auth-Secrets Manager", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-aws-name", cx);
+            window.input("prod/orders", cx);
+            window.click("use-secret-host", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        assert_eq!(*saved.borrow(), [false]);
+    }
+
+    #[gpui_kit::test]
+    fn a_database_found_in_aws_fills_in_a_new_connection(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("save").is_none());
+            window.click("source-aws", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("aws-regions", cx);
+            window.input("eu-west-1", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("aws-find", cx));
+        // The search itself runs on the runtime, which tests don't; give its answer.
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let source = form.read(cx).start().cloned().expect("source step shown");
+            let picker = source.read(cx).aws_picker().cloned().expect("AWS step");
+            picker.update(cx, |picker, cx| {
+                picker.set_discovery(
+                    tuplebase_core::cloud::Discovery {
+                        found: vec![crate::aws_picker::tests::found(
+                            "orders",
+                            Some(Adapter::Postgres),
+                        )],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+        });
+        window_action(handle, cx, |window, cx| window.click("aws-use", cx));
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            assert!(form.read(cx).start().is_none());
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save {
+                    connection,
+                    previous,
+                    ..
+                } = event
+                {
+                    *saved.borrow_mut() = Some((connection.clone(), previous.clone()));
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("conn-notice").visible());
+            assert!(window.try_find("conn-password").is_none());
+            assert!(window.find("conn-aws-profile").visible());
+            assert!(window.try_find("conn-tls-hint").is_some());
+            window.click("save", cx);
+        });
+        let (connection, previous) = saved.borrow_mut().take().expect("the form saved");
+        // A new connection, not an edit of one with the same name.
+        assert_eq!(previous, None);
+        assert_eq!(connection.name, "orders");
+        assert_eq!(connection.host, "orders.abc.eu-west-1.rds.amazonaws.com");
+        assert_eq!((connection.port, connection.user.as_str()), (5432, "admin"));
+        assert_eq!(connection.tls, TlsMode::Require);
+        assert_eq!(
+            connection.auth,
+            Auth::AwsIam(AwsIamAuth {
+                profile: "prod".into(),
+                region: "eu-west-1".into(),
+            })
+        );
+        assert!(connection.source.is_some());
+        cx.update(|cx| {
+            // Where it looked is remembered for next time.
+            let search = &workspace.read(cx).session.aws_search;
+            assert_eq!(search.regions, ["eu-west-1"]);
+            assert_eq!(search.profile, "");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_credentials_choice_switches_the_fields_and_iam_turns_on_encryption(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = open(Config::default(), cx);
+        open_new_form(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-password").is_some());
+            window.click("auth-IAM token", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-password").is_none());
+            assert!(window.try_find("conn-aws-name").is_none());
+            assert!(window.try_find("conn-aws-profile").is_some());
+            assert!(window.try_find("conn-host").is_some());
+            window.click("auth-Parameter Store", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-aws-name").is_some());
+            window.click("auth-IAM token", cx);
+        });
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    *saved.borrow_mut() = Some(connection.clone());
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-name", cx);
+            window.input("orders", cx);
+            window.click("conn-host", cx);
+            window.input("orders.abc.eu-west-1.rds.amazonaws.com", cx);
+            window.click("conn-user", cx);
+            window.input("app", cx);
+            window.click("conn-aws-profile", cx);
+            window.input("prod", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        let connection = saved.borrow_mut().take().expect("the form saved");
+        assert_eq!(
+            connection.auth,
+            Auth::AwsIam(AwsIamAuth {
+                profile: "prod".into(),
+                region: String::new(),
+            })
+        );
+        assert_eq!(connection.tls, TlsMode::Require);
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
             assert!(form.read(cx).error.is_none());

@@ -17,6 +17,15 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 - Or keep the credentials in AWS: point a connection at a Secrets Manager secret or a Parameter
   Store parameter, and it is read with your AWS profile each time you connect. See
   [credentials kept in AWS](CREDENTIALS.md#credentials-kept-in-aws).
+- Or sign in to RDS and Aurora with an IAM token made from your AWS profile, with no password
+  at all; the app renews it while the connection is open. See
+  [IAM tokens](CREDENTIALS.md#iam-tokens).
+- Find your databases in AWS: choose an AWS profile and regions, and the app lists the RDS
+  databases and Aurora clusters there. Pick one to fill in the connection, with its
+  RDS-managed secret or an IAM token already chosen. See
+  [finding databases in AWS](CREDENTIALS.md#finding-databases-in-aws).
+- Certificates of RDS databases can be verified: Amazon's RDS certificate authorities come
+  with the app.
 
 ## Schema browser
 

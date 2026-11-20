@@ -31,6 +31,25 @@ pub struct SessionState {
     /// Sizes the user dragged panels to, in whole pixels, by panel name.
     #[serde(default)]
     pub panels: BTreeMap<String, u32>,
+    /// Where the last search for databases in AWS looked, to look there again.
+    #[serde(default, skip_serializing_if = "CloudSearch::is_empty")]
+    pub aws_search: CloudSearch,
+}
+
+/// A search for databases in a cloud account: the profile and regions it used.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudSearch {
+    /// Empty means the default credentials.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
+}
+
+impl CloudSearch {
+    pub fn is_empty(&self) -> bool {
+        self.profile.is_empty() && self.regions.is_empty()
+    }
 }
 
 impl SessionState {
@@ -166,9 +185,21 @@ mod tests {
         let mut state = SessionState::default();
         state.set_draft("a", "select 1");
         state.panels.insert("sidebar".into(), 340);
+        state.aws_search = CloudSearch {
+            profile: "prod".into(),
+            regions: vec!["eu-west-1".into(), "us-east-1".into()],
+        };
         state.save_to(&path).unwrap();
         assert_eq!(SessionState::load_from(&path), state);
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(SessionState::load_from(&path), SessionState::default());
+    }
+
+    #[test]
+    fn no_search_writes_nothing_and_older_files_load() {
+        let text = serde_json::to_string(&SessionState::default()).unwrap();
+        assert!(!text.contains("aws_search"), "{text}");
+        let old: SessionState = serde_json::from_str(r#"{"drafts":{}}"#).unwrap();
+        assert!(old.aws_search.is_empty());
     }
 }
