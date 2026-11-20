@@ -988,7 +988,11 @@ mod tests {
                 "[ci]\naws_access_key_id = AKID\naws_secret_access_key = s\n",
             ),
         ]);
-        let env = Env::from_slice(&[("HOME", "/home/me")]);
+        // Named outright: `~` would expand with `\` on Windows.
+        let env = Env::from_slice(&[
+            ("AWS_CONFIG_FILE", "/home/me/.aws/config"),
+            ("AWS_SHARED_CREDENTIALS_FILE", "/home/me/.aws/credentials"),
+        ]);
         let profiles = profiles_in(&fs, &env).await.unwrap();
         let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["ci", "default", "prod-sso"]);

@@ -122,7 +122,8 @@ Changing one of these needs the user's explicit agreement, not just a passing re
 | Change                           | Place                                                      |
 | -------------------------------- | ---------------------------------------------------------- |
 | New database engine or SQL       | `core/src/db.rs`, and `core/src/safety.rs` for the guard   |
-| New way to get credentials       | its own `core` module, called from `credentials`           |
+| New way to get credentials       | an `Auth` variant in `core/src/config.rs`, its arm in `core/src/credentials.rs`, and its system's own module |
+| New cloud provider               | `core/src/cloud/<name>.rs`, and an arm in `cloud::discover` |
 | New setting saved to disk        | `core/src/config.rs`, or `core/src/state.rs` if not a connection setting |
 | New panel, dialog or form        | its own `app` module (A2)                                  |
 | New item in Settings             | `app/src/workspace/settings.rs`                            |

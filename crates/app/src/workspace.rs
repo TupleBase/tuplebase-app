@@ -3351,6 +3351,10 @@ mod tests {
             assert!(window.try_find("save").is_none());
             window.click("source-aws", cx);
         });
+        window_action(handle, cx, |window, cx| {
+            window.click("aws-regions", cx);
+            window.input("eu-west-1", cx);
+        });
         window_action(handle, cx, |window, cx| window.click("aws-find", cx));
         // The search itself runs on the runtime, which tests don't; give its answer.
         cx.update(|cx| {
@@ -3412,7 +3416,8 @@ mod tests {
         cx.update(|cx| {
             // Where it looked is remembered for next time.
             let search = &workspace.read(cx).session.aws_search;
-            assert!(search.regions.is_empty() && search.profile.is_empty());
+            assert_eq!(search.regions, ["eu-west-1"]);
+            assert_eq!(search.profile, "");
         });
     }
 
