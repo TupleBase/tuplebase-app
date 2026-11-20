@@ -2624,6 +2624,67 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn result_cells_and_rows_can_be_copied(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                this.results.update(cx, |table, cx| {
+                    table.delegate_mut().set(&QueryResult {
+                        columns: vec!["id".into(), "name".into()],
+                        rows: vec![
+                            vec![json!(1), json!("say \"hi\"")],
+                            vec![json!(2), json!(null)],
+                        ],
+                        truncated: false,
+                        rows_affected: None,
+                        elapsed_ms: 1,
+                    });
+                    table.refresh(cx);
+                });
+                cx.notify();
+            });
+        });
+        let copied = |cx: &mut TestAppContext| {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .unwrap_or_default()
+        };
+        let row_0 = "{\n  \"id\": 1,\n  \"name\": \"say \\\"hi\\\"\"\n}";
+
+        // Right click a cell: "Copy value", then "Copy row as JSON".
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-cell-0:1", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        assert_eq!(copied(cx), "say \"hi\"");
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-cell-1:1", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(0usize, cx));
+        assert_eq!(copied(cx), "NULL");
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-cell-0:0", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(1usize, cx));
+        assert_eq!(copied(cx), row_0);
+
+        // The row detail panel copies one field, or the whole row.
+        window_action(handle, cx, |_, cx| {
+            workspace.update(cx, |this, cx| {
+                this.results
+                    .update(cx, |table, cx| table.set_selected_row(0, cx));
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click(("row-detail-copy-field", 1usize), cx);
+        });
+        assert_eq!(copied(cx), "say \"hi\"");
+        window_action(handle, cx, |window, cx| window.click("row-detail-copy", cx));
+        assert_eq!(copied(cx), row_0);
+    }
+
+    #[gpui_kit::test]
     fn the_connection_color_shows_above_an_open_connection(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         window_action(handle, cx, |window, _| {
