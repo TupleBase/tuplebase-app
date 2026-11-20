@@ -3,8 +3,9 @@
 
 use std::rc::Rc;
 
-use gpui_kit::component::{Theme, ThemeRegistry};
+use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
 use gpui_kit::*;
+use tuplebase_core::config::Appearance;
 
 /// How much smaller code is than the rest of the text, in pixels.
 const CODE_FONT_GAP: f32 = 2.;
@@ -21,6 +22,15 @@ pub fn init(cx: &mut App) {
         theme.light_theme = light;
         theme.dark_theme = dark;
     });
+}
+
+/// Uses the light or dark colors `appearance` asks for, or the system's.
+pub fn set_appearance(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) {
+    match appearance {
+        Appearance::System => Theme::sync_system_appearance(window, cx),
+        Appearance::Light => Theme::change(ThemeMode::Light, window, cx),
+        Appearance::Dark => Theme::change(ThemeMode::Dark, window, cx),
+    }
 }
 
 /// Sets the size of the app's text in pixels. Everything sized in rems follows it.

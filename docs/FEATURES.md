@@ -59,6 +59,8 @@ its arguments.
 
 ## Appearance
 
+- Choose light or dark colors in Settings, or System to follow your computer's setting and
+  change with it. The choice is kept between launches.
 - Make all text larger or smaller with `Cmd` and `+` or `-` on macOS, `Ctrl` on Windows and
   Linux, or from the View menu. `Cmd+0` or `Ctrl+0` brings back the default size.
 - The size is kept between launches.

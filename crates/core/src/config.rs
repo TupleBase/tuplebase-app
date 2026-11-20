@@ -325,6 +325,36 @@ pub struct Config {
     /// Size of the app's text, in pixels.
     #[serde(default = "default_font_size")]
     pub font_size: u8,
+    /// Light or dark colors, or whichever the system uses.
+    #[serde(default, skip_serializing_if = "Appearance::is_system")]
+    pub appearance: Appearance,
+}
+
+/// The app's colors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Appearance {
+    /// Follows the system's light or dark setting, and changes when it does.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Appearance {
+    pub const ALL: [Appearance; 3] = [Appearance::System, Appearance::Light, Appearance::Dark];
+
+    pub fn is_system(&self) -> bool {
+        *self == Appearance::System
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Appearance::System => "System",
+            Appearance::Light => "Light",
+            Appearance::Dark => "Dark",
+        }
+    }
 }
 
 pub const DEFAULT_FONT_SIZE: u8 = 16;
@@ -347,6 +377,7 @@ impl Default for Config {
             connections: Vec::new(),
             check_for_updates: true,
             font_size: DEFAULT_FONT_SIZE,
+            appearance: Appearance::System,
         }
     }
 }
@@ -937,6 +968,26 @@ mod tests {
     fn font_size_defaults_for_existing_files() {
         let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
         assert_eq!(config.font_size, DEFAULT_FONT_SIZE);
+    }
+
+    #[test]
+    fn appearance_follows_the_system_unless_chosen() {
+        let config: Config = serde_json::from_str(r#"{ "version": 1 }"#).unwrap();
+        assert_eq!(config.appearance, Appearance::System);
+        // Following the system is the default, so it isn't written.
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("appearance")
+        );
+        let dark = Config {
+            appearance: Appearance::Dark,
+            ..config
+        };
+        let text = serde_json::to_string(&dark).unwrap();
+        assert!(text.contains(r#""appearance":"dark""#));
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.appearance, Appearance::Dark);
     }
 
     #[test]
