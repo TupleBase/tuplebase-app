@@ -72,7 +72,8 @@ scripts/                   install, packaging, release helpers
   What needs no SQL (name, default port, file or server, quoting, script splitting) is in
   one `EngineInfo` per engine in `config`, from `Adapter::info`, so every module can read
   it. Match on `Adapter` and `Pool` without a catch-all, so a new engine makes the compiler
-  list each place to fill in. A new engine is a new module plus one arm per feature; see
+  list each place to fill in (`Pool::set_options` is the one exception: options can't
+  belong to another engine's pool). A new engine is a new module plus one arm per feature; see
   [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md).
 
 ## Inside `app`

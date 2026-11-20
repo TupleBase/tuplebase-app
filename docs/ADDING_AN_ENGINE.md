@@ -12,8 +12,9 @@ Where an engine's code lives:
 - **Its SQL** (catalog queries, read-only statements, object sources, routine calls, value
   decoding): its own module, `core/src/db/<engine>.rs` (L7). The module's `DIALECT` constant holds
   its fixed statements and the kinds of object it lists.
-- **Connecting** (driver options, TLS, the pool): `core/src/db.rs` today, `core/src/db/connect.rs`
-  once the AWS work (PR #25) is merged.
+- **Connecting** (driver options, TLS, the pool): one options function per engine in
+  `core/src/db/connect.rs`, and the `Pool` variant in `core/src/db.rs`. Which credentials and
+  tunnels apply is decided by `is_file`, in `core/src/credentials.rs` and `Connection::validate`.
 - **How it looks**: its logo and color in `app/src/logos.rs`.
 
 Engines that work alike share a module, as MySQL and MariaDB share `db/mysql.rs`. Branch on the
@@ -91,17 +92,24 @@ engine shares:
 - In the tests at the bottom of `db.rs`, add an arm to `dialect` and add the engine to
   `read_only_statements_are_pinned` and `each_engine_lists_its_own_kinds_of_object`.
 
-## 5. Connecting (in PR B, after the AWS work)
+## 5. Connecting (`core/src/db/connect.rs`, `core/src/db.rs`)
 
-These parts are being changed by the AWS work (PR #25). Add them after it merges, on top of
-`db/connect.rs`:
-
-- the `Pool` variant and its arm in `Pool::close`;
-- the engine's connect options: host, port, user, password, database, and its TLS modes from
-  `TlsMode`. A file engine opens `ssh::expand_home(&conn.database)`, read-only when the connection
-  is;
-- whether AWS credentials and SSH tunnels apply to it. Today they apply to every server engine,
-  and to no file engine.
+- `db.rs`: the `Pool` variant and its arm in `Pool::close`.
+- `db/connect.rs`:
+  - an `Options` variant and an `<engine>_options` function beside `postgres_options`. It sets
+    host, port, user, password and database, and maps each `TlsMode` to the driver's TLS mode.
+    For `TlsMode::Verify`, it adds `extra_roots(conn)` to the trusted authorities, so RDS hosts
+    verify. A file engine opens `ssh::expand_home(&conn.database)`, read-only when the connection
+    is, like `sqlite_options`;
+  - its arms in `connect_options` and `open_pool`;
+  - its arm in `Pool::set_options`. This one has a `_ => {}` arm for options of another engine, so
+    the compiler won't ask for it. A missing arm would mean a renewed IAM token never reaches the
+    pool.
+- Credentials and SSH tunnels apply to every server engine and to no file engine, through
+  `is_file` in `credentials::resolve_with` and `Connection::validate`. An IAM token
+  (`Auth::AwsIam`) needs the driver to send the token as the password. MySQL also needs
+  `enable_cleartext_plugin`. Check the engine's equivalent, or have `Connection::validate` refuse
+  IAM for it.
 
 ## 6. The app and the MCP server
 
@@ -110,8 +118,11 @@ These parts are being changed by the AWS work (PR #25). Add them after it merges
 - `app/src/logos.rs`: an arm in `logo` with the SVG and a brand color dark enough for a white
   mark. The test there checks that every engine has an SVG and a color of its own.
 - The connection form (`app/src/conn_form.rs`) reads `Adapter::ALL`, the label, the default port
-  and `is_file`, so it needs no change unless the engine asks for something new. That form is part
-  of PR B.
+  and `is_file`, so it needs no change unless the engine asks for something new.
+- Finding databases in AWS: if RDS runs the engine, map its RDS engine names to the variant in
+  `adapter_for_engine` in `core/src/cloud/aws.rs`, with a test there. Check the default database
+  that discovery fills in, which is `postgres` for PostgreSQL. Until it's mapped, the AWS picker
+  (`app/src/aws_picker.rs`) shows such databases but can't use them.
 - The schema browser groups whatever `list_objects` returns, so it needs no change.
 - `mcp/src/main.rs`: if the engine's default schema isn't `public` or the connection's database,
   say so in the `schema` argument's description of `describe_table`.
