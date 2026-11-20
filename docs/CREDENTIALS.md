@@ -123,14 +123,20 @@ no connections, and changing any setting there replaces the file with an empty o
 TupleBase first on every computer that uses this file, before adding an IAM token
 connection.
 
-The first time this version writes version 2, it keeps the version 1 file as
+Before this version raises a version 1 file to version 2, it keeps the version 1 file as
 `connections.v1-backup.json` in the same folder and never deletes it. To go back to an
 older version, copy it over `connections.json`. Remove the IAM token connection and the
-file goes back to version 1.
+file goes back to version 1. If it is later raised again with other connections in it, the
+earlier backup is kept as `connections.v1-backup-<time>.json` and the backup holds the
+newer file.
 
 This version never writes over a `connections.json` it can't read, for example one from a
-newer version: it renames it to `connections.unreadable-<time>.json`, says so in the status
-line, and starts without it. Rename it back once you run a version that reads it.
+newer version. It starts without it, leaves the file as it is and says so in the status
+line. Only when you change something is the file renamed to
+`connections.unreadable-<time>.json`, and the status line names it. Rename it back once
+you run a version that reads it. A file that can't be opened at all, such as one another
+program holds locked, is never moved and nothing is saved until TupleBase is restarted
+and can read it.
 
 ### Verifying an RDS certificate
 

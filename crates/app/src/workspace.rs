@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -22,8 +23,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::{self, AgentState, AgentStatus};
 use tuplebase_core::config::{
-    Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name, parent_of,
-    rebase_folder,
+    Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
+    kept_unreadable_message, parent_of, rebase_folder,
 };
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::state::SessionState;
@@ -352,8 +353,8 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Small local file read once before the first frame.
-        // A file that can't be read is set aside, never saved over (see `core::config`).
-        let (config, status) = match Config::load_or_set_aside() {
+        // A file that can't be used is left as it is, never saved over (see `core::config`).
+        let (config, status) = match Config::load_or_keep() {
             Ok((config, None)) => (config, Status::Idle),
             Ok((config, Some(message))) => (config, Status::Failed(message.into())),
             Err(e) => {
@@ -675,15 +676,22 @@ impl Workspace {
     fn save_config(&self, cx: &mut Context<Self>) {
         let config = self.config.clone();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = blocking(move || config.save()).await {
-                this.update(cx, |this, cx| {
-                    this.status = Status::Failed(format!("{e:#}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
+            let saved = blocking(move || config.save()).await;
+            this.update(cx, |this, cx| this.show_saved(saved, cx)).ok();
         })
         .detach();
+    }
+
+    /// Shows in the status line why saving failed, or where it moved a connections file
+    /// this version can't read; says nothing after an ordinary save.
+    fn show_saved(&mut self, saved: anyhow::Result<Option<PathBuf>>, cx: &mut Context<Self>) {
+        let status = match saved {
+            Ok(None) => return,
+            Ok(Some(kept)) => Status::Done(kept_unreadable_message(&kept).into()),
+            Err(e) => Status::Failed(format!("{e:#}").into()),
+        };
+        self.status = status;
+        cx.notify();
     }
 
     fn begin_folder_edit(
@@ -1061,7 +1069,7 @@ impl Workspace {
         let saved = config.clone();
         cx.spawn(async move |this, cx| {
             let result = blocking(move || {
-                saved.save()?;
+                let kept = saved.save()?;
                 let renamed = previous.as_ref().filter(|p| **p != connection.name);
                 if let Some(old) = renamed {
                     secrets::rename(old, &connection.name)?;
@@ -1075,11 +1083,11 @@ impl Workspace {
                 if let Some(secret) = &ssh_password {
                     secrets::set_ssh_password(&connection.name, secret)?;
                 }
-                Ok(previous)
+                Ok((previous, kept))
             })
             .await;
             let forget = match &result {
-                Ok(Some(previous)) => Some(previous.clone()),
+                Ok((Some(previous), _)) => Some(previous.clone()),
                 _ => None,
             };
             let renamed_from = forget.clone().filter(|old| *old != name);
@@ -1092,7 +1100,7 @@ impl Workspace {
                 .ok();
             }
             this.update(cx, |this, cx| match result {
-                Ok(_) => {
+                Ok((_, kept)) => {
                     this.config = config;
                     if let Some(old) = &renamed_from {
                         this.session.rename_connection(old, &name);
@@ -1100,6 +1108,7 @@ impl Workspace {
                     }
                     this.collapsed.remove(&folder);
                     this.select(name, cx);
+                    this.show_saved(Ok(kept), cx);
                 }
                 Err(e) => form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx)),
             })
@@ -1150,8 +1159,9 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let forget_name = name.clone();
             let result = blocking(move || {
-                config.save()?;
-                secrets::delete_all(&name)
+                let kept = config.save()?;
+                secrets::delete_all(&name)?;
+                Ok(kept)
             })
             .await;
             io(async move {
@@ -1160,13 +1170,7 @@ impl Workspace {
             })
             .await
             .ok();
-            if let Err(e) = result {
-                this.update(cx, |this, cx| {
-                    this.status = Status::Failed(format!("{e:#}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
+            this.update(cx, |this, cx| this.show_saved(result, cx)).ok();
         })
         .detach();
     }

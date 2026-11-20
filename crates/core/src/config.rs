@@ -453,8 +453,8 @@ pub struct Config {
     /// Light or dark colors, or whichever the system uses.
     #[serde(default, skip_serializing_if = "Appearance::is_system")]
     pub appearance: Appearance,
-    /// Why this config must not be saved: the file it stands in for couldn't be read or
-    /// set aside, and saving would delete what is in it. Never in the file.
+    /// Why this config must not be saved: the file it stands in for couldn't be read, and
+    /// saving would delete what is in it. Never in the file.
     #[serde(skip)]
     pub unsaved_because: Option<String>,
 }
@@ -534,45 +534,62 @@ pub fn config_dir() -> Result<PathBuf> {
 
 /// Writes a file via a temp file and rename, so a crash never leaves half a file.
 pub(crate) fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    write_bytes_atomic(path, format!("{text}\n").as_bytes())
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, format!("{text}\n")).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
+}
+
+/// The file's bytes, or `None` when there is no file.
+fn read_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Where the last file older versions can read is kept, once it is upgraded.
 pub const BASE_VERSION_BACKUP: &str = "connections.v1-backup.json";
 
-/// Copies a [`VERSION_BASE`] file at `path` to [`BASE_VERSION_BACKUP`] beside it, unless
-/// that copy exists already.
+/// Keeps the [`VERSION_BASE`] file at `path` as [`BASE_VERSION_BACKUP`] beside it, before
+/// it is raised to [`VERSION_IAM`]. A backup that isn't a whole version 1 file, such as one
+/// cut short, is written again. A good one that differs, from an earlier upgrade, is kept
+/// as `connections.v1-backup-<time>.json` first, so no copy older versions can read is lost.
 fn keep_base_version(path: &Path) -> Result<()> {
-    let backup = path.with_file_name(BASE_VERSION_BACKUP);
-    if backup.exists() || !path.exists() {
+    let Some(current) = read_file(path)? else {
+        return Ok(());
+    };
+    if !Config::parse(&current).is_ok_and(|c| c.version == VERSION_BASE) {
         return Ok(());
     }
-    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let version = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v.get("version").and_then(serde_json::Value::as_u64));
-    if version == Some(u64::from(VERSION_BASE)) {
-        fs::copy(path, &backup).with_context(|| format!("writing {}", backup.display()))?;
+    let backup = path.with_file_name(BASE_VERSION_BACKUP);
+    match fs::read(&backup) {
+        Ok(old) if old == current => return Ok(()),
+        Ok(old) if Config::parse(&old).is_ok_and(|c| c.version == VERSION_BASE) => {
+            let older = unused_name(path, BASE_VERSION_BACKUP.trim_end_matches(".json"));
+            fs::rename(&backup, &older)
+                .with_context(|| format!("keeping {} as {}", backup.display(), older.display()))?;
+        }
+        // Missing, or not a version 1 file this version reads: write it (again).
+        _ => {}
     }
-    Ok(())
+    write_bytes_atomic(&backup, &current)
 }
 
-/// Where a file this version couldn't read is kept: next to it, named with the
-/// time, and never overwriting an earlier copy.
-fn unreadable_copy(path: &Path) -> PathBuf {
+/// `<prefix>-<time>.json` beside `path`, with `-N` added so it never names a file that
+/// exists.
+fn unused_name(path: &Path, prefix: &str) -> PathBuf {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("connections");
     (0..)
         .map(|n| {
             let suffix = if n == 0 {
@@ -580,10 +597,28 @@ fn unreadable_copy(path: &Path) -> PathBuf {
             } else {
                 format!("-{n}")
             };
-            path.with_file_name(format!("{stem}.unreadable-{stamp}{suffix}.json"))
+            path.with_file_name(format!("{prefix}-{stamp}{suffix}.json"))
         })
         .find(|candidate| !candidate.exists())
         .expect("an unused name exists")
+}
+
+/// Where a file this version couldn't read is kept: next to it, named with the
+/// time, and never overwriting an earlier copy.
+fn unreadable_copy(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("connections");
+    unused_name(path, &format!("{stem}.unreadable"))
+}
+
+/// What to tell the user once saving moved a file this version can't read to `kept`.
+pub fn kept_unreadable_message(kept: &Path) -> String {
+    format!(
+        "Your earlier connections file, which this version can't read, was kept as {}.",
+        kept.display()
+    )
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -596,18 +631,23 @@ impl Config {
         Self::load_from(&config_path()?)
     }
 
-    pub fn save(&self) -> Result<()> {
+    /// Saves the user's config; see [`Config::save_to`].
+    pub fn save(&self) -> Result<Option<PathBuf>> {
         self.save_to(&config_path()?)
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        match read_file(path)? {
+            None => Ok(Self::default()),
+            Some(bytes) => {
+                Self::parse(&bytes).with_context(|| format!("parsing {}", path.display()))
+            }
         }
-        let text =
-            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut config: Config =
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    }
+
+    /// A config file's contents, if this version reads them.
+    fn parse(bytes: &[u8]) -> Result<Self> {
+        let mut config: Config = serde_json::from_slice(bytes)?;
         if !(VERSION_BASE..=VERSION_IAM).contains(&config.version) {
             bail!("unsupported config version {}", config.version);
         }
@@ -616,28 +656,21 @@ impl Config {
         Ok(config)
     }
 
-    /// Loads the user's config like [`Config::load`], but a file that can't be read
-    /// doesn't stop the app: it is moved aside, so that saving can't write over it, and
-    /// the config starts empty. Also returns what to tell the user, then.
-    pub fn load_or_set_aside() -> Result<(Self, Option<String>)> {
-        Ok(Self::load_or_set_aside_from(&config_path()?))
+    /// Loads the user's config like [`Config::load`], but a file that can't be used
+    /// doesn't stop the app and is left exactly as it is. Also returns what to tell the
+    /// user, then.
+    pub fn load_or_keep() -> Result<(Self, Option<String>)> {
+        Ok(Self::load_or_keep_from(&config_path()?))
     }
 
-    pub fn load_or_set_aside_from(path: &Path) -> (Self, Option<String>) {
-        let error = match Self::load_from(path) {
-            Ok(config) => return (config, None),
-            Err(e) => format!("{e:#}"),
-        };
-        let kept = unreadable_copy(path);
-        match fs::rename(path, &kept) {
-            Ok(()) => (
-                Self::default(),
-                Some(format!(
-                    "Couldn't read your connections ({error}). The file was kept as {}; \
-                     TupleBase started without it.",
-                    kept.display()
-                )),
-            ),
+    /// The config starts empty when the file can't be used:
+    /// - one this version can't parse, such as a newer version's, is moved aside by
+    ///   [`Config::save_to`], and only when something is saved;
+    /// - one that can't be read at all, perhaps only for now, is never saved over.
+    pub fn load_or_keep_from(path: &Path) -> (Self, Option<String>) {
+        let bytes = match read_file(path) {
+            Ok(None) => return (Self::default(), None),
+            Ok(Some(bytes)) => bytes,
             Err(e) => {
                 let config = Self {
                     unsaved_because: Some(format!(
@@ -647,40 +680,61 @@ impl Config {
                     ..Self::default()
                 };
                 let message = format!(
-                    "Couldn't read your connections ({error}), nor set the file aside ({e}). \
-                     Changes won't be saved until {} is fixed or moved.",
-                    path.display()
+                    "Couldn't read your connections ({e:#}). The file is left untouched and \
+                     changes won't be saved; restart TupleBase once it can be read."
                 );
-                (config, Some(message))
+                return (config, Some(message));
             }
+        };
+        match Self::parse(&bytes) {
+            Ok(config) => (config, None),
+            Err(e) => (
+                Self::default(),
+                Some(format!(
+                    "This version can't read your connections file {} ({e:#}). It is left \
+                     untouched; if you change anything, it is first kept beside it as \
+                     connections.unreadable-<time>.json, never written over.",
+                    path.display()
+                )),
+            ),
         }
     }
 
-    /// Writes the config. The first time it raises a file to [`VERSION_IAM`], which
-    /// older versions can't read, it keeps a copy of the old file as
-    /// [`BASE_VERSION_BACKUP`]. A file already there that this version can't read is
-    /// moved aside first rather than overwritten, so its connections are never lost.
-    pub fn save_to(&self, path: &Path) -> Result<()> {
+    /// Writes the config. A file already there that this version can't parse is moved
+    /// aside first rather than overwritten, so its connections are never lost; returns
+    /// where it went. A file that can't be read at all is left alone and nothing is
+    /// saved. The first time it raises a file to [`VERSION_IAM`], which older versions
+    /// can't read, it keeps a copy of the old file as [`BASE_VERSION_BACKUP`].
+    pub fn save_to(&self, path: &Path) -> Result<Option<PathBuf>> {
         if let Some(reason) = &self.unsaved_because {
             bail!("not saved: {reason}");
         }
-        if path.exists() && Self::load_from(path).is_err() {
-            // It became unreadable after loading, e.g. a newer TupleBase saved it.
-            let kept = unreadable_copy(path);
-            fs::rename(path, &kept).with_context(|| {
+        let existing = read_file(path).with_context(|| {
+            format!(
+                "not saved: {} couldn't be checked, so it isn't written over",
+                path.display()
+            )
+        })?;
+        let mut kept = None;
+        if existing.is_some_and(|bytes| Self::parse(&bytes).is_err()) {
+            // E.g. a newer TupleBase wrote it.
+            let to = unreadable_copy(path);
+            fs::rename(path, &to).with_context(|| {
                 format!(
                     "keeping the unreadable {} as {}",
                     path.display(),
-                    kept.display()
+                    to.display()
                 )
             })?;
+            kept = Some(to);
         }
         let mut config = self.clone();
         config.sync_version();
         if config.version > VERSION_BASE {
             keep_base_version(path)?;
         }
-        write_atomic(path, &serde_json::to_string_pretty(&config)?)
+        write_atomic(path, &serde_json::to_string_pretty(&config)?)?;
+        Ok(kept)
     }
 
     /// Sets the oldest file format that holds every connection.
@@ -1144,39 +1198,83 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILE);
         fs::write(&path, r#"{ "version": 3 }"#).unwrap();
-        let error = Config::load_from(&path).unwrap_err().to_string();
+        let error = format!("{:#}", Config::load_from(&path).unwrap_err());
         assert!(error.contains("unsupported config version 3"), "{error}");
         fs::write(&path, r#"{ "version": 2 }"#).unwrap();
         assert!(Config::load_from(&path).is_ok());
     }
 
+    /// The files in `dir` whose names contain `part`.
+    fn files_named(dir: &Path, part: &str) -> Vec<PathBuf> {
+        let mut found: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.file_name().unwrap().to_string_lossy().contains(part))
+            .collect();
+        found.sort();
+        found
+    }
+
     #[test]
-    fn an_unreadable_file_is_set_aside_and_never_written_over() {
-        for text in [r#"{ "version": 3, "connections": [] }"#, "not json"] {
+    fn a_file_this_version_cannot_parse_is_left_alone_until_something_is_saved() {
+        let texts: [&[u8]; 3] = [
+            br#"{ "version": 3, "connections": [] }"#,
+            b"not json",
+            b"\xff\xfe not utf-8",
+        ];
+        for text in texts {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(CONFIG_FILE);
             fs::write(&path, text).unwrap();
-            let (mut config, message) = Config::load_or_set_aside_from(&path);
+            let (mut config, message) = Config::load_or_keep_from(&path);
             let message = message.expect("the user is told");
+            assert!(message.contains("left untouched"), "{message}");
             assert_eq!(config.connections, []);
-            let kept: Vec<_> = fs::read_dir(dir.path())
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| p.to_string_lossy().contains("connections.unreadable-"))
-                .collect();
-            assert_eq!(kept.len(), 1, "{kept:?}");
-            assert_eq!(fs::read_to_string(&kept[0]).unwrap(), text);
-            assert!(message.contains(&*kept[0].to_string_lossy()), "{message}");
-            // Saving afterwards writes a new file and leaves the kept one alone.
+            // Loading changes nothing on disk.
+            assert_eq!(fs::read(&path).unwrap(), text);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+            // Saving moves it aside, byte for byte, and says where.
             config.resize_font(1);
-            config.save_to(&path).unwrap();
-            assert_eq!(fs::read_to_string(&kept[0]).unwrap(), text);
+            let kept = config.save_to(&path).unwrap().expect("moved aside");
+            assert_eq!(
+                files_named(dir.path(), "connections.unreadable-"),
+                [kept.clone()]
+            );
+            assert_eq!(fs::read(&kept).unwrap(), text);
+            assert!(Config::load_from(&path).is_ok());
+            let told = kept_unreadable_message(&kept);
+            assert!(told.contains(&*kept.to_string_lossy()), "{told}");
+            // Later saves write over their own file and leave the kept one alone.
+            config.resize_font(1);
+            assert_eq!(config.save_to(&path).unwrap(), None);
+            assert_eq!(fs::read(&kept).unwrap(), text);
         }
     }
 
     #[test]
+    fn a_file_that_cannot_be_read_is_never_saved_over_or_moved() {
+        // A directory can't be read as a file on any system, even by root.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("inside"), "kept").unwrap();
+        let (config, message) = Config::load_or_keep_from(&path);
+        let message = message.expect("the user is told");
+        assert!(message.contains("won't be saved"), "{message}");
+        let error = config.save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("not saved"), "{error}");
+        // Even a config from a successful load doesn't write over what it can't check.
+        let error = Config::default().save_to(&path).unwrap_err().to_string();
+        assert!(error.contains("not saved"), "{error}");
+        assert!(path.is_dir());
+        assert_eq!(fs::read_to_string(path.join("inside")).unwrap(), "kept");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn a_config_standing_in_for_a_file_kept_in_place_is_never_saved() {
-        // What a file that couldn't be set aside gives: saving would delete it.
+        // What a file that couldn't be read gives: saving would delete what is in it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILE);
         fs::write(&path, "not json").unwrap();
@@ -1194,10 +1292,64 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILE);
         fs::write(&path, V1_FILE).unwrap();
-        let (config, message) = Config::load_or_set_aside_from(&path);
+        let (config, message) = Config::load_or_keep_from(&path);
         assert_eq!(message, None);
         assert_eq!(config, Config::load_from(&path).unwrap());
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// `config` with a connection that uses an IAM token, which raises it to version 2.
+    fn with_iam(config: &Config) -> Config {
+        let mut config = config.clone();
+        let mut iam = config.connections[0].clone();
+        iam.name = "iam".into();
+        iam.tls = TlsMode::Require;
+        iam.auth = Auth::AwsIam(AwsIamAuth {
+            profile: String::new(),
+            region: "eu-west-1".into(),
+        });
+        config.upsert(iam, None).unwrap();
+        config
+    }
+
+    #[test]
+    fn a_backup_cut_short_is_written_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let backup = dir.path().join(BASE_VERSION_BACKUP);
+        fs::write(&path, V1_FILE).unwrap();
+        // As a copy interrupted midway would leave it.
+        fs::write(&backup, &V1_FILE[..V1_FILE.len() / 2]).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        with_iam(&config).save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), V1_FILE);
+        assert_eq!(files_named(dir.path(), ".tmp"), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_later_upgrade_keeps_the_earlier_backup_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        let backup = dir.path().join(BASE_VERSION_BACKUP);
+        fs::write(&path, V1_FILE).unwrap();
+        let config = Config::load_from(&path).unwrap();
+        with_iam(&config).save_to(&path).unwrap();
+        // The IAM connection is removed, the file goes back to version 1 and changes...
+        let mut later = config.clone();
+        later.resize_font(2);
+        later.save_to(&path).unwrap();
+        let later_v1 = fs::read_to_string(&path).unwrap();
+        assert_ne!(later_v1, V1_FILE);
+        // ...and is raised again: the backup is the newer file, the older one kept.
+        with_iam(&later).save_to(&path).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), later_v1);
+        let older = files_named(dir.path(), "connections.v1-backup-");
+        assert_eq!(older.len(), 1, "{older:?}");
+        assert_eq!(fs::read_to_string(&older[0]).unwrap(), V1_FILE);
+        // Raising the same version 1 file again changes nothing.
+        later.save_to(&path).unwrap();
+        with_iam(&later).save_to(&path).unwrap();
+        assert_eq!(files_named(dir.path(), "connections.v1-backup-").len(), 1);
     }
 
     #[test]
