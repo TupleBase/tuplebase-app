@@ -31,7 +31,7 @@ use tuplebase_core::state::SessionState;
 use tuplebase_core::{app_status, mcp_status, secrets, updates};
 
 use crate::chat::{ChatEvent, ChatPanel};
-use crate::completions::{SchemaNames, SqlCompletions};
+use crate::completions::{self, SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
 use crate::logos;
 use crate::results::ResultsDelegate;
@@ -100,6 +100,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(secondary!("0"), ResetFontSize, None),
     ]);
     cx.bind_keys(tree_nav::key_bindings());
+    cx.bind_keys(completions::key_bindings());
 }
 
 /// Menu items must work whatever has focus, so their actions are global and go to the
@@ -872,9 +873,7 @@ impl Workspace {
                 .language("sql")
                 .line_number(true)
                 .default_value("SELECT 1;");
-            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
-                names: names.clone(),
-            }));
+            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(names.clone())));
             state
         });
         let _editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
@@ -2167,7 +2166,12 @@ impl Workspace {
             .child(text)
     }
 
-    fn render_query_view(&self, conn: &Connection, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_query_view(
+        &self,
+        conn: &Connection,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let (border, radius, muted, muted_bg) = (
             theme.border,
@@ -2194,8 +2198,7 @@ impl Workspace {
             .on_resize(self.remember_panel_sizes(&[Panel::Editor], cx))
             .child(
                 self.sized_panel(Panel::Editor).child(
-                    div()
-                        .id("sql-editor")
+                    completions::handle_keys(div().id("sql-editor"), &self.editor, window)
                         .test_support()
                         .size_full()
                         .child(Editor::new(&self.editor).appearance(false).h_full()),
@@ -2437,7 +2440,7 @@ impl Render for Workspace {
         let main = if let Some(form) = self.form.clone() {
             div().size_full().child(form).into_any_element()
         } else if let Some(conn) = self.selected_connection() {
-            self.render_query_view(&conn, cx).into_any_element()
+            self.render_query_view(&conn, window, cx).into_any_element()
         } else {
             self.render_empty(cx).into_any_element()
         };
@@ -3688,27 +3691,61 @@ mod tests {
         });
     }
 
-    #[gpui_kit::test]
-    fn autocomplete_finishes_a_keyword(cx: &mut TestAppContext) {
+    /// Opens the editor of a connection, holding `text`.
+    fn open_editor(text: &str, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                cx.notify();
-            });
-        });
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.press("secondary-a", cx);
-            window.input("SELE", cx);
+            window.input(text, cx);
         });
-        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        // Nothing listens at the test connection's port; don't wait for connecting to fail.
+        cx.update(|cx| workspace.update(cx, |this, _| this.status = Status::Idle));
+        (handle, workspace)
+    }
+
+    fn menu_open(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> bool {
         cx.update(|cx| {
-            assert_eq!(
-                workspace.read(cx).editor.read(cx).value().as_str(),
-                "SELECT"
-            );
-        });
+            let editor = workspace.read(cx).editor.read(cx);
+            editor.completion_menu_state().open
+        })
+    }
+
+    #[gpui_kit::test]
+    fn tab_takes_the_suggestion(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("SELE", cx);
+        assert!(menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        assert_eq!(editor_text(&workspace, cx), "SELECT");
+        assert!(!menu_open(&workspace, cx));
+        // With no menu, Tab indents as before.
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        let text = editor_text(&workspace, cx);
+        assert!(
+            text.starts_with("SELECT") && text.len() > "SELECT".len(),
+            "{text:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn enter_starts_a_new_line_even_with_the_menu_open(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("SELE", cx);
+        assert!(menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        assert_eq!(editor_text(&workspace, cx), "SELE\n");
+        assert!(!menu_open(&workspace, cx));
+    }
+
+    #[gpui_kit::test]
+    fn the_menu_waits_for_a_second_letter_or_ctrl_space(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("S", cx);
+        assert!(!menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("ctrl-space", cx));
+        assert!(menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("escape", cx));
+        assert!(!menu_open(&workspace, cx));
+        assert_eq!(editor_text(&workspace, cx), "S");
     }
 
     #[gpui_kit::test]
