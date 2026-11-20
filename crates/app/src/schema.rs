@@ -540,7 +540,7 @@ impl SchemaPanel {
                         .font_medium()
                         .child(name.clone()),
                 )
-                .child(div().text_xs().text_color(muted).child(tables.to_string()))
+                .child(count_pill(tables, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.take_cursor(Target::Schema(name.clone()), window, cx);
                     this.toggle_schema(&name, cx);
@@ -636,7 +636,7 @@ impl SchemaPanel {
                         .text_color(muted)
                         .child(kind.plural()),
                 )
-                .child(div().text_xs().text_color(muted).child(count.to_string()))
+                .child(count_pill(count, cx))
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.take_cursor(Target::Group(schema.clone(), kind), window, cx);
                     this.toggle_group(schema.clone(), kind, cx);
@@ -735,6 +735,19 @@ impl Render for SchemaPanel {
                 }
             })
     }
+}
+
+/// How many tables or views a schema or group holds, in a small rounded badge.
+fn count_pill(count: usize, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .flex_none()
+        .px_1p5()
+        .rounded_full()
+        .bg(theme.muted)
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(count.to_string())
 }
 
 #[cfg(test)]

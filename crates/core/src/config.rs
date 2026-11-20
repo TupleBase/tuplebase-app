@@ -357,7 +357,7 @@ impl Appearance {
     }
 }
 
-pub const DEFAULT_FONT_SIZE: u8 = 16;
+pub const DEFAULT_FONT_SIZE: u8 = 14;
 /// The smallest and largest text the app offers.
 pub const FONT_SIZES: RangeInclusive<u8> = 10..=28;
 

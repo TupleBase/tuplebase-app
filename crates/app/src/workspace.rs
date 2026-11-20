@@ -1189,7 +1189,8 @@ impl Workspace {
                     }
                     this.close_row_detail(cx);
                     this.results.update(cx, |table, cx| {
-                        table.delegate_mut().set(&run.result);
+                        let font_size = cx.theme().font_size;
+                        table.delegate_mut().set(&run.result, font_size);
                         table.refresh(cx);
                         cx.notify();
                     });
@@ -1524,9 +1525,10 @@ impl Workspace {
             })
             .child(
                 h_flex()
+                    .flex_none()
+                    .h(rems(2.5))
                     .pl_3()
-                    .pr_2()
-                    .pb_1()
+                    .pr_1p5()
                     .justify_between()
                     .child(div().text_sm().font_semibold().child("Connections"))
                     .child(
@@ -2117,6 +2119,7 @@ impl Workspace {
         );
         let busy = matches!(self.status, Status::Busy(_));
         let placeholder = self.results.read(cx).delegate().placeholder();
+        let ran = self.results.read(cx).delegate().ran();
         let chip = |text: String, fg: Hsla, bg: Hsla| {
             div()
                 .flex_none()
@@ -2147,12 +2150,24 @@ impl Workspace {
                         .child(
                             resizable_panel().child(
                                 div().size_full().min_w_0().child(match placeholder {
-                                    Some(text) => h_flex()
+                                    Some(text) => v_flex()
                                         .size_full()
                                         .justify_center()
+                                        .items_center()
+                                        .gap_2()
                                         .text_sm()
                                         .text_color(muted)
                                         .child(text)
+                                        .when(!ran, |el| {
+                                            el.children(Keystroke::parse(RUN_KEY).ok().map(|key| {
+                                                h_flex()
+                                                    .gap_1p5()
+                                                    .text_xs()
+                                                    .child("Press")
+                                                    .child(gpui_kit::component::kbd::Kbd::new(key))
+                                                    .child("to run")
+                                            }))
+                                        })
                                         .into_any_element(),
                                     None => DataTable::new(&self.results)
                                         .small()
@@ -2661,7 +2676,7 @@ mod tests {
             workspace.update(cx, |this, cx| {
                 this.selected = Some("db".into());
                 this.results.update(cx, |table, cx| {
-                    table.delegate_mut().set(&QueryResult {
+                    table.delegate_mut().show(&QueryResult {
                         columns: vec!["id".into(), "name".into()],
                         rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!(null)]],
                         truncated: false,
@@ -2712,7 +2727,7 @@ mod tests {
             workspace.update(cx, |this, cx| {
                 this.selected = Some("db".into());
                 this.results.update(cx, |table, cx| {
-                    table.delegate_mut().set(&QueryResult {
+                    table.delegate_mut().show(&QueryResult {
                         columns: vec!["id".into(), "name".into()],
                         rows: vec![
                             vec![json!(1), json!("say \"hi\"")],
@@ -2857,7 +2872,7 @@ mod tests {
                     elapsed_ms: 1,
                 };
                 this.results.update(cx, |table, cx| {
-                    table.delegate_mut().set(&result);
+                    table.delegate_mut().show(&result);
                     table.refresh(cx);
                 });
                 cx.notify();
@@ -3527,18 +3542,18 @@ mod tests {
                 )
             })
         };
-        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
+        assert_eq!(sizes(cx), (14, px(14.), px(12.)));
         for _ in 0..2 {
             window_action(handle, cx, |window, cx| window.press("secondary-=", cx));
         }
-        assert_eq!(sizes(cx), (18, px(18.), px(16.)));
+        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
         window_action(handle, cx, |window, _| {
-            assert_eq!(window.rem_size(), px(18.));
+            assert_eq!(window.rem_size(), px(16.));
         });
         window_action(handle, cx, |window, cx| window.press("secondary--", cx));
-        assert_eq!(sizes(cx), (17, px(17.), px(15.)));
+        assert_eq!(sizes(cx), (15, px(15.), px(13.)));
         window_action(handle, cx, |window, cx| window.press("secondary-0", cx));
-        assert_eq!(sizes(cx), (16, px(16.), px(14.)));
+        assert_eq!(sizes(cx), (14, px(14.), px(12.)));
     }
 
     #[gpui_kit::test]
@@ -3906,7 +3921,7 @@ mod tests {
             workspace.update(cx, |this, cx| {
                 this.selected = Some("db".into());
                 this.results.update(cx, |table, cx| {
-                    table.delegate_mut().set(&QueryResult {
+                    table.delegate_mut().show(&QueryResult {
                         columns: vec!["id".into(), "name".into()],
                         rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!(null)]],
                         truncated: false,
