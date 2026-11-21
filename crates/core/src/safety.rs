@@ -524,6 +524,12 @@ pub fn check_mongo(command: &Command) -> Result<(), String> {
         Command::RunCommand { .. } => Err("read-only: db.runCommand is not allowed; use find, \
              aggregate, countDocuments or distinct"
             .into()),
+        // No collection's name holds `$`: such a name could only reach a command
+        // namespace, such as `$cmd`.
+        Command::Collection { target, .. } if target.collection.contains('$') => Err(format!(
+            "read-only: \"{}\" is not a collection",
+            target.collection
+        )),
         Command::Collection { op, .. } => check_mongo_op(op),
     }
 }
@@ -1328,6 +1334,9 @@ mod tests {
             "db.users.createIndex({a: 1})",
             "db.users.dropIndex('a_1')",
             "db.users.drop()",
+            // A `$` name is a command namespace, not a collection.
+            "db.$cmd.findOne({drop: 'users'})",
+            "db.getCollection('$cmd').find({})",
             // Raw commands are refused whatever they are, reads included.
             "db.runCommand({ping: 1})",
             "db.runCommand({find: 'users'})",

@@ -168,6 +168,11 @@ impl Command {
     /// The command as a read, or `None` if it may write: a write method, `runCommand`,
     /// or any argument holding a key from [`NEVER_READ`] or JavaScript code.
     pub fn as_read(&self) -> Option<ReadOp> {
+        if let Command::Collection { target, .. } = self
+            && target.collection.contains('$')
+        {
+            return None;
+        }
         self.as_read_unguarded().filter(read_is_clean)
     }
 
@@ -1848,6 +1853,7 @@ mod tests {
             "db.users.find().sort({a: {$accumulator: 1}})",
             "db.users.countDocuments({$where: '1'})",
             "db.users.distinct('a', {$where: '1'})",
+            "db.$cmd.findOne({drop: 'users'})",
         ] {
             assert_eq!(read(src), None, "{src}");
         }
