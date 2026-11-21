@@ -442,6 +442,12 @@ impl ConnectionsDialog {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if renaming.is_none() {
+            // A new folder is empty, and a search or a chip would hide it.
+            self.filter = Filter::All;
+            self.search
+                .update(cx, |search, cx| search.set_value("", window, cx));
+        }
         self.collapsed.remove(&parent);
         let value = renaming
             .as_deref()
@@ -973,7 +979,10 @@ impl ConnectionsDialog {
                     div()
                         .id(SharedString::from(format!("conn-status-{}", conn.name)))
                         .test_support()
-                        .group_hover(row_group.clone(), |s| s.invisible())
+                        // Disconnect takes its place.
+                        .when(connected, |d| {
+                            d.group_hover(row_group.clone(), |s| s.invisible())
+                        })
                         .child(status_dot(light, dot_color, muted)),
                 )
             })
@@ -2006,6 +2015,42 @@ mod tests {
             assert!(shows(window, "connections-dialog"));
         });
         assert!(workspace.read_with(cx, |this, _| this.config.connections.is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn a_connecting_connection_says_so(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        // Nothing listens at the test connection's port: it stays connecting.
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| this.open_connection("db".into(), window, cx));
+        });
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(shows(window, "conn-status-db"));
+            assert_eq!(text_in(window, "details-status"), "Connecting…");
+            // Its tab can be closed while it connects.
+            assert!(shows(window, "details-disconnect"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_new_folder_ends_a_search_so_that_it_shows(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_folders(), cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            window.click("filter-connected", cx)
+        });
+        search(handle, "shop", cx);
+        window_action(handle, cx, |window, cx| window.click("add-folder", cx));
+        window_action(handle, cx, |window, cx| {
+            window.input("Archive", cx);
+            window.press("enter", cx);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(shows(window, "folder-Archive"));
+            assert!(shows(window, "conn-db"));
+        });
+        assert_eq!(picker(&workspace, cx, |p| p.filter), Filter::All);
     }
 
     #[gpui_kit::test]
