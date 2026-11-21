@@ -4,7 +4,7 @@ cask "tuplebase" do
 
   url "https://github.com/TupleBase/tuplebase-app/releases/download/v#{version}/TupleBase-#{version}-macos-arm64.dmg"
   name "TupleBase"
-  desc "Database client for PostgreSQL, MariaDB, MySQL and SQLite"
+  desc "Database client for PostgreSQL, MariaDB, MySQL, SQLite and Amazon Redshift"
   homepage "https://tuplebase.app/"
 
   livecheck do

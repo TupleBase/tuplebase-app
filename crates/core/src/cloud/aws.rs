@@ -475,7 +475,8 @@ pub async fn discover(profile: &str, regions: &[String]) -> Discovery {
         async move { (region, discover_region(&config, profile, region).await) }
     });
     for (region, (found, errors)) in futures_util::future::join_all(searches).await {
-        if found.is_empty() && errors.is_empty() {
+        // Empty if the services that answered hold nothing; those that didn't are errors.
+        if found.is_empty() && errors.len() < SERVICES.len() {
             discovery.empty_regions.push(region.clone());
         }
         discovery.found.extend(found);
@@ -508,6 +509,9 @@ where
         },
     }
 }
+
+/// The services discovery searches in each region.
+const SERVICES: [Service; 3] = [Service::Rds, Service::Redshift, Service::RedshiftServerless];
 
 /// An AWS service that discovery lists databases in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,10 +574,11 @@ async fn discover_region(
     );
     let mut found = Vec::new();
     let mut errors = Vec::new();
+    let [rds_service, redshift_service, serverless_service] = SERVICES;
     for (service, result) in [
-        (Service::Rds, rds),
-        (Service::Redshift, redshift),
-        (Service::RedshiftServerless, serverless),
+        (rds_service, rds),
+        (redshift_service, redshift),
+        (serverless_service, serverless),
     ] {
         match result {
             Ok(Ok(more)) => found.extend(more),

@@ -118,6 +118,37 @@ must be set up for it (`GRANT rds_iam TO app_user;` on PostgreSQL,
 MariaDB). On MySQL and MariaDB the token is sent in clear text inside the encrypted
 connection, as RDS requires; no other password is ever sent that way.
 
+### Redshift
+
+Redshift doesn't take RDS IAM tokens. With **IAM token** on a Redshift connection, each time
+the app connects it asks AWS for a temporary database user and password instead, with the same
+AWS profile rules as above:
+
+- a provisioned cluster:
+  [`GetClusterCredentials`](https://docs.aws.amazon.com/redshift/latest/APIReference/API_GetClusterCredentials.html)
+  for the connection's user and database. The user must already exist: the app never asks AWS
+  to create it (`AutoCreate` is off) and adds it to no groups. AWS signs it in as `IAM:<user>`;
+- a Serverless workgroup:
+  [`GetCredentials`](https://docs.aws.amazon.com/redshift-serverless/latest/APIReference/API_GetCredentials.html)
+  for the connection's database. AWS chooses the user from your IAM identity (`IAM:<user>` or
+  `IAMR:<role>`), so the connection's own user is not used.
+
+Which cluster or workgroup to ask for, and the region when none is set, are read from the
+host, which must be its own endpoint: `<cluster>.<id>.<region>.redshift.amazonaws.com` or
+`<workgroup>.<account>.<region>.redshift-serverless.amazonaws.com`, also when you connect
+through an SSH tunnel. A custom domain name can't be used with IAM. The password is asked for
+15 minutes and renewed after 10, as an IAM token is; **Encryption** must be **Required** or
+**Verified**.
+
+```json
+"adapter": "redshift",
+"auth": { "type": "aws_iam", "profile": "prod-sso" }
+```
+
+A connection with Redshift's other ways to sign in, a password or a secret, works as on any
+other database. Older versions of TupleBase can't read a `connections.json` that holds a
+Redshift connection; see below for what they do with a file they can't read.
+
 A `connections.json` with an IAM token connection is written as `"version": 2`.
 **TupleBase 0.10.0 and older can't read a file with an IAM token connection.** They show
 no connections, and changing any setting there replaces the file with an empty one. Update
@@ -146,18 +177,30 @@ With **Encryption** set to **Verified**, a database at an `*.rds.amazonaws.com` 
 [Amazon's RDS certificate authorities](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html),
 which come with the app.
 
+Redshift endpoints (`*.redshift.amazonaws.com`, `*.redshift-serverless.amazonaws.com`) use
+[certificates from AWS Certificate Manager](https://docs.aws.amazon.com/redshift/latest/mgmt/connecting-transitioning-to-acm-certs.html),
+issued by Amazon Trust Services, which the app trusts like any other public authority, so
+**Verified** needs nothing more there. In the China regions Redshift uses authorities of its
+own, which the app doesn't bring: there, use **Required**.
+
 ### Finding databases in AWS
 
-**New connection** → **Amazon Web Services** lists the RDS databases and Aurora clusters
-your AWS profile can see, in the regions you choose (the profile's own by default). The
+**New connection** → **Amazon Web Services** lists the RDS databases, Aurora clusters,
+Redshift clusters and Redshift Serverless workgroups your AWS profile can see, in the regions
+you choose (the profile's own by default). The
 app remembers the profile and regions you searched last, in `state.json`. Pick one and the
 form is filled in: name, host and port, master user, database, and **Encryption**:
 **Verified** for a public database (the RDS certificate is checked), **Required** for a
 private one, which you reach through an SSH tunnel. Its credentials are:
 
-- the master user's secret, when RDS manages it in Secrets Manager;
-- otherwise an IAM token, when the database has IAM authentication on;
+- the master user's secret, when RDS or Redshift manages it in Secrets Manager;
+- otherwise an IAM token, when the database has IAM authentication on, and always for
+  Redshift, which takes [temporary credentials](#redshift) from any cluster or workgroup;
 - otherwise a password you type.
+
+A Redshift cluster fills in its master user and database, `dev` unless it names another; a
+Serverless workgroup those of its namespace. A service your AWS identity may not list, or that
+doesn't answer in a region, is named in red beside what the others found.
 
 An Aurora cluster is listed once, at its writer endpoint; the note names its reader
 endpoint. A database that isn't publicly accessible needs an SSH tunnel to a host in its
@@ -171,9 +214,12 @@ The connection keeps where it was found, as `"source": { "provider": "aws", "res
 | To                                | Your AWS identity needs                                          |
 | --------------------------------- | ---------------------------------------------------------------- |
 | Find databases                    | `rds:DescribeDBInstances` and `rds:DescribeDBClusters`           |
+| Find Redshift                     | `redshift:DescribeClusters`, `redshift-serverless:ListWorkgroups` and `redshift-serverless:ListNamespaces` |
 | Read a secret                     | `secretsmanager:GetSecretValue`, plus `kms:Decrypt` for your own KMS key |
 | Read a parameter                  | `ssm:GetParameter`, plus `kms:Decrypt` for your own KMS key      |
 | Sign in with an IAM token         | `rds-db:connect` on `arn:aws:rds-db:<region>:<account>:dbuser:<resource id>/<user>` |
+| Sign in to a Redshift cluster     | `redshift:GetClusterCredentials` on `arn:aws:redshift:<region>:<account>:dbuser:<cluster>/<user>` and `…:dbname:<cluster>/<database>` |
+| Sign in to a Serverless workgroup | `redshift-serverless:GetCredentials` on the workgroup                |
 
 The RDS-managed master secret is encrypted with a KMS key; with the default
 `aws/secretsmanager` key, `secretsmanager:GetSecretValue` is enough.

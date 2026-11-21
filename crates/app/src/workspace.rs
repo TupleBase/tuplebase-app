@@ -2399,6 +2399,44 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
+    fn redshift_is_a_server_on_its_own_default_port(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("add-connection", cx));
+        window_action(handle, cx, |window, cx| window.click("source-manual", cx));
+        window_action(handle, cx, |window, cx| {
+            // The fifth button is laid out with the others.
+            assert!(window.find("adapter-Redshift").bounds().size.width > px(0.));
+            window.click("adapter-Redshift", cx);
+        });
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    *saved.borrow_mut() = Some(connection.clone());
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-password").is_some());
+            assert!(window.try_find("use-ssh").is_some());
+            window.click("conn-name", cx);
+            window.input("warehouse", cx);
+            window.click("conn-host", cx);
+            window.input("dw.abc123.eu-west-1.redshift.amazonaws.com", cx);
+            window.click("conn-user", cx);
+            window.input("awsuser", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        let connection = saved.borrow_mut().take().expect("the form saved");
+        assert_eq!(connection.adapter, Adapter::Redshift);
+        assert_eq!(connection.port, 5439);
+    }
+
+    #[gpui_kit::test]
     fn ssh_fields_appear_and_require_a_fingerprint(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
         open_new_form(handle, cx);

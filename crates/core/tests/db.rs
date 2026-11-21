@@ -21,12 +21,14 @@ fn enabled() -> bool {
 fn connection(adapter: Adapter) -> Connection {
     let (name, port) = match adapter {
         Adapter::Postgres => ("it-pg", 55432),
+        // No Redshift runs locally: PostgreSQL stands in, for what Redshift does alike.
+        Adapter::Redshift => ("it-redshift-on-pg", 55432),
         _ => ("it-maria", 53306),
     };
     // Password comes from the env override, never the keychain, in tests.
     static SET_PASSWORDS: std::sync::Once = std::sync::Once::new();
     SET_PASSWORDS.call_once(|| {
-        for n in ["it-pg", "it-maria"] {
+        for n in ["it-pg", "it-maria", "it-redshift-on-pg"] {
             // SAFETY: runs once, before any connection reads the environment.
             unsafe { std::env::set_var(tuplebase_core::secrets::env_var_name(n), "dev") };
         }
@@ -1079,4 +1081,99 @@ async fn mariadb_a_routine_body_does_not_let_a_read_only_script_write() {
 
 fn listed_name(objects: &[ObjectInfo], name: &str) -> Option<ObjectKind> {
     objects.iter().find(|o| o.name == name).map(|o| o.kind)
+}
+
+/// Redshift's module against PostgreSQL standing in for it: the parts that work the same on
+/// both (connecting, the read-only wrapper, ending transactions, decoding). Its catalog
+/// queries read Redshift's own views, which PostgreSQL doesn't have.
+fn redshift_on_postgres() -> Option<(Db, Connection)> {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return None;
+    }
+    Some((Db::new(), connection(Adapter::Redshift)))
+}
+
+#[tokio::test]
+async fn redshift_read_only_work_runs_in_a_read_only_transaction() {
+    let Some((db, conn)) = redshift_on_postgres() else {
+        return;
+    };
+    db.test(&conn).await.unwrap();
+    // Past the keyword check, the server refuses the write.
+    let error = db
+        .execute(
+            &conn,
+            "WITH x AS (INSERT INTO users (name, email) VALUES ('rs', 'rs@x') RETURNING id) \
+             SELECT id FROM x",
+            READ,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("read-only"), "{error:#}");
+    assert!(db.execute(&conn, "DELETE FROM users", READ).await.is_err());
+    let r = db
+        .execute(&conn, "SELECT count(*) AS n FROM users", READ)
+        .await;
+    assert!(r.unwrap().rows[0][0].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn redshift_a_transaction_left_open_is_rolled_back_and_reported() {
+    let Some((db, conn)) = redshift_on_postgres() else {
+        return;
+    };
+    let run = db
+        .execute_script(
+            &conn,
+            "BEGIN; CREATE TABLE it_redshift_left_open (a int)",
+            WRITE,
+        )
+        .await
+        .unwrap();
+    assert!(run.rolled_back, "DDL doesn't commit on Redshift");
+    let gone = db
+        .execute(&conn, "SELECT 1 FROM it_redshift_left_open", READ)
+        .await;
+    assert!(gone.is_err(), "the table was rolled back");
+    let run = db
+        .execute_script(&conn, "SELECT 1 AS n", WRITE)
+        .await
+        .unwrap();
+    assert!(!run.rolled_back);
+    let run = db
+        .execute_script(&conn, "BEGIN; SELECT 1 AS n; END", WRITE)
+        .await
+        .unwrap();
+    assert!(!run.rolled_back, "END commits");
+    // The connection went back to the pool without a transaction.
+    let r = db.execute(&conn, "SELECT 2 AS n", WRITE).await.unwrap();
+    assert_eq!(r.rows, [[json!(2)]]);
+}
+
+#[tokio::test]
+async fn redshift_decodes_timetz_and_skips_describing_an_empty_result() {
+    let Some((db, conn)) = redshift_on_postgres() else {
+        return;
+    };
+    let r = db
+        .execute(
+            &conn,
+            "SELECT '12:34:56+02'::timetz AS t, 1.50::numeric(4,2) AS n, NULL::timetz AS z",
+            READ,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.rows,
+        [[json!("12:34:56+02:00"), json!("1.50"), json!(null)]]
+    );
+    // Redshift can't run the driver's column-origin lookup, so an empty result is not
+    // prepared again for its column names.
+    let empty = db
+        .execute(&conn, "SELECT id FROM users WHERE false", READ)
+        .await
+        .unwrap();
+    assert!(empty.rows.is_empty());
+    assert!(empty.columns.is_empty());
 }

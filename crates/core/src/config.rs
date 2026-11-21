@@ -273,14 +273,16 @@ pub struct AwsSecretRef {
     pub use_secret_host: bool,
 }
 
-/// Sign in to the database with a short-lived RDS IAM token made from an AWS profile.
+/// Sign in to the database with a short-lived RDS IAM token made from an AWS profile, or on
+/// Redshift with temporary credentials AWS hands out for it (`GetClusterCredentials`, or
+/// Redshift Serverless's `GetCredentials`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AwsIamAuth {
     /// Profile in `~/.aws/config`. Empty means the default AWS credentials.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub profile: String,
-    /// The database's region. Empty means the one in its `*.rds.amazonaws.com` host
-    /// name, or else the profile's.
+    /// The database's region. Empty means the one in its `*.rds.amazonaws.com` (or
+    /// Redshift) host name, or else the profile's.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub region: String,
 }
@@ -296,7 +298,8 @@ pub enum Auth {
     AwsSecret(AwsSecretRef),
     /// A parameter in AWS Systems Manager Parameter Store.
     AwsParameter(AwsSecretRef),
-    /// An RDS IAM auth token for the connection's user, made on every connect.
+    /// An RDS IAM auth token for the connection's user, made on every connect; on Redshift,
+    /// temporary credentials for it.
     AwsIam(AwsIamAuth),
 }
 

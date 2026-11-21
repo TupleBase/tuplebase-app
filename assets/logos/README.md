@@ -13,8 +13,8 @@ Unmodified single marks, which the app draws in one color on a colored tile:
 
 Drawn for TupleBase, not a vendor's logo:
 
-- `redshift.svg`: three shifted slabs, a generic data warehouse mark for Amazon Redshift, which
-  has no logo of its own apart from AWS's service icon
+- `redshift.svg`: three shifted slabs, a plain data warehouse mark drawn for Amazon Redshift
+  instead of AWS's own service icon
 
 # Agent logos
 
