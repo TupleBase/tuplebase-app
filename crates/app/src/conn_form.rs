@@ -1273,6 +1273,76 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_list_keeps_room_in_a_short_window_with_many_profiles(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        cx.update_window(handle, |_, window, _| {
+            window.resize(size(px(1000.), px(560.)))
+        })
+        .unwrap();
+        act(handle, cx, |window, cx| window.click("source-aws", cx));
+        act(handle, cx, |window, cx| {
+            let picker = form.read(cx).aws_picker().cloned().expect("AWS step");
+            let profiles = (0..40)
+                .map(|i| tuplebase_core::cloud::aws::Profile {
+                    name: format!("account-{i:02}-admin"),
+                    region: Some("eu-west-1".into()),
+                })
+                .collect();
+            picker.update(cx, |p, cx| p.set_profiles(Ok(profiles), window, cx));
+        });
+        show(
+            &form,
+            Discovery {
+                found: many(40),
+                ..Discovery::default()
+            },
+            cx,
+        );
+        act(handle, cx, |window, _| {
+            assert!(in_view(window, "aws-use"));
+            assert!(in_view(window, "aws-find"));
+            assert!(in_view(window, "aws-search"));
+            let list = window.find("aws-results").bounds();
+            assert!(list.bottom() <= window.find("conn-footer").bounds().top());
+            assert!(list.size.height >= px(4. * 34.), "{list:?}");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn moving_with_the_keys_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-aws", cx));
+        show(
+            &form,
+            Discovery {
+                found: many(40),
+                ..Discovery::default()
+            },
+            cx,
+        );
+        act(handle, cx, |window, cx| window.click("aws-search", cx));
+        act(handle, cx, |window, cx| {
+            for _ in 0..30 {
+                window.press("down", cx);
+            }
+        });
+        let index = cx.update(|cx| {
+            let picker = form.read(cx).aws_picker().cloned().unwrap();
+            picker.read(cx).selected_index().expect("selected")
+        });
+        act(handle, cx, |window, _| {
+            let list = window.find("aws-results").bounds();
+            let row = window
+                .find(gpui_kit::SharedString::from(format!("aws-result-{index}")))
+                .bounds();
+            assert!(
+                row.top() >= list.top() && row.bottom() <= list.bottom(),
+                "{row:?} in {list:?}"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
     fn switching_between_typing_and_aws_keeps_both_and_change_goes_back(cx: &mut TestAppContext) {
         let (handle, form) = open(cx);
         act(handle, cx, |window, cx| window.click("source-manual", cx));

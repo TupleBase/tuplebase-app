@@ -196,6 +196,20 @@ impl AwsPicker {
         }
     }
 
+    /// The selected result's index, for tests.
+    #[cfg(test)]
+    pub fn selected_index(&self) -> Option<usize> {
+        self.selected
+    }
+
+    /// Whether one of its fields has the keys, or nothing does.
+    fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        window.focused(cx).is_none()
+            || [&self.typed_profile, &self.regions, &self.query]
+                .iter()
+                .any(|input| input.read(cx).focus_handle(cx).is_focused(window))
+    }
+
     fn query_text(&self, cx: &App) -> String {
         self.query.read(cx).value().trim().to_owned()
     }
@@ -354,6 +368,9 @@ impl AwsPicker {
         cx.emit(AwsPickerEvent::Searched(search.clone()));
         self.search = Search::Searching;
         self.selected = None;
+        // A filter for the last results could hide all of the new ones.
+        self.query
+            .update(cx, |input, cx| input.set_value("", window, cx));
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let found = io(async move {
@@ -379,8 +396,11 @@ impl AwsPicker {
                         cx,
                     ),
                 }
-                // Ready to type a search, or Enter to use the first one.
-                this.focus(window, cx);
+                // Ready to type a search, or Enter to use the first one, unless the keys
+                // went somewhere else meanwhile.
+                if this.has_focus(window, cx) {
+                    this.focus(window, cx);
+                }
             })
             .ok();
         })
@@ -1203,6 +1223,9 @@ pub(crate) mod tests {
             assert!(window.find("aws-no-match").visible());
         });
         assert_eq!(selected(&picker, cx), None);
+        // A new search starts unfiltered.
+        act(handle, cx, |window, cx| window.click("aws-find", cx));
+        cx.update(|cx| assert_eq!(picker.read(cx).query_text(cx), ""));
     }
 
     #[gpui_kit::test]

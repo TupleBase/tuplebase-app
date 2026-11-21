@@ -1494,6 +1494,29 @@ mod tests {
     }
 
     #[test]
+    fn the_config_knows_a_workgroup_endpoint_as_this_module_does() {
+        for host in [
+            "analytics.123456789012.eu-west-1.redshift-serverless.amazonaws.com",
+            "WG.123456789012.CN-NORTH-1.redshift-serverless.amazonaws.com.cn.",
+            "warehouse.abc123.eu-west-1.redshift.amazonaws.com",
+            "orders.abc123.eu-west-1.rds.amazonaws.com",
+            "redshift-serverless.amazonaws.com",
+            "123456789012.eu-west-1.redshift-serverless.amazonaws.com",
+            "db.example.com",
+        ] {
+            let here = matches!(
+                redshift_target(host),
+                Some((RedshiftTarget::Workgroup(_), _))
+            );
+            assert_eq!(
+                crate::config::is_redshift_serverless_host(host),
+                here,
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
     fn a_redshift_endpoint_names_its_cluster_or_workgroup_and_region() {
         assert_eq!(
             redshift_target("examplecluster.abc123xyz789.us-west-2.redshift.amazonaws.com"),
