@@ -1,10 +1,13 @@
 # Features
 
 Works with PostgreSQL, MariaDB, MySQL, SQLite and Amazon Redshift (provisioned clusters and
-Serverless workgroups).
+Serverless workgroups), and with MongoDB, Amazon DocumentDB and Amazon DynamoDB. See
+[MongoDB and DocumentDB](#mongodb-and-documentdb) and [DynamoDB](#dynamodb) for what differs
+on those.
 
 ## Connections
 
+- Pick the engine from a list grouped by family (SQL, Document, Key-value), with search.
 - Organize connections in nested folders and give each one a color.
 - Right-click a connection or folder to edit it, delete it or add to it.
 - A green light marks every connection that is open. Disconnect from the sidebar, the toolbar or
@@ -65,7 +68,9 @@ Serverless workgroups).
 
 ## AI agents
 
-A local [MCP server](MCP.md) lets agents list connections, inspect tables and run queries.
+A local [MCP server](MCP.md) lets agents list connections, inspect tables and run queries, in
+SQL, Mongo shell commands or PartiQL; for MongoDB and DocumentDB it also takes `find` and
+`aggregate` as plain JSON, always read-only.
 It uses the connections saved in the app and is read-only by default. It can also tell an agent
 which connections are open in the app, so the agent works on those.
 Add it to your installed agents in one click from Settings or the app menu. An indicator in the
@@ -76,6 +81,38 @@ own Claude Code, with your account. There it can use only this MCP server, so it
 databases and nothing else on your computer, and it is told to work only on the connections you
 have open. Each tool call it makes is listed; click one to see
 its arguments.
+
+## MongoDB and DocumentDB
+
+- Write Mongo shell commands: `db.users.find({...}).sort({...}).limit(10)`, `findOne`,
+  `aggregate`, `countDocuments`, `estimatedDocumentCount`, `distinct`, `getIndexes`,
+  `show dbs`, `show collections`, `getSiblingDB`, and the write methods on a writable
+  connection. Nothing is run as JavaScript.
+- Autocomplete collections after `db.`, methods after `db.<collection>.`, and stages and
+  operators after `$`; on a read-only connection, only reads and the stages the guard allows.
+- The schema browser lists collections and views, the fields sampled from up to 100 documents
+  (with **Resample fields**), and each collection's indexes, whose definitions show beside the
+  results.
+- Results show one row per document. `ObjectId("…")`, dates and decimals read as in the shell;
+  a field a document lacks is an empty cell, and a null one is `NULL`. Click a row to see the
+  whole document as a tree, and copy it as JSON.
+- **Paste connection string** fills in the form from a `mongodb://` or `mongodb+srv://` string.
+  The password goes to the credential store; the string isn't kept.
+- Find DocumentDB clusters in AWS like RDS databases; with Encryption **Verified**, they are
+  checked against Amazon's certificate authorities.
+- A read-only connection runs only reads: one typed read per command, with no server-side
+  JavaScript. The server itself refuses writes only for a read-only user, which the app reports;
+  otherwise the tab says **Guarded by TupleBase only**.
+
+## DynamoDB
+
+- Query with [PartiQL](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ql-reference.html),
+  one statement at a time, signing in with your AWS profile and region. An endpoint URL reaches
+  DynamoDB Local.
+- The schema browser lists tables with their keys, global and local indexes, and attributes
+  sampled from up to 50 items.
+- A read-only connection runs only a single `SELECT`. A `SELECT` without a key condition scans
+  the table, up to 10 pages; the status line says when it stopped there.
 
 ## Appearance
 

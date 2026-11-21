@@ -5,7 +5,8 @@
 ### Your database workspace, on your desktop.
 
 Explore schemas, write queries and inspect results in a native app for macOS, Windows and
-Linux, written in Rust. Works with PostgreSQL, MariaDB, MySQL, SQLite and Amazon Redshift.
+Linux, written in Rust. Works with PostgreSQL, MariaDB, MySQL, SQLite and Amazon Redshift,
+and with MongoDB, Amazon DocumentDB and Amazon DynamoDB.
 
 [Website](https://tuplebase.app) · [Download the latest release](https://github.com/TupleBase/tuplebase-app/releases/latest) · [Install guide](docs/INSTALL.md)
 
