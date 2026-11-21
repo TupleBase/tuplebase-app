@@ -13,6 +13,8 @@
 //! run. So everything here reads SQL through one scanner, [`token`], that follows the
 //! engine's rules ([`ScriptFlavor`]).
 
+use std::ops::Range;
+
 use crate::config::{Adapter, ScriptFlavor};
 
 const READ_KEYWORDS: [&str; 8] = [
@@ -169,6 +171,44 @@ pub fn trim_statement(sql: &str) -> &str {
 /// PostgreSQL dollar quotes, and the `BEGIN … END` body of a routine, trigger or event
 /// on MySQL and MariaDB (see [`Body`]). Comment-only pieces are dropped.
 pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
+    pieces(adapter, sql)
+        .into_iter()
+        .map(|piece| &sql[piece.text])
+        .collect()
+}
+
+/// The byte range of the statement that `cursor`, a byte offset into `sql`, is in, split
+/// exactly as [`split_statements`] splits a script. A statement owns its text, any comment
+/// before it, and its closing `;`, so a cursor just after the `;` is still in it. A cursor
+/// in blank space between statements, or in a comment with no statement after it, is in
+/// none.
+pub fn statement_at(adapter: Adapter, sql: &str, cursor: usize) -> Option<Range<usize>> {
+    pieces(adapter, sql)
+        .into_iter()
+        .find(|piece| !piece.text.is_empty() && piece.text.start <= cursor && cursor <= piece.end)
+        .map(|piece| piece.text)
+}
+
+/// One statement of a script.
+struct Piece {
+    /// The statement, trimmed of whitespace, without its `;`.
+    text: Range<usize>,
+    /// Just past its `;`, or the end of its text when it has none.
+    end: usize,
+}
+
+impl Piece {
+    fn new(sql: &str, raw: Range<usize>, end: Option<usize>) -> Self {
+        let piece = &sql[raw.clone()];
+        let start = raw.start + piece.len() - piece.trim_start().len();
+        let text = start..(raw.start + piece.trim_end().len()).max(start);
+        let end = end.unwrap_or(text.end);
+        Self { text, end }
+    }
+}
+
+/// The statements of a script, read by [`token`]; see [`split_statements`].
+fn pieces(adapter: Adapter, sql: &str) -> Vec<Piece> {
     let mysql = adapter.info().script == ScriptFlavor::Mysql;
     let mut statements = Vec::new();
     let (mut start, mut i, mut has_content) = (0, 0, false);
@@ -177,7 +217,7 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
         match kind {
             Token::Semicolon if body.depth == 0 => {
                 if has_content {
-                    statements.push(sql[start..i].trim());
+                    statements.push(Piece::new(sql, start..i, Some(i + 1)));
                 }
                 start = i + 1;
                 has_content = false;
@@ -193,7 +233,7 @@ pub fn split_statements(adapter: Adapter, sql: &str) -> Vec<&str> {
         i += text.len();
     }
     if has_content {
-        statements.push(sql[start..].trim());
+        statements.push(Piece::new(sql, start..sql.len(), None));
     }
     statements
 }
@@ -690,6 +730,130 @@ mod tests {
     fn letters_beyond_ascii_outside_quotes_split_fine() {
         for adapter in [Adapter::Postgres, Adapter::Mariadb, Adapter::Sqlite] {
             assert_eq!(split(adapter, "select 1 as café; select 2").len(), 2);
+        }
+    }
+
+    /// The statement at the cursor, which is where `|` is in `marked`.
+    fn at(adapter: Adapter, marked: &str) -> Option<String> {
+        let cursor = marked.find('|').expect("a cursor mark");
+        let sql = marked.replacen('|', "", 1);
+        statement_at(adapter, &sql, cursor).map(|range| sql[range].to_owned())
+    }
+
+    const ALL: [Adapter; 4] = [
+        Adapter::Postgres,
+        Adapter::Mariadb,
+        Adapter::Mysql,
+        Adapter::Sqlite,
+    ];
+
+    #[test]
+    fn statement_at_finds_the_first_middle_and_last_statement() {
+        for adapter in ALL {
+            let at = |marked: &str| at(adapter, marked);
+            let script = "select 1;\nselect 2;\nselect 3";
+            assert_eq!(at(&format!("|{script}")).as_deref(), Some("select 1"));
+            assert_eq!(
+                at("select 1;\nsel|ect 2;\nselect 3").as_deref(),
+                Some("select 2")
+            );
+            assert_eq!(
+                at("select 1;\nselect 2;\nselect 3|").as_deref(),
+                Some("select 3")
+            );
+        }
+    }
+
+    #[test]
+    fn statement_at_counts_the_semicolon_as_part_of_its_statement() {
+        for adapter in ALL {
+            let at = |marked: &str| at(adapter, marked);
+            assert_eq!(at("select 1|; select 2").as_deref(), Some("select 1"));
+            assert_eq!(at("select 1;| select 2").as_deref(), Some("select 1"));
+            assert_eq!(at("select 1; |select 2").as_deref(), Some("select 2"));
+            // Right between two statements, the one the `;` closes wins.
+            assert_eq!(at("select 1;|select 2").as_deref(), Some("select 1"));
+            assert_eq!(at("select 1;\nselect 2;|\n").as_deref(), Some("select 2"));
+        }
+    }
+
+    #[test]
+    fn statement_at_finds_nothing_in_blank_space_or_a_trailing_comment() {
+        for adapter in ALL {
+            let at = |marked: &str| at(adapter, marked);
+            assert_eq!(at("select 1;\n|\n"), None);
+            assert_eq!(at("select 1;\n\n|\nselect 2"), None);
+            assert_eq!(at("select 1;\n-- the |end\n"), None);
+            assert_eq!(at("|"), None);
+            assert_eq!(at("  | "), None);
+        }
+    }
+
+    #[test]
+    fn statement_at_includes_the_comment_before_a_statement() {
+        for adapter in ALL {
+            let at = |marked: &str| at(adapter, marked);
+            let found = at("select 1;\n-- co|unt\nselect count(*) from t; select 3");
+            assert_eq!(found.as_deref(), Some("-- count\nselect count(*) from t"));
+            let found = at("select 1; /* a; |b */ select 2");
+            assert_eq!(found.as_deref(), Some("/* a; b */ select 2"));
+        }
+    }
+
+    #[test]
+    fn statement_at_keeps_a_postgres_dollar_quoted_body_whole() {
+        let body = "create function f() returns int as $body$ begin; return 1; end; $body$ \
+                    language plpgsql";
+        let inside = body.find("return").unwrap();
+        let marked = format!(
+            "select 1; {}|{}; select 2",
+            &body[..inside],
+            &body[inside..]
+        );
+        assert_eq!(at(Adapter::Postgres, &marked).as_deref(), Some(body));
+        assert_eq!(
+            at(Adapter::Postgres, "select $$a;|b$$; select 2").as_deref(),
+            Some("select $$a;b$$")
+        );
+    }
+
+    #[test]
+    fn statement_at_keeps_a_mysql_routine_body_whole() {
+        let body = "CREATE PROCEDURE p()\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND";
+        let inside = body.find("SELECT 2").unwrap();
+        let marked = format!(
+            "SELECT 0;\n{}|{};\nSELECT 3",
+            &body[..inside],
+            &body[inside..]
+        );
+        for adapter in [Adapter::Mariadb, Adapter::Mysql] {
+            assert_eq!(at(adapter, &marked).as_deref(), Some(body));
+        }
+        // SQLite has no such bodies, so there the cursor is in the piece after a `;`.
+        assert_eq!(at(Adapter::Sqlite, &marked).as_deref(), Some("SELECT 2"));
+    }
+
+    #[test]
+    fn statement_at_handles_text_beyond_ascii() {
+        for adapter in ALL {
+            let at = |marked: &str| at(adapter, marked);
+            let found = at("select 'héllo';\nselect 'wö|rld' as naïve; select 'ü'");
+            assert_eq!(found.as_deref(), Some("select 'wörld' as naïve"));
+            assert_eq!(at("select '😀';| select 2").as_deref(), Some("select '😀'"));
+        }
+    }
+
+    #[test]
+    fn statement_at_agrees_with_split_statements() {
+        let script = "-- intro\nselect 1; select 'a;b' /* ; */;\n\nselect $$x;y$$;\
+                      CREATE PROCEDURE p() BEGIN SELECT 1; END;  -- tail";
+        for adapter in ALL {
+            let pieces = split_statements(adapter, script);
+            for cursor in 0..=script.len() {
+                if let Some(range) = statement_at(adapter, script, cursor) {
+                    assert!(pieces.contains(&&script[range]), "{adapter:?} at {cursor}");
+                }
+            }
         }
     }
 

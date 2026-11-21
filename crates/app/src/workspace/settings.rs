@@ -15,6 +15,7 @@ use tuplebase_core::agents::AgentState;
 use tuplebase_core::config::Appearance;
 
 use super::Workspace;
+use crate::dialogs;
 
 /// The pages of Settings, in the order `open_settings` lists them.
 #[derive(Clone, Copy)]
@@ -43,8 +44,8 @@ impl Workspace {
             // The dialog is rounded and the sidebar fills its left edge.
             let sidebar = StyleRefinement::default().rounded_l(cx.theme().radius_lg);
             // The pages bring their own titles and padding.
-            dialog.w(px(760.)).p_0().child(
-                div().h(px(520.)).child(
+            dialog.w(px(760.)).p_0().close_button(false).child(
+                dialogs::with_close_button(
                     Settings::new("settings")
                         .with_group_variant(GroupBoxVariant::Outline)
                         .sidebar_width(px(200.))
@@ -54,7 +55,8 @@ impl Workspace {
                             group_ix: None,
                         })
                         .pages([general(&workspace), agents(&workspace, cx)]),
-                ),
+                )
+                .h(px(520.)),
             )
         });
     }
