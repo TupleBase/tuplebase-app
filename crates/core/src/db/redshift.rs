@@ -622,6 +622,7 @@ mod tests {
             ssh: None,
             auth: Default::default(),
             source: None,
+            mongo: None,
         };
         let options = options(&conn, "127.0.0.1", 40000, Some("pw"));
         assert_eq!(

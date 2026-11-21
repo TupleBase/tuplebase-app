@@ -107,6 +107,9 @@ pub(crate) struct ConnectionTab {
     pub(crate) row_detail: Entity<RowDetail>,
     pub(crate) schema: Entity<SchemaPanel>,
     pub(crate) status: Status,
+    /// On MongoDB and DocumentDB, whether the server refuses this connection's writes,
+    /// as the last run found; `None` until known.
+    server_read_only: Option<bool>,
     /// Set from asking for a pool until the answer.
     pub(crate) connecting: bool,
     /// Whether the tab has started: loaded its schema and asked for a pool. A tab
@@ -194,6 +197,7 @@ impl ConnectionTab {
             row_detail,
             schema,
             status: Status::Idle,
+            server_read_only: None,
             connecting: false,
             started: false,
             connected: false,
@@ -217,8 +221,13 @@ impl ConnectionTab {
                 editor.lsp_mut().completion_provider =
                     Some(Rc::new(SqlCompletions::new(names.clone())));
             }
-            // No engine of these families yet: plain text, with no completions.
-            Family::Document | Family::KeyValue => {
+            // Mongo shell commands read as JavaScript. Completions come later.
+            Family::Document => {
+                editor.set_highlighter("javascript", cx);
+                editor.lsp_mut().completion_provider = None;
+            }
+            // No engine of this family yet: plain text, with no completions.
+            Family::KeyValue => {
                 editor.set_highlighter("text", cx);
                 editor.lsp_mut().completion_provider = None;
             }
@@ -283,6 +292,9 @@ impl ConnectionTab {
             self.editor.update(cx, |editor, cx| {
                 Self::configure_editor(editor, family, &names, cx)
             });
+        }
+        if !same_server(&self.conn, &conn) {
+            self.server_read_only = None;
         }
         self.conn = conn;
         cx.notify();
@@ -461,6 +473,7 @@ impl ConnectionTab {
             Err(e) => Status::Failed(format!("{e:#}").into()),
         };
         if let Ok(run) = &result {
+            self.server_read_only = run.result.server_read_only;
             // A statement that changed something may have changed the schema too.
             if run.changed {
                 self.schema.update(cx, |schema, cx| schema.refresh(cx));
@@ -670,6 +683,14 @@ impl Render for ConnectionTab {
                     .when(conn.readonly, |el| {
                         el.child(chip("Read-only".into(), muted, muted_bg))
                     })
+                    // No read-only transaction here (S2): unless the server showed it
+                    // refuses this user's writes, only TupleBase's checks keep it so.
+                    .when(
+                        conn.readonly
+                            && conn.adapter.family() != Family::Sql
+                            && self.server_read_only != Some(true),
+                        |el| el.child(chip("Guarded by TupleBase only".into(), muted, muted_bg)),
+                    )
                     .child(div().flex_1())
                     .child(
                         Button::new("history")
@@ -758,6 +779,12 @@ fn rows_text(count: usize) -> String {
     }
 }
 
+/// Whether two settings reach the same server as the same user.
+fn same_server(a: &Connection, b: &Connection) -> bool {
+    (a.adapter, &a.host, a.port, &a.user, &a.mongo)
+        == (b.adapter, &b.host, b.port, &b.user, &b.mongo)
+}
+
 pub(crate) fn summary(r: &tuplebase_core::db::QueryResult, statements: usize) -> String {
     let ms = r.elapsed_ms;
     let outcome = match r.rows_affected {
@@ -824,6 +851,7 @@ mod tests {
                         elapsed_ms: 1,
                         note: None,
                         documents: None,
+                        server_read_only: None,
                     });
                     table.refresh(cx);
                 });
@@ -879,6 +907,7 @@ mod tests {
                         elapsed_ms: 1,
                         note: None,
                         documents: None,
+                        server_read_only: None,
                     });
                     table.refresh(cx);
                 });
@@ -933,6 +962,7 @@ mod tests {
                     elapsed_ms: 1,
                     note: None,
                     documents: None,
+                    server_read_only: None,
                 };
                 this.results.update(cx, |table, cx| {
                     table.delegate_mut().show(&result);
@@ -958,6 +988,7 @@ mod tests {
             elapsed_ms: 5,
             note: None,
             documents: None,
+            server_read_only: None,
         };
         assert_eq!(summary(&result(1, None, false), 1), "1 row in 5 ms");
         assert_eq!(summary(&result(2, None, true), 1), "First 2 rows in 5 ms");
@@ -977,6 +1008,7 @@ mod tests {
             elapsed_ms: 5,
             note: None,
             documents: None,
+            server_read_only: None,
         };
         assert_eq!(summary(&result, 3), "3 statements. 2 rows in 5 ms");
         assert_eq!(history_label("select\n  1"), "select 1");
@@ -1471,6 +1503,7 @@ mod tests {
                         elapsed_ms: 1,
                         note: None,
                         documents: None,
+                        server_read_only: None,
                     });
                     table.refresh(cx);
                 });
@@ -1514,6 +1547,7 @@ mod tests {
                 elapsed_ms: 1,
                 note: None,
                 documents: None,
+                server_read_only: None,
             },
             statements: 2,
             changed: true,
@@ -1547,6 +1581,7 @@ mod tests {
                 elapsed_ms: 1,
                 note: None,
                 documents: None,
+                server_read_only: None,
             },
             statements: 1,
             changed: false,

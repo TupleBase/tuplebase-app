@@ -51,6 +51,18 @@ fn logo(adapter: Adapter) -> Logo {
             color: 0x4A3AA8,
             letters: "RS",
         },
+        // TupleBase's own leaf, not MongoDB's logo.
+        Adapter::Mongodb => Logo {
+            glyph: include_bytes!("../../../assets/logos/mongodb.svg"),
+            color: 0x116149,
+            letters: "MG",
+        },
+        // TupleBase's own stacked documents, not AWS's service icon.
+        Adapter::Documentdb => Logo {
+            glyph: include_bytes!("../../../assets/logos/documentdb.svg"),
+            color: 0x9D2B6B,
+            letters: "DD",
+        },
     }
 }
 

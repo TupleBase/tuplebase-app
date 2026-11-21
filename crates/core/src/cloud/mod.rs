@@ -108,6 +108,7 @@ impl Discovered {
             ssh: None,
             auth: self.auth.clone(),
             source: Some(self.source.clone()),
+            mongo: None,
         })
     }
 }

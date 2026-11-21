@@ -8,6 +8,7 @@ pub mod config;
 pub mod credentials;
 pub mod db;
 pub mod mcp_status;
+pub mod mongo_shell;
 pub mod safety;
 pub mod secrets;
 pub mod ssh;

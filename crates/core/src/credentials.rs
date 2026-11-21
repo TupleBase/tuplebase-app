@@ -7,7 +7,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cloud::aws;
 use crate::config::{Adapter, Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection};
@@ -178,6 +178,14 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
                         refresh: Some(iam_expiry(made, login.expires)),
                     })
                 }
+                // Refused on save; this catches a file edited by hand. MONGODB-AWS needs the
+                // driver's `aws-auth`, which pulls a C library (D2).
+                Adapter::Mongodb | Adapter::Documentdb => {
+                    bail!(
+                        "IAM sign-in to {} isn't supported yet: use a password or a secret",
+                        conn.adapter.label()
+                    )
+                }
                 Adapter::Postgres | Adapter::Mariadb | Adapter::Mysql | Adapter::Sqlite => {
                     // Signed for the database's own name, even when a tunnel carries the
                     // traffic.
@@ -281,6 +289,7 @@ mod tests {
             ssh: None,
             auth,
             source: None,
+            mongo: None,
         }
     }
 

@@ -85,6 +85,7 @@ fn connection(name: &str, store: AwsStore, secret: &str) -> Connection {
             AwsStore::ParameterStore => Auth::AwsParameter(secret),
         },
         source: None,
+        mongo: None,
     }
 }
 

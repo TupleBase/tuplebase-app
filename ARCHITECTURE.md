@@ -36,25 +36,27 @@ scripts/                   install, packaging, release helpers
 | `config`       | connection settings and the config directory              | nothing                                                 |
 | `secrets`      | passwords in the OS credential store                      | nothing                                                 |
 | `state`        | unsaved SQL, query history, panel sizes, last search, open tabs | `config`                                                |
-| `safety`       | statement classification for the read-only guard          | `config`                                                |
+| `safety`       | statement classification for the read-only guard, and the Mongo shell command check | `config` `mongo_shell`                    |
+| `mongo_shell`  | the Mongo shell commands TupleBase reads: parser, command tree, splitting scripts | nothing                                 |
 | `ssh`          | SSH tunnels                                               | `config`                                                |
 | `cloud`        | cloud providers, one file each (`cloud/aws.rs`)           | `config`                                                |
 | `credentials`  | the password each auth method signs in with               | `config` `secrets` `cloud`                              |
 | `mcp_status`   | heartbeat files of running MCP servers                    | `config`                                                |
 | `app_status`   | the file naming the connections open in the app           | `config`                                                |
 | `updates`      | the GitHub release check                                  | `config`                                                |
-| `db`           | the database API, pools, running SQL, the read-only guard | `config` `ssh` `safety`                                 |
+| `db`           | the database API, pools, running SQL and Mongo shell commands, the read-only guard | `config` `ssh` `safety` `mongo_shell`  |
 | `db/connect`   | opening a pool, for every engine: credentials, tunnel, token renewal, RDS authorities, pool size | `config` `secrets` `ssh` `credentials` `cloud`, and `db` |
 | `db/postgres`  | PostgreSQL's connect options and pool, own SQL, read-only statements, value decoding | `config`, and `db` (its parent) and `db/connect` |
 | `db/mysql`     | MySQL's and MariaDB's connect options and pool, SQL, read-only statements, decoding | `config`, and `db` (its parent) and `db/connect` |
 | `db/sqlite`    | SQLite's connect options and pools (one read-only), own SQL, read-only switch, value decoding | `config` `ssh`, and `db` (its parent) and `db/connect` |
 | `db/redshift`  | Redshift's connect options and pool (PostgreSQL's driver), own catalog SQL, read-only statements, decoding | `config`, and `db` (its parent), `db/connect` and `db/postgres` |
+| `db/mongo`     | MongoDB's and DocumentDB's client options and connecting, running parsed shell commands (reads as typed read calls only), listing, field sampling, the server read-only probe, BSON to JSON | `config` `mongo_shell`, and `db` (its parent) and `db/connect` |
 | `db/decode`    | value decoding the engine modules share                   | nothing                                                 |
 | `agents`       | the MCP server's entry in each agent's config file        | `updates`                                               |
 | `chat`         | running the user's agent for the chat panel               | `config` `agents`                                       |
 
-- **L5. Imports inside `core` go one way, with no cycles.** `config` and `secrets` import
-  no sibling module. A module that only needs settings imports `config` alone. `db`,
+- **L5. Imports inside `core` go one way, with no cycles.** `config`, `secrets` and
+  `mongo_shell` import no sibling module. A module that only needs settings imports `config` alone. `db`,
   `agents` and `chat` combine the others, and nothing below imports them. A submodule,
   such as `db/postgres`, may import its parent and its siblings; nothing outside the
   parent imports it. `credentials` combines `secrets` and `cloud` for `db`; only
@@ -129,6 +131,15 @@ Changing one of these needs the user's explicit agreement, not just a passing re
   given, so there read-only work runs on a connection opened read-only, with
   `PRAGMA query_only` on, and SQLite's own parser must find exactly one statement. The
   guard reads comments and quotes as each engine does (`ScriptFlavor`).
+  Engines with no server read-only mode (MongoDB, DocumentDB, DynamoDB) rely on a command
+  allowlist checked on the parsed command and on running one typed read call per request;
+  the server enforces read-only only when the connection's user, endpoint or IAM policy is
+  read-only, which TupleBase reports but cannot switch on.
+
+  A known limit of that guard, not a change to S2: it checks the command it is given, not
+  what a MongoDB view stores. Reading a view runs the view's own pipeline as the server
+  keeps it, which may run server-side JavaScript (`$function`). On these engines only the
+  server's permissions decide what a view does.
 
 ## Dependencies
 

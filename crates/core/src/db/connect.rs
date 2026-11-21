@@ -175,12 +175,18 @@ impl Drop for Refresher {
     }
 }
 
-/// What every engine's pool is opened with: at most 4 connections, and 10 seconds to
-/// wait for one.
+/// The most connections a pool opens to one database.
+pub(super) const POOL_SIZE: u32 = 4;
+
+/// How long to wait for a connection from the pool, or for a server to answer.
+pub(super) const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What every SQL engine's pool is opened with: at most [`POOL_SIZE`] connections, and
+/// [`ACQUIRE_TIMEOUT`] to wait for one. The MongoDB driver takes the same two settings.
 pub(super) fn pool_options<DB: sqlx::Database>() -> PoolOptions<DB> {
     PoolOptions::new()
-        .max_connections(4)
-        .acquire_timeout(Duration::from_secs(10))
+        .max_connections(POOL_SIZE)
+        .acquire_timeout(ACQUIRE_TIMEOUT)
 }
 
 /// Certificate authorities to trust, besides the usual ones, when verifying `conn`'s
@@ -215,6 +221,7 @@ pub(super) mod tests {
             ssh: None,
             auth: Auth::Password,
             source: None,
+            mongo: None,
         }
     }
 

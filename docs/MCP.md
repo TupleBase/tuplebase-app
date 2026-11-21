@@ -69,3 +69,14 @@ is not marked read-only. In read-only mode a statement must:
 This stops ordinary writes, but a read-only transaction cannot stop every side effect:
 a function that signals a backend, for example, can still run. For a hard guarantee,
 save the connection with a database user that only has read grants.
+
+MongoDB and Amazon DocumentDB have no read-only transaction. In read-only mode a command
+must parse as one `find`, `findOne`, `aggregate`, `countDocuments`,
+`estimatedDocumentCount`, `distinct` or `getIndexes` (or `show dbs` / `show collections`),
+with pipeline stages from a fixed list, no `$out` or `$merge` at any depth, no server-side
+JavaScript (`$where`, `$function`, `$accumulator`), no internal `$_` operators, no
+`allowDiskUse`, and no `db.runCommand`. It then runs as one typed read call, limited to
+60 seconds on the server. What this can't see is what a view stores: reading a view runs
+its own pipeline, which may run JavaScript. The server refuses writes only for a user
+with read-only roles (or a direct connection to a secondary); TupleBase reports whether it
+found one, and otherwise shows the connection as guarded by TupleBase only.

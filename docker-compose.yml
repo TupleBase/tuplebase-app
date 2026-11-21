@@ -58,3 +58,33 @@ services:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
       interval: 2s
       retries: 30
+  # MongoDB as a single-node replica set, so `hello` and secondaries behave as in
+  # production. It listens on 57017 inside the container too: the set names its member
+  # localhost:57017, which must be the same address from the host. A replica set with
+  # users needs a key file; this one is made fresh on each start.
+  mongo:
+    image: mongo:8.0
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: dev
+      MONGO_INITDB_ROOT_PASSWORD: dev
+    entrypoint:
+      - bash
+      - -c
+      - |
+        head -c 756 /dev/urandom | base64 > /tmp/keyfile
+        chmod 400 /tmp/keyfile && chown mongodb:mongodb /tmp/keyfile
+        exec docker-entrypoint.sh mongod --replSet rs0 --keyFile /tmp/keyfile --bind_ip_all --port 57017
+    ports: ["57017:57017"]
+    volumes:
+      - ./dev/seed-mongo.js:/docker-entrypoint-initdb.d/seed-mongo.js:ro
+    # The seed runs on a server the image starts first, without the replica set, so the
+    # set is started here, once, and the service is healthy when it has a primary.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --port 57017 -u dev -p dev --quiet --eval
+          "try { rs.status() } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'localhost:57017'}]}) }
+          if (!db.hello().isWritablePrimary) quit(1)"
+      interval: 2s
+      retries: 60

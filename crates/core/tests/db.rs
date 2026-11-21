@@ -1,6 +1,10 @@
 //! Integration tests against the databases in `docker-compose.yml`.
 //! Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
 
+// Db::run dispatches to each family's runner, one more level of nested futures than
+// the compiler's default query depth allows here.
+#![recursion_limit = "256"]
+
 use serde_json::json;
 use tuplebase_core::config::{Adapter, Connection};
 use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind, ROLLED_BACK_NOTE};
@@ -47,6 +51,7 @@ fn connection(adapter: Adapter) -> Connection {
         ssh: None,
         auth: Default::default(),
         source: None,
+        mongo: None,
     }
 }
 
@@ -403,6 +408,7 @@ fn sqlite_connection(dir: &tempfile::TempDir, name: &str) -> Connection {
         ssh: None,
         auth: Default::default(),
         source: None,
+        mongo: None,
     }
 }
 

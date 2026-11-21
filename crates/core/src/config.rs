@@ -72,6 +72,8 @@ pub enum Adapter {
     Mysql,
     Sqlite,
     Redshift,
+    Mongodb,
+    Documentdb,
 }
 
 /// How a database quotes an identifier such as a table name.
@@ -98,6 +100,11 @@ pub enum ScriptFlavor {
     Mysql,
     /// Plain SQL quotes and comments, and `[name]` and `` `name` `` quoted names.
     Sqlite,
+    /// Mongo shell commands: `'`, `"` and backtick strings with backslash escapes, `//`
+    /// and `/* */` comments, and `/regex/` where a value may start. A statement ends at
+    /// `;` or at a line break outside brackets, unless the next line starts with `.`.
+    /// Read by the same scanner as the parser, `mongo_shell::split`.
+    MongoShell,
 }
 
 /// The kind of query language and data model an engine has. Decides which runner,
@@ -192,13 +199,36 @@ const REDSHIFT: EngineInfo = EngineInfo {
     script: ScriptFlavor::Redshift,
 };
 
+const MONGODB: EngineInfo = EngineInfo {
+    label: "MongoDB",
+    default_port: 27017,
+    family: Family::Document,
+    place: Place::Server,
+    user_hint: "admin",
+    // No Mongo path quotes a name; this only keeps the field filled in.
+    quote: IdentQuote::Double,
+    script: ScriptFlavor::MongoShell,
+};
+
+const DOCUMENTDB: EngineInfo = EngineInfo {
+    label: "Amazon DocumentDB",
+    default_port: 27017,
+    family: Family::Document,
+    place: Place::Server,
+    user_hint: "docdbadmin",
+    quote: IdentQuote::Double,
+    script: ScriptFlavor::MongoShell,
+};
+
 impl Adapter {
-    pub const ALL: [Adapter; 5] = [
+    pub const ALL: [Adapter; 7] = [
         Adapter::Postgres,
         Adapter::Mariadb,
         Adapter::Mysql,
         Adapter::Sqlite,
         Adapter::Redshift,
+        Adapter::Mongodb,
+        Adapter::Documentdb,
     ];
 
     /// This engine's static facts. A new engine adds its constant here.
@@ -209,6 +239,8 @@ impl Adapter {
             Adapter::Mysql => &MYSQL,
             Adapter::Sqlite => &SQLITE,
             Adapter::Redshift => &REDSHIFT,
+            Adapter::Mongodb => &MONGODB,
+            Adapter::Documentdb => &DOCUMENTDB,
         }
     }
 
@@ -462,6 +494,84 @@ pub struct Source {
     pub region: String,
 }
 
+/// What a MongoDB or DocumentDB connection needs besides host, port, user and database.
+/// Never a secret: the password stays in the OS credential store (S1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MongoSettings {
+    /// Find the servers through DNS (`mongodb+srv://`); the port is then not used.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub srv: bool,
+    /// Connection string options, such as `authSource=admin&replicaSet=rs0`. Never a
+    /// password or a session token: [`Connection::validate`] refuses them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub options: String,
+}
+
+/// Whether an option would put a secret into the saved, plain options string (S1): any
+/// key naming a password. `key` is lower-cased and percent-decoded.
+fn is_secret_option(key: &str) -> bool {
+    key.contains("password") || key == "pwd"
+}
+
+impl MongoSettings {
+    /// Each option as a lower-cased, percent-decoded key and its decoded value.
+    pub fn pairs(&self) -> impl Iterator<Item = (String, String)> + '_ {
+        self.options
+            .trim_start_matches('?')
+            .split('&')
+            .filter(|pair| !pair.trim().is_empty())
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (
+                    percent_decode(key).trim().to_ascii_lowercase(),
+                    percent_decode(value),
+                )
+            })
+    }
+
+    /// Refuses options that would put a secret in the saved settings.
+    pub fn check(&self) -> Result<()> {
+        for (key, value) in self.pairs() {
+            if is_secret_option(&key) {
+                bail!(
+                    "the password can't go in the connection options: they are saved as \
+                     plain text. Leave it to the password field"
+                );
+            }
+            if key == "authmechanismproperties"
+                && value.to_ascii_uppercase().contains("AWS_SESSION_TOKEN")
+            {
+                bail!("an AWS session token can't go in the connection options");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `%XX` decoded, with `+` left as it is; bytes that aren't UTF-8 are replaced.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Connection {
     /// Unique name; also the keychain account for this connection's password.
@@ -496,6 +606,9 @@ pub struct Connection {
     /// Where the connection was discovered, if it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+    /// MongoDB and DocumentDB only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mongo: Option<MongoSettings>,
 }
 
 impl Connection {
@@ -548,6 +661,29 @@ impl Connection {
         Ok(())
     }
 
+    /// The rules for MongoDB and DocumentDB, and that no other engine has their settings.
+    fn check_mongo(&self) -> Result<()> {
+        if self.adapter.family() != Family::Document {
+            if self.mongo.is_some() {
+                bail!("MongoDB settings apply only to MongoDB and DocumentDB");
+            }
+            return Ok(());
+        }
+        if matches!(self.auth, Auth::AwsIam(_)) {
+            // MONGODB-AWS needs the driver's `aws-auth`, which pulls a C library (D2).
+            bail!(
+                "IAM sign-in to {} isn't supported yet: use a password or a secret",
+                self.adapter.label()
+            );
+        }
+        let settings = self.mongo.clone().unwrap_or_default();
+        settings.check()?;
+        if settings.srv && self.ssh.is_some() {
+            bail!("an SRV address names several servers, which one SSH tunnel can't reach");
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("connection name is required");
@@ -577,11 +713,15 @@ impl Connection {
             if self.host.trim().is_empty() {
                 bail!("host is required for \"{}\"", self.name);
             }
-            if self.user.trim().is_empty() && !self.iam_names_the_user() {
+            // A MongoDB server may run without users.
+            let user_optional =
+                self.iam_names_the_user() || self.adapter.family() == Family::Document;
+            if self.user.trim().is_empty() && !user_optional {
                 bail!("user is required for \"{}\"", self.name);
             }
             self.check_iam_encryption()?;
         }
+        self.check_mongo()?;
         let color_is_valid = self.color.is_empty()
             || (self.color.len() == 7
                 && self.color.starts_with('#')
@@ -1328,6 +1468,7 @@ mod tests {
             ssh: None,
             auth: Auth::Password,
             source: None,
+            mongo: None,
         }
     }
 
@@ -1340,6 +1481,8 @@ mod tests {
             Adapter::Mysql => 2,
             Adapter::Sqlite => 3,
             Adapter::Redshift => 4,
+            Adapter::Mongodb => 5,
+            Adapter::Documentdb => 6,
         };
         for (i, adapter) in Adapter::ALL.into_iter().enumerate() {
             assert_eq!(position(adapter), i);
@@ -1351,12 +1494,31 @@ mod tests {
         let labels = Adapter::ALL.map(Adapter::label);
         assert_eq!(
             labels,
-            ["PostgreSQL", "MariaDB", "MySQL", "SQLite", "Redshift"]
+            [
+                "PostgreSQL",
+                "MariaDB",
+                "MySQL",
+                "SQLite",
+                "Redshift",
+                "MongoDB",
+                "Amazon DocumentDB"
+            ]
         );
         let ports = Adapter::ALL.map(Adapter::default_port);
-        assert_eq!(ports, [5432, 3306, 3306, 0, 5439]);
+        assert_eq!(ports, [5432, 3306, 3306, 0, 5439, 27017, 27017]);
         let users = Adapter::ALL.map(Adapter::user_hint);
-        assert_eq!(users, ["postgres", "root", "root", "", "awsuser"]);
+        assert_eq!(
+            users,
+            [
+                "postgres",
+                "root",
+                "root",
+                "",
+                "awsuser",
+                "admin",
+                "docdbadmin"
+            ]
+        );
         for adapter in Adapter::ALL {
             // Only a server has a port, and a user.
             let info = adapter.info();
@@ -1376,6 +1538,8 @@ mod tests {
         assert_eq!(Adapter::Mysql.info().script, ScriptFlavor::Mysql);
         assert_eq!(Adapter::Sqlite.info().script, ScriptFlavor::Sqlite);
         assert_eq!(Adapter::Redshift.info().script, ScriptFlavor::Redshift);
+        assert_eq!(Adapter::Mongodb.info().script, ScriptFlavor::MongoShell);
+        assert_eq!(Adapter::Documentdb.info().script, ScriptFlavor::MongoShell);
         assert!(!Adapter::Redshift.is_file());
         assert_eq!(Adapter::Redshift.quote_ident(r#"a"b"#), r#""a""b""#);
         // Saved in every connections.json: it can never change.
@@ -1383,12 +1547,31 @@ mod tests {
             serde_json::to_string(&Adapter::Redshift).unwrap(),
             r#""redshift""#
         );
+        assert_eq!(
+            serde_json::to_string(&Adapter::Mongodb).unwrap(),
+            r#""mongodb""#
+        );
+        assert_eq!(
+            serde_json::to_string(&Adapter::Documentdb).unwrap(),
+            r#""documentdb""#
+        );
     }
 
     #[test]
     fn each_engine_has_its_family_and_place() {
         let families = Adapter::ALL.map(Adapter::family);
-        assert_eq!(families, [Family::Sql; 5]);
+        assert_eq!(
+            families,
+            [
+                Family::Sql,
+                Family::Sql,
+                Family::Sql,
+                Family::Sql,
+                Family::Sql,
+                Family::Document,
+                Family::Document
+            ]
+        );
         let places = Adapter::ALL.map(|a| a.info().place);
         assert_eq!(
             places,
@@ -1397,6 +1580,8 @@ mod tests {
                 Place::Server,
                 Place::Server,
                 Place::File,
+                Place::Server,
+                Place::Server,
                 Place::Server
             ]
         );
@@ -1420,6 +1605,8 @@ mod tests {
                 r#"SELECT * FROM `my"s``c`.`users` LIMIT 100"#,
                 r#"SELECT * FROM "my""s`c"."users" LIMIT 100"#,
                 r#"SELECT * FROM "my""s`c"."users" LIMIT 100"#,
+                r#"db.getSiblingDB("my\"s`c").getCollection("users").find({}).limit(100)"#,
+                r#"db.getSiblingDB("my\"s`c").getCollection("users").find({}).limit(100)"#,
             ]
         );
     }
@@ -1968,6 +2155,109 @@ mod tests {
             let back: Connection = serde_json::from_value(json).unwrap();
             assert_eq!(back.auth, auth);
         }
+    }
+
+    fn mongo(options: &str) -> Connection {
+        Connection {
+            adapter: Adapter::Mongodb,
+            port: 27017,
+            user: String::new(),
+            mongo: Some(MongoSettings {
+                srv: false,
+                options: options.into(),
+            }),
+            ..pg("m")
+        }
+    }
+
+    #[test]
+    fn mongo_settings_are_saved_only_when_set() {
+        let conn = mongo("replicaSet=rs0");
+        let json = serde_json::to_value(&conn).unwrap();
+        assert_eq!(json["adapter"], "mongodb");
+        assert_eq!(
+            json["mongo"],
+            serde_json::json!({"options": "replicaSet=rs0"})
+        );
+        assert_eq!(serde_json::from_value::<Connection>(json).unwrap(), conn);
+        let srv = Connection {
+            mongo: Some(MongoSettings {
+                srv: true,
+                options: String::new(),
+            }),
+            ..conn
+        };
+        let json = serde_json::to_value(&srv).unwrap();
+        assert_eq!(json["mongo"], serde_json::json!({"srv": true}));
+        // Other engines don't write the key at all.
+        assert!(
+            serde_json::to_value(pg("a"))
+                .unwrap()
+                .get("mongo")
+                .is_none()
+        );
+        let documentdb: Connection = serde_json::from_value(serde_json::json!({
+            "name": "d", "adapter": "documentdb", "host": "h", "port": 27017, "user": "u",
+        }))
+        .unwrap();
+        assert_eq!(documentdb.adapter, Adapter::Documentdb);
+        assert_eq!(documentdb.mongo, None);
+    }
+
+    #[test]
+    fn mongo_connections_are_validated() {
+        assert!(mongo("").validate().is_ok(), "no user is fine on MongoDB");
+        assert!(mongo("authSource=admin&replicaSet=rs0").validate().is_ok());
+        for options in [
+            "password=x",
+            "authSource=admin&PASSWORD=x",
+            "pass%77ord=x",
+            "pwd=x",
+            "tlsCertificateKeyFilePassword=x",
+            "proxyPassword=x",
+            "authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN:abc",
+            "authMechanismProperties=aws_session_token%3Aabc",
+        ] {
+            assert!(mongo(options).validate().is_err(), "{options}");
+        }
+        let iam = Connection {
+            auth: Auth::AwsIam(AwsIamAuth::default()),
+            tls: TlsMode::Require,
+            user: "u".into(),
+            ..mongo("")
+        };
+        assert!(iam.validate().unwrap_err().to_string().contains("IAM"));
+        let documentdb_iam = Connection {
+            adapter: Adapter::Documentdb,
+            ..iam
+        };
+        assert!(documentdb_iam.validate().is_err());
+        let tunnel = SshConfig {
+            host: "bastion".into(),
+            port: 22,
+            user: "ec2-user".into(),
+            key_path: String::new(),
+            fingerprint: "SHA256:abc".into(),
+        };
+        let mut srv = mongo("");
+        srv.mongo.as_mut().unwrap().srv = true;
+        assert!(srv.validate().is_ok());
+        srv.ssh = Some(tunnel.clone());
+        assert!(srv.validate().unwrap_err().to_string().contains("SRV"));
+        let mut tunneled = mongo("");
+        tunneled.ssh = Some(tunnel);
+        assert!(tunneled.validate().is_ok());
+        // Only document engines take these settings.
+        let mut wrong = pg("p");
+        wrong.mongo = Some(MongoSettings::default());
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn percent_decoding_reads_escapes_and_leaves_the_rest() {
+        assert_eq!(percent_decode("a%20b%3d"), "a b=");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
     }
 
     #[test]

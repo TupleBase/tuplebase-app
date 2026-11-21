@@ -1,5 +1,9 @@
 //! SQLite needs no server, so these always run.
 
+// Db::run dispatches to each family's runner, one more level of nested futures than
+// the compiler's default query depth allows here.
+#![recursion_limit = "256"]
+
 use serde_json::json;
 use sqlx::Executor;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -50,6 +54,7 @@ async fn database() -> (tempfile::TempDir, Connection) {
         ssh: None,
         auth: Default::default(),
         source: None,
+        mongo: None,
     };
     (dir, conn)
 }
