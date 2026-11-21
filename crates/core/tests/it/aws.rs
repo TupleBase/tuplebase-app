@@ -27,7 +27,8 @@ fn use_fake_aws() {
             ("AWS_ACCESS_KEY_ID", "test"),
             ("AWS_SECRET_ACCESS_KEY", "test"),
         ] {
-            // SAFETY: runs once, before anything reads the environment.
+            // SAFETY: only std::env reads these variables, and it locks against this write;
+            // no C code reads them. The tests share one process (see main.rs).
             unsafe { std::env::set_var(key, value) };
         }
         unsafe { std::env::remove_var("AWS_PROFILE") };
