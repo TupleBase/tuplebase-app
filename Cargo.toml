@@ -7,3 +7,10 @@ version = "0.11.1"
 edition = "2024"
 license = "MIT"
 publish = false
+
+# Line tables only: panics and backtraces still show file and line. Measured on Linux, a
+# clean build takes about 17% less time, a rebuild after a change in `app` about 40% less,
+# and target/ shrinks from 12 to 7 GB. For a debugger's local variables, see
+# docs/DEVELOPMENT.md. `cargo test` inherits this; release builds are unchanged.
+[profile.dev]
+debug = "line-tables-only"

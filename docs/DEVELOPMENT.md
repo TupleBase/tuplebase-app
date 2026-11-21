@@ -36,6 +36,30 @@ scripts/install.sh                                      # release build + instal
 scripts/uninstall.sh                                    # remove it; config and passwords stay
 ```
 
+## Build speed
+
+A clean build compiles several hundred crates and takes a few minutes; after that, a change in
+`app` rebuilds in seconds. To keep it that way:
+
+- **Keep incremental builds on.** Don't set `CARGO_INCREMENTAL=0` or `incremental = false`
+  for local work.
+- **Keep one `target/` per worktree; don't share a `CARGO_TARGET_DIR` between them.** It
+  would save rebuilding the dependencies in each new worktree, but Cargo stores this repo's own
+  crates under the same names in every worktree and judges them fresh by file times. After a
+  build in worktree B, a build or `cargo test` in worktree A can report `Finished` and still
+  run B's code. Instead, reuse a worktree for the next task rather than making a new one, and
+  delete its `target/` when you remove it. This applies to coding agents in parallel worktrees
+  too.
+- **Debug info is line tables only** (`[profile.dev]` in `Cargo.toml`): backtraces and panics
+  still show file and line, but a debugger can't show local variables. When you need them,
+  build with full debug info (this rebuilds every crate):
+
+  ```sh
+  CARGO_PROFILE_DEV_DEBUG=full cargo run -p tuplebase-app
+  ```
+
+- On x86_64 Linux, Rust already links with its own `rust-lld`; no linker setup is needed.
+
 ## Tests against real databases
 
 ```sh
