@@ -1,10 +1,6 @@
 //! Integration tests against the databases in `docker-compose.yml`.
 //! Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
 
-// Db::run dispatches to each family's runner, one more level of nested futures than
-// the compiler's default query depth allows here.
-#![recursion_limit = "256"]
-
 use serde_json::json;
 use tuplebase_core::config::{Adapter, Connection};
 use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind, ROLLED_BACK_NOTE};
@@ -33,7 +29,8 @@ fn connection(adapter: Adapter) -> Connection {
     static SET_PASSWORDS: std::sync::Once = std::sync::Once::new();
     SET_PASSWORDS.call_once(|| {
         for n in ["it-pg", "it-maria", "it-redshift-on-pg"] {
-            // SAFETY: runs once, before any connection reads the environment.
+            // SAFETY: only std::env reads these variables, and it locks against this write;
+            // no C code reads them. The tests share one process (see main.rs).
             unsafe { std::env::set_var(tuplebase_core::secrets::env_var_name(n), "dev") };
         }
     });

@@ -1,10 +1,6 @@
 //! SSH tunnels against the `sshd` service in `docker-compose.yml`.
 //! Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
 
-// Db::run dispatches to each family's runner, one more level of nested futures than
-// the compiler's default query depth allows here.
-#![recursion_limit = "256"]
-
 use std::process::Command;
 use std::sync::Once;
 
@@ -33,7 +29,8 @@ fn set_secrets() {
             "it-tunnel-wrong",
             "it-tunnel-key",
         ] {
-            // SAFETY: runs once, before any connection reads the environment.
+            // SAFETY: only std::env reads these variables, and it locks against this write;
+            // no C code reads them. The tests share one process (see main.rs).
             unsafe {
                 std::env::set_var(secrets::env_var_name(name), "dev");
                 if name != "it-tunnel-key" {
