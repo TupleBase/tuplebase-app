@@ -1,20 +1,21 @@
-//! Opening a connection's pool: its credentials, its SSH tunnel, and each engine's
-//! connect options, including what an RDS database needs (Amazon's certificate
-//! authorities, and on MySQL and MariaDB the clear-text plugin for IAM tokens).
+//! Opening a connection's pool: what every engine shares. Its credentials, its SSH
+//! tunnel, renewing an IAM token before it expires, Amazon's certificate authorities for
+//! an RDS host, and the pool's size and timeout.
 //!
-//! The rest of `db` asks for a pool and gets an [`Open`]; nothing here runs queries.
+//! Each engine's own connect options and pools are in its module (`postgres::connect`,
+//! ...), reached through [`Pool::open`] and [`Pool::renew`], so a new engine changes
+//! nothing here. The rest of `db` asks for a pool and gets an [`Open`]; nothing here runs
+//! queries.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::pool::PoolOptions;
 
-use super::{Open, Pool, SqlitePools};
+use super::{Open, Pool};
 use crate::cloud::aws;
-use crate::config::{Adapter, Auth, Connection, TlsMode};
+use crate::config::{Connection, TlsMode};
 use crate::credentials::{self, Expiry};
 use crate::{secrets, ssh};
 
@@ -44,8 +45,7 @@ pub(super) async fn connect(conn: &Connection) -> Result<Open> {
         Some(tunnel) => ("127.0.0.1".to_owned(), tunnel.local_port()),
         None => (target.host.clone(), target.port),
     };
-    let options = connect_options(&target, &host, port, password.as_deref());
-    let pool = open_pool(options)
+    let pool = Pool::open(&target, &host, port, password.as_deref())
         .await
         .with_context(|| format!("connecting to \"{}\"", conn.name))?;
     let refresher =
@@ -102,8 +102,7 @@ impl Refresher {
                 match credentials::resolve(&conn).await {
                     Ok(resolved) => {
                         let password = resolved.password.as_deref();
-                        let options = connect_options(&resolved.target, &host, port, password);
-                        pool.set_options(options);
+                        pool.renew(&resolved.target, &host, port, password);
                         let expiry = resolved.refresh.unwrap_or(expiry);
                         *shared.lock().unwrap() = Renewal::new(now, expiry);
                     }
@@ -176,149 +175,32 @@ impl Drop for Refresher {
     }
 }
 
-/// What a pool opens each of its connections with.
-enum Options {
-    Pg(PgConnectOptions),
-    My(MySqlConnectOptions),
-    Sqlite(SqliteConnectOptions),
+/// What every engine's pool is opened with: at most 4 connections, and 10 seconds to
+/// wait for one.
+pub(super) fn pool_options<DB: sqlx::Database>() -> PoolOptions<DB> {
+    PoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(10))
 }
 
 /// Certificate authorities to trust, besides the usual ones, when verifying `conn`'s
 /// certificate: Amazon's, for a database at an RDS host name. Decided by the host alone,
 /// not by where the connection was found: RDS certificates name only RDS hosts, and the
 /// host may come from a secret.
-fn extra_roots(conn: &Connection) -> Option<&'static [u8]> {
+pub(super) fn extra_roots(conn: &Connection) -> Option<&'static [u8]> {
     (conn.tls == TlsMode::Verify && aws::is_rds_host(&conn.host)).then_some(aws::RDS_CA_BUNDLE)
 }
 
-/// Options to reach `conn` at `host:port`, which is the local end of the tunnel when
-/// there is one.
-fn connect_options(conn: &Connection, host: &str, port: u16, password: Option<&str>) -> Options {
-    match conn.adapter {
-        Adapter::Postgres => Options::Pg(postgres_options(conn, host, port, password)),
-        Adapter::Mariadb | Adapter::Mysql => Options::My(mysql_options(conn, host, port, password)),
-        Adapter::Sqlite => Options::Sqlite(sqlite_options(conn)),
-    }
-}
-
-fn postgres_options(
-    conn: &Connection,
-    host: &str,
-    port: u16,
-    password: Option<&str>,
-) -> PgConnectOptions {
-    let mut opts = PgConnectOptions::new()
-        .host(host)
-        .port(port)
-        .username(&conn.user)
-        .ssl_mode(match conn.tls {
-            TlsMode::Prefer => PgSslMode::Prefer,
-            TlsMode::Require => PgSslMode::Require,
-            TlsMode::Verify => PgSslMode::VerifyFull,
-        });
-    if !conn.database.is_empty() {
-        opts = opts.database(&conn.database);
-    }
-    if let Some(pw) = password {
-        opts = opts.password(pw);
-    }
-    if let Some(pem) = extra_roots(conn) {
-        opts = opts.ssl_root_cert_from_pem(pem.to_vec());
-    }
-    opts
-}
-
-/// MySQL and MariaDB.
-fn mysql_options(
-    conn: &Connection,
-    host: &str,
-    port: u16,
-    password: Option<&str>,
-) -> MySqlConnectOptions {
-    let mut opts = MySqlConnectOptions::new()
-        .host(host)
-        .port(port)
-        .username(&conn.user)
-        .ssl_mode(match conn.tls {
-            TlsMode::Prefer => MySqlSslMode::Preferred,
-            TlsMode::Require => MySqlSslMode::Required,
-            TlsMode::Verify => MySqlSslMode::VerifyIdentity,
-        });
-    if !conn.database.is_empty() {
-        opts = opts.database(&conn.database);
-    }
-    if let Some(pw) = password {
-        opts = opts.password(pw);
-    }
-    if let Some(pem) = extra_roots(conn) {
-        opts = opts.ssl_ca_from_pem(pem.to_vec());
-    }
-    // RDS asks for an IAM token in clear text, inside the encryption that IAM requires.
-    // No other password may be sent that way, and never without encryption.
-    if matches!(conn.auth, Auth::AwsIam(_)) && conn.tls != TlsMode::Prefer {
-        opts = opts.enable_cleartext_plugin(true);
-    }
-    opts
-}
-
-fn sqlite_options(conn: &Connection) -> SqliteConnectOptions {
-    SqliteConnectOptions::new()
-        .filename(ssh::expand_home(&conn.database))
-        .read_only(conn.readonly)
-}
-
-impl Pool {
-    /// What new connections open with from now on. Options for another engine are
-    /// ignored; they can't come from the same connection.
-    fn set_options(&self, options: Options) {
-        match (self, options) {
-            (Pool::Pg(p), Options::Pg(o)) => p.set_connect_options(o),
-            (Pool::My(p), Options::My(o)) => p.set_connect_options(o),
-            (Pool::Sqlite(p), Options::Sqlite(o)) => {
-                p.read_only.set_connect_options(o.clone().read_only(true));
-                p.main.set_connect_options(o);
-            }
-            _ => {}
-        }
-    }
-}
-
-async fn open_pool(options: Options) -> Result<Pool> {
-    let timeout = Duration::from_secs(10);
-    Ok(match options {
-        Options::Pg(opts) => Pool::Pg(
-            PgPoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?,
-        ),
-        Options::Sqlite(opts) => {
-            let pool = || {
-                SqlitePoolOptions::new()
-                    .max_connections(4)
-                    .acquire_timeout(timeout)
-            };
-            Pool::Sqlite(SqlitePools {
-                read_only: pool().connect_lazy_with(opts.clone().read_only(true)),
-                main: pool().connect_with(opts).await?,
-            })
-        }
-        Options::My(opts) => Pool::My(
-            MySqlPoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?,
-        ),
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(super) mod tests {
+    use sqlx::postgres::PgPoolOptions;
 
-    fn rds(tls: TlsMode) -> Connection {
+    use super::super::postgres;
+    use super::*;
+    use crate::config::{Adapter, Auth};
+
+    /// A PostgreSQL database at an RDS host, signing in with a password.
+    pub(in crate::db) fn rds(tls: TlsMode) -> Connection {
         Connection {
             name: "orders".into(),
             folder: String::new(),
@@ -334,27 +216,6 @@ mod tests {
             auth: Auth::Password,
             source: None,
         }
-    }
-
-    #[test]
-    fn the_clear_text_plugin_is_only_for_iam_over_encryption() {
-        let cleartext = |auth: Auth, tls: TlsMode| {
-            let mut conn = rds(tls);
-            conn.adapter = Adapter::Mysql;
-            conn.auth = auth;
-            let options = mysql_options(&conn, "127.0.0.1", 3306, Some("x"));
-            format!("{options:?}").contains("enable_cleartext_plugin: true")
-        };
-        let iam = || {
-            Auth::AwsIam(crate::config::AwsIamAuth {
-                profile: String::new(),
-                region: "eu-west-1".into(),
-            })
-        };
-        assert!(cleartext(iam(), TlsMode::Require));
-        assert!(cleartext(iam(), TlsMode::Verify));
-        assert!(!cleartext(iam(), TlsMode::Prefer));
-        assert!(!cleartext(Auth::Password, TlsMode::Require));
     }
 
     #[test]
@@ -378,29 +239,21 @@ mod tests {
 
     #[tokio::test]
     async fn new_options_reach_the_pool_and_a_tunnel_keeps_its_address() {
-        let Options::Pg(first) = connect_options(&rds(TlsMode::Require), "127.0.0.1", 40000, None)
-        else {
-            panic!("PostgreSQL options expected");
-        };
+        let first = postgres::options(&rds(TlsMode::Require), "127.0.0.1", 40000, None);
         assert_eq!((first.get_host(), first.get_port()), ("127.0.0.1", 40000));
         let pool = Pool::Pg(PgPoolOptions::new().connect_lazy_with(first));
         let mut renamed = rds(TlsMode::Require);
         renamed.user = "reporting".into();
-        pool.set_options(connect_options(&renamed, "127.0.0.1", 40000, Some("token")));
+        pool.renew(&renamed, "127.0.0.1", 40000, Some("token"));
         let Pool::Pg(pg) = &pool else { unreachable!() };
         assert_eq!(pg.connect_options().get_username(), "reporting");
         assert_eq!(pg.connect_options().get_host(), "127.0.0.1");
-        // Options for another database are ignored rather than mixed in.
-        pool.set_options(Options::Sqlite(SqliteConnectOptions::new()));
-        assert_eq!(pg.connect_options().get_username(), "reporting");
     }
 
     #[tokio::test]
     async fn an_expired_password_makes_the_pool_unusable_so_connecting_says_why() {
         let conn = rds(TlsMode::Require);
-        let Options::Pg(options) = connect_options(&conn, "127.0.0.1", 40000, None) else {
-            panic!("PostgreSQL options expected");
-        };
+        let options = postgres::options(&conn, "127.0.0.1", 40000, None);
         let pool = Pool::Pg(PgPoolOptions::new().connect_lazy_with(options));
         let refresher = Refresher::start(
             &conn,
@@ -458,36 +311,5 @@ mod tests {
         let renewal = Renewal::new(start, short);
         assert!(!renewal.due(at(4 * 60 - 1)));
         assert!(renewal.due(at(4 * 60)));
-    }
-
-    /// Part of the read-only guard (S2): whatever the statement check lets through, the
-    /// read-only pool's connections can't write, also after the options change.
-    #[tokio::test]
-    async fn sqlite_read_only_work_runs_on_connections_that_cannot_write() {
-        use sqlx::Executor;
-        let dir = tempfile::tempdir().unwrap();
-        let options = SqliteConnectOptions::new()
-            .filename(dir.path().join("app.sqlite"))
-            .create_if_missing(true);
-        let opened = open_pool(Options::Sqlite(options.clone())).await.unwrap();
-        let renewed = open_pool(Options::Sqlite(options.clone())).await.unwrap();
-        renewed.set_options(Options::Sqlite(options));
-        let (Pool::Sqlite(opened), Pool::Sqlite(renewed)) = (opened, renewed) else {
-            unreachable!()
-        };
-        opened
-            .main
-            .execute("CREATE TABLE t (a); INSERT INTO t VALUES (1)")
-            .await
-            .unwrap();
-        for pools in [&opened, &renewed] {
-            let write = "PRAGMA query_only = OFF; DELETE FROM t";
-            assert!(pools.read_only.execute(write).await.is_err());
-            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
-                .fetch_one(&pools.read_only)
-                .await
-                .unwrap();
-            assert_eq!(rows, 1);
-        }
     }
 }
