@@ -131,7 +131,7 @@ AWS profile rules as above:
 - a Serverless workgroup:
   [`GetCredentials`](https://docs.aws.amazon.com/redshift-serverless/latest/APIReference/API_GetCredentials.html)
   for the connection's database. AWS chooses the user from your IAM identity (`IAM:<user>` or
-  `IAMR:<role>`), so the connection's own user is not used.
+  `IAMR:<role>`), so the connection's own user is not used, and the form doesn't ask for one.
 
 Which cluster or workgroup to ask for, and the region when none is set, are read from the
 host, which must be its own endpoint: `<cluster>.<id>.<region>.redshift.amazonaws.com` or
@@ -201,7 +201,13 @@ private one, which you reach through an SSH tunnel. Its credentials are:
 
 A Redshift cluster fills in its master user and database, `dev` unless it names another; a
 Serverless workgroup those of its namespace. A service your AWS identity may not list, or that
-doesn't answer in a region, is named in red beside what the others found.
+doesn't answer in a region, is counted in one line above what the others found; **Show** names
+each one.
+
+The list is one line per database, by region then name. Type in the search box above it to
+filter by name, engine, version, region or endpoint; Up and Down move through the list, Enter
+or a double-click fills in the form, and Escape empties the search. **Change**, above the
+filled-in form, goes back to the list as you left it.
 
 An Aurora cluster is listed once, at its writer endpoint; the note names its reader
 endpoint. A database that isn't publicly accessible needs an SSH tunnel to a host in its
