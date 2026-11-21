@@ -83,6 +83,33 @@ impl QueryResult {
     }
 }
 
+/// The read-only guard for one Mongo shell command (S2): the command allowlist in
+/// [`safety::check_mongo`], then [`mongo_shell::Command::as_read`], whose [`ReadOp`]
+/// can't express a write. Typed commands in read-only mode and the structured
+/// `find` and `aggregate` requests all pass through here.
+///
+/// [`ReadOp`]: mongo_shell::ReadOp
+fn mongo_read_only(command: &mongo_shell::Command) -> Result<mongo_shell::ReadOp, String> {
+    safety::check_mongo(command)?;
+    command
+        .as_read()
+        .ok_or_else(|| "read-only: this command may write".to_owned())
+}
+
+/// Refuses `tool` on a connection whose engine isn't a document one.
+fn document_only(conn: &Connection, tool: &str) -> Result<()> {
+    if conn.adapter.family() != Family::Document {
+        bail!(
+            "{tool} works only on MongoDB and DocumentDB connections; \"{}\" is {}, so use \
+             run_query with {}",
+            conn.name,
+            conn.adapter.label(),
+            conn.adapter.query_language(),
+        );
+    }
+    Ok(())
+}
+
 /// Said when a run left a transaction open and it was rolled back, so nothing it
 /// changed in it was kept. The connection goes back to a pool, so a transaction can't
 /// span runs.
@@ -474,6 +501,22 @@ impl Db {
         })
     }
 
+    /// [`Db::server_read_only`] without connecting: what the open connection found, or
+    /// `None` when `conn` isn't open (or is being opened) right now.
+    pub async fn known_server_read_only(&self, conn: &Connection) -> Option<bool> {
+        let slot = self.slots.lock().await.get(&conn.name).cloned()?;
+        let slot = tokio::time::timeout(BUSY_SLOT_WAIT, slot.lock())
+            .await
+            .ok()?;
+        let open = slot.open.as_ref().filter(|open| open.is_usable_for(conn))?;
+        match &open.pool {
+            Pool::Pg(_) | Pool::My(_) | Pool::Sqlite(_) | Pool::Redshift(_) | Pool::Dynamo(_) => {
+                None
+            }
+            Pool::Mongo(p) => p.server_read_only,
+        }
+    }
+
     /// Like [`Db::test`], but closes a connection that no longer works.
     pub async fn check(&self, conn: &Connection) -> Result<()> {
         let result = self.test(conn).await;
@@ -746,12 +789,10 @@ impl Db {
             .map(|(i, s)| mongo_shell::parse_command(s).map_err(|e| numbered(i, e.to_string())))
             .collect::<Result<Vec<_>>>()?;
         let reads = if opts.read_only || conn.readonly {
-            let reads = commands.iter().enumerate().map(|(i, command)| {
-                safety::check_mongo(command).map_err(|e| numbered(i, e))?;
-                command
-                    .as_read()
-                    .ok_or_else(|| numbered(i, "read-only: this command may write".into()))
-            });
+            let reads = commands
+                .iter()
+                .enumerate()
+                .map(|(i, command)| mongo_read_only(command).map_err(|e| numbered(i, e)));
             Some(reads.collect::<Result<Vec<_>>>()?)
         } else {
             None
@@ -763,6 +804,49 @@ impl Db {
             Some(reads) => mongo::run_reads(&pool, reads, opts.max_rows).await,
             None => mongo::run(&pool, commands, opts.max_rows).await,
         }
+    }
+
+    /// Runs a `find` given as structured JSON, on MongoDB or DocumentDB only. Always
+    /// read-only, even on a connection that may write: the request is built into a
+    /// [`mongo_shell::Command`] and passes the same guard (S2) as a typed command in
+    /// read-only mode, then runs as one typed read call.
+    pub async fn mongo_find(
+        &self,
+        conn: &Connection,
+        request: &mongo_shell::FindRequest,
+        max_rows: usize,
+    ) -> Result<QueryResult> {
+        document_only(conn, "find")?;
+        let command = request.to_command().map_err(|e| anyhow!(e))?;
+        self.run_mongo_read(conn, &command, max_rows).await
+    }
+
+    /// Runs an `aggregate` given as structured JSON, on MongoDB or DocumentDB only.
+    /// Always read-only, like [`Db::mongo_find`].
+    pub async fn mongo_aggregate(
+        &self,
+        conn: &Connection,
+        request: &mongo_shell::AggregateRequest,
+        max_rows: usize,
+    ) -> Result<QueryResult> {
+        document_only(conn, "aggregate")?;
+        let command = request.to_command().map_err(|e| anyhow!(e))?;
+        self.run_mongo_read(conn, &command, max_rows).await
+    }
+
+    /// Checks `command` with the read-only guard before the connection is opened, then
+    /// runs it as one typed read.
+    async fn run_mongo_read(
+        &self,
+        conn: &Connection,
+        command: &mongo_shell::Command,
+        max_rows: usize,
+    ) -> Result<QueryResult> {
+        let read = mongo_read_only(command).map_err(|e| anyhow!(e))?;
+        let Pool::Mongo(pool) = self.pool(conn).await? else {
+            bail!("\"{}\" is not a MongoDB connection", conn.name);
+        };
+        Ok(mongo::run_reads(&pool, vec![read], max_rows).await?.result)
     }
 
     /// Runs PartiQL statements on DynamoDB, each alone with `ExecuteStatement`.
@@ -1142,6 +1226,123 @@ pub(super) mod tests {
         let _connecting = slot.lock().await;
         let open = tokio::time::timeout(Duration::from_secs(5), db.open_connections()).await;
         assert_eq!(open, Ok(HashSet::new()));
+    }
+
+    fn connection(adapter: Adapter) -> Connection {
+        serde_json::from_value(serde_json::json!({
+            "name": format!("{adapter:?}"),
+            "adapter": adapter,
+            // Nothing listens here: a test that got past the guard would fail to connect.
+            "host": "127.0.0.1",
+            "port": 9,
+            "user": "u",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn structured_mongo_requests_work_only_on_document_engines() {
+        let db = Db::new();
+        let find = mongo_shell::FindRequest {
+            collection: "users".into(),
+            ..Default::default()
+        };
+        let aggregate = mongo_shell::AggregateRequest {
+            database: None,
+            collection: "users".into(),
+            pipeline: serde_json::json!([]),
+        };
+        for adapter in Adapter::ALL {
+            if adapter.family() == Family::Document {
+                continue;
+            }
+            let conn = connection(adapter);
+            let e = db.mongo_find(&conn, &find, 10).await.unwrap_err();
+            assert!(
+                e.to_string().contains("only on MongoDB"),
+                "{adapter:?}: {e}"
+            );
+            assert!(e.to_string().contains(adapter.query_language()), "{e}");
+            let e = db.mongo_aggregate(&conn, &aggregate, 10).await.unwrap_err();
+            assert!(
+                e.to_string().contains("only on MongoDB"),
+                "{adapter:?}: {e}"
+            );
+        }
+        assert!(db.open_connections().await.is_empty(), "nothing was opened");
+    }
+
+    #[tokio::test]
+    async fn structured_mongo_requests_pass_the_guard_before_connecting() {
+        let db = Db::new();
+        for adapter in [Adapter::Mongodb, Adapter::Documentdb] {
+            let conn = connection(adapter);
+            for pipeline in [
+                serde_json::json!([{"$out": "copy"}]),
+                serde_json::json!([{"$merge": {"into": "copy"}}]),
+                serde_json::json!([{"$facet": {"a": [{"$out": "copy"}]}}]),
+                serde_json::json!([{"$match": {"$where": "true"}}]),
+                serde_json::json!([{"$project": {"x": {"$function": {}}}}]),
+                serde_json::json!([{"$group": {"_id": 1, "x": {"$accumulator": {}}}}]),
+                serde_json::json!([{"$match": {"$_internalX": 1}}]),
+                serde_json::json!([{"$match": {"$_": 1}}]),
+                serde_json::json!([{"$match": {}, "$limit": 1}]),
+                serde_json::json!([{"$collStats": {}}]),
+            ] {
+                let request = mongo_shell::AggregateRequest {
+                    database: None,
+                    collection: "users".into(),
+                    pipeline: pipeline.clone(),
+                };
+                let e = db.mongo_aggregate(&conn, &request, 10).await.unwrap_err();
+                assert!(e.to_string().starts_with("read-only"), "{pipeline}: {e}");
+            }
+            for (filter, projection, sort) in [
+                (serde_json::json!({"$where": "true"}), None, None),
+                (serde_json::json!({"$expr": {"$function": {}}}), None, None),
+                (
+                    serde_json::json!({}),
+                    Some(serde_json::json!({"x": {"$function": {}}})),
+                    None,
+                ),
+                (
+                    serde_json::json!({}),
+                    None,
+                    Some(serde_json::json!({"$_internal": 1})),
+                ),
+            ] {
+                let request = mongo_shell::FindRequest {
+                    collection: "users".into(),
+                    filter: Some(filter.clone()),
+                    projection,
+                    sort,
+                    ..Default::default()
+                };
+                let e = db.mongo_find(&conn, &request, 10).await.unwrap_err();
+                assert!(e.to_string().starts_with("read-only"), "{filter}: {e}");
+            }
+        }
+        assert!(db.open_connections().await.is_empty(), "nothing was opened");
+    }
+
+    #[test]
+    fn the_mongo_guard_refuses_keys_holding_a_nul() {
+        let mut filter = mongodb::bson::Document::new();
+        filter.insert("a\0", 1);
+        let command = mongo_shell::Command::Collection {
+            target: mongo_shell::Target {
+                database: None,
+                collection: "users".into(),
+            },
+            op: mongo_shell::Op::Find {
+                filter,
+                projection: None,
+                sort: None,
+                limit: None,
+                skip: None,
+            },
+        };
+        assert!(mongo_read_only(&command).unwrap_err().contains("NUL"));
     }
 
     pub(super) fn param(mode: ParamMode, name: &str, data_type: &str) -> Parameter {

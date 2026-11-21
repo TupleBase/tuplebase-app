@@ -37,7 +37,7 @@ scripts/                   install, packaging, release helpers
 | `secrets`      | passwords in the OS credential store                      | nothing                                                 |
 | `state`        | unsaved SQL, query history, panel sizes, last search, open tabs | `config`                                                |
 | `safety`       | statement classification for the read-only guard, the Mongo shell command check, and the PartiQL check | `config` `mongo_shell`  |
-| `mongo_shell`  | the Mongo shell commands TupleBase reads: parser, command tree, splitting scripts | nothing                                 |
+| `mongo_shell`  | the Mongo shell commands TupleBase reads: parser, command tree, splitting scripts, and the structured `find` and `aggregate` requests agents send, built into the same tree | nothing |
 | `ssh`          | SSH tunnels                                               | `config`                                                |
 | `cloud`        | cloud providers, one file each (`cloud/aws.rs`)           | `config`                                                |
 | `credentials`  | the password each auth method signs in with               | `config` `secrets` `cloud`                              |

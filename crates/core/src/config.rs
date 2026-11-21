@@ -124,6 +124,17 @@ pub enum Family {
     KeyValue,
 }
 
+impl Family {
+    /// Its name for agents and files: `sql`, `document` or `key-value`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Sql => "sql",
+            Family::Document => "document",
+            Family::KeyValue => "key-value",
+        }
+    }
+}
+
 /// Where an engine's data lives, which decides the fields a connection needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
@@ -301,6 +312,19 @@ impl Adapter {
 
     pub fn label(self) -> &'static str {
         self.info().label
+    }
+
+    /// The language its queries are written in, as agents are told: `sql`,
+    /// `mongo-shell` or `partiql`.
+    pub fn query_language(self) -> &'static str {
+        match self.info().script {
+            ScriptFlavor::Postgres
+            | ScriptFlavor::Redshift
+            | ScriptFlavor::Mysql
+            | ScriptFlavor::Sqlite => "sql",
+            ScriptFlavor::MongoShell => "mongo-shell",
+            ScriptFlavor::PartiQl => "partiql",
+        }
     }
 
     /// Quotes an identifier for this database.

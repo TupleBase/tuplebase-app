@@ -1608,6 +1608,210 @@ fn parse_date(text: &str) -> Option<DateTime> {
         .or_else(|| DateTime::parse_rfc3339_str(format!("{text}Z")).ok())
 }
 
+/// The most documents a structured [`FindRequest`] asks the server for. Results are
+/// also capped by the caller's row limit, so this only bounds what an agent can ask.
+pub const MAX_FIND_LIMIT: i64 = 100_000;
+
+/// A `find` given as structured JSON rather than shell text, for agents: the same
+/// [`Command`] that `db.getSiblingDB(database).getCollection(collection).find(filter,
+/// projection).sort(sort).limit(limit)` parses to. Values are plain JSON, plus the
+/// extended JSON forms in [`json_to_bson`]. Building it checks names and shapes only;
+/// whether it may run read-only is decided on the built [`Command`], by the same guard
+/// as a typed command.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FindRequest {
+    pub database: Option<String>,
+    pub collection: String,
+    pub filter: Option<serde_json::Value>,
+    pub projection: Option<serde_json::Value>,
+    pub sort: Option<serde_json::Value>,
+    /// From 1 up; above [`MAX_FIND_LIMIT`] it is lowered to it.
+    pub limit: Option<i64>,
+}
+
+/// An `aggregate` given as structured JSON: the [`Command`] that
+/// `db.getSiblingDB(database).getCollection(collection).aggregate(pipeline)` parses to,
+/// with no options. Like [`FindRequest`], it is checked by the guard once built.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AggregateRequest {
+    pub database: Option<String>,
+    pub collection: String,
+    /// An array of stage documents.
+    pub pipeline: serde_json::Value,
+}
+
+impl FindRequest {
+    pub fn to_command(&self) -> Result<Command, String> {
+        let target = request_target(self.database.as_deref(), &self.collection)?;
+        let filter = match &self.filter {
+            Some(value) => json_document(value, "filter")?,
+            None => Document::new(),
+        };
+        let projection = self
+            .projection
+            .as_ref()
+            .map(|value| json_document(value, "projection"))
+            .transpose()?;
+        let sort = self
+            .sort
+            .as_ref()
+            .map(|value| json_document(value, "sort"))
+            .transpose()?;
+        let limit = match self.limit {
+            None => None,
+            Some(n) if n < 1 => return Err("limit must be 1 or more".into()),
+            Some(n) => Some(n.min(MAX_FIND_LIMIT)),
+        };
+        Ok(Command::Collection {
+            target,
+            op: Op::Find {
+                filter,
+                projection,
+                sort,
+                limit,
+                skip: None,
+            },
+        })
+    }
+}
+
+impl AggregateRequest {
+    pub fn to_command(&self) -> Result<Command, String> {
+        let target = request_target(self.database.as_deref(), &self.collection)?;
+        let serde_json::Value::Array(stages) = &self.pipeline else {
+            return Err("pipeline must be a JSON array of stage objects".into());
+        };
+        let pipeline = stages
+            .iter()
+            .enumerate()
+            .map(|(i, stage)| json_document(stage, &format!("pipeline stage {}", i + 1)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Command::Collection {
+            target,
+            op: Op::Aggregate {
+                pipeline,
+                options: AggregateOptions::default(),
+            },
+        })
+    }
+}
+
+/// The longest database or collection name a request may name; the server's own limits
+/// are lower.
+const MAX_NAME_LEN: usize = 255;
+
+/// A request's collection, after checking both names: not empty, no `$` (which could
+/// only reach a command namespace such as `$cmd`), no NUL. A database name also holds
+/// none of the characters the server refuses in one (`/\. "`).
+fn request_target(database: Option<&str>, collection: &str) -> Result<Target, String> {
+    fn check(name: &str, what: &str, also: &[char]) -> Result<(), String> {
+        if name.is_empty() {
+            return Err(format!("the {what} name is empty"));
+        }
+        if name.len() > MAX_NAME_LEN {
+            return Err(format!("the {what} name is too long"));
+        }
+        if let Some(c) = name
+            .chars()
+            .find(|c| *c == '$' || *c == '\0' || also.contains(c))
+        {
+            return Err(format!("the {what} name can't hold {c:?}"));
+        }
+        Ok(())
+    }
+    if let Some(database) = database {
+        check(database, "database", &['/', '\\', '.', ' ', '"'])?;
+    }
+    check(collection, "collection", &[])?;
+    Ok(Target {
+        database: database.map(str::to_owned),
+        collection: collection.to_owned(),
+    })
+}
+
+/// `value` as a document, or an error naming `what` when it isn't a JSON object.
+fn json_document(value: &serde_json::Value, what: &str) -> Result<Document, String> {
+    match json_to_bson(value).map_err(|e| format!("{what}: {e}"))? {
+        Bson::Document(doc) => Ok(doc),
+        _ => Err(format!("{what} must be a JSON object")),
+    }
+}
+
+/// JSON to BSON, for structured requests. Plain JSON as is: a whole number becomes a
+/// 32-bit integer when it fits, else a 64-bit one; other numbers become doubles. These
+/// one-key objects stand for the shell's helpers, as in MongoDB's extended JSON:
+/// `{"$oid": "<24 hex digits>"}` (`ObjectId`), `{"$date": "<RFC 3339>" | <ms>}`
+/// (`ISODate`), `{"$numberLong": "<n>"}` (`NumberLong`) and
+/// `{"$numberDecimal": "<n>"}` (`NumberDecimal`). No other extended JSON is read, so
+/// nothing here makes JavaScript code or any type the shell parser can't; keys are
+/// refused where the parser refuses them (a NUL), and the guard checks the result.
+pub fn json_to_bson(value: &serde_json::Value) -> Result<Bson, String> {
+    use serde_json::Value;
+    Ok(match value {
+        Value::Null => Bson::Null,
+        Value::Bool(b) => Bson::Boolean(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(i) => i32::try_from(i).map_or(Bson::Int64(i), Bson::Int32),
+            None => Bson::Double(
+                n.as_f64()
+                    .ok_or_else(|| format!("the number {n} doesn't fit"))?,
+            ),
+        },
+        Value::String(s) => Bson::String(s.clone()),
+        Value::Array(items) => {
+            Bson::Array(items.iter().map(json_to_bson).collect::<Result<_, _>>()?)
+        }
+        Value::Object(map) => {
+            if map.len() == 1
+                && let Some((key, inner)) = map.iter().next()
+                && let Some(helper) = json_helper(key, inner)
+            {
+                return helper;
+            }
+            let mut doc = Document::new();
+            for (key, inner) in map {
+                if key.contains('\0') {
+                    return Err("a key can't hold a NUL".into());
+                }
+                doc.insert(key.clone(), json_to_bson(inner)?);
+            }
+            Bson::Document(doc)
+        }
+    })
+}
+
+/// The value of an extended JSON helper object `{key: value}`, or `None` when `key`
+/// names no helper [`json_to_bson`] reads.
+fn json_helper(key: &str, value: &serde_json::Value) -> Option<Result<Bson, String>> {
+    use serde_json::Value;
+    let text = value.as_str();
+    Some(match key {
+        "$oid" => text
+            .and_then(|s| ObjectId::parse_str(s).ok())
+            .map(Bson::ObjectId)
+            .ok_or_else(|| "$oid takes 24 hexadecimal digits".into()),
+        "$date" => match value {
+            Value::Number(n) => n
+                .as_i64()
+                .map(|ms| Bson::DateTime(DateTime::from_millis(ms))),
+            Value::String(s) => parse_date(s).map(Bson::DateTime),
+            _ => None,
+        }
+        .ok_or_else(|| {
+            "$date takes a date such as \"2024-01-31T12:00:00Z\" or milliseconds".into()
+        }),
+        "$numberLong" => text
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .map(Bson::Int64)
+            .ok_or_else(|| "$numberLong takes a whole number as a string".into()),
+        "$numberDecimal" => text
+            .and_then(|s| Decimal128::from_str(s.trim()).ok())
+            .map(Bson::Decimal128)
+            .ok_or_else(|| "$numberDecimal takes a number as a string".into()),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use mongodb::bson::doc;
@@ -2016,5 +2220,148 @@ mod tests {
         let e = err("db.a.find({a: 1 / 2})");
         assert!(e.message.contains("expected `,` or `}`"), "{e}");
         assert_eq!(e.column, 17);
+    }
+
+    #[test]
+    fn a_structured_find_builds_the_command_the_shell_text_parses_to() {
+        let request = FindRequest {
+            database: Some("shop".into()),
+            collection: "orders".into(),
+            filter: Some(serde_json::json!({
+                "_id": {"$oid": "65a1b2c3d4e5f60718293a4b"},
+                "at": {"$gte": {"$date": "2024-01-31T12:00:00Z"}},
+                "n": {"$numberLong": "5"},
+                "big": 3_000_000_000_i64,
+                "d": {"$numberDecimal": "1.5"},
+                "x": 1.5,
+            })),
+            projection: Some(serde_json::json!({"n": 1})),
+            sort: Some(serde_json::json!({"at": -1})),
+            limit: Some(5),
+        };
+        let text = "db.getSiblingDB('shop').getCollection('orders').find({\
+            _id: ObjectId('65a1b2c3d4e5f60718293a4b'), \
+            at: {$gte: ISODate('2024-01-31T12:00:00Z')}, n: NumberLong(5), big: 3000000000, \
+            d: NumberDecimal('1.5'), x: 1.5}, {n: 1}).sort({at: -1}).limit(5)";
+        assert_eq!(request.to_command().unwrap(), parse(text));
+        let empty = FindRequest {
+            collection: "orders".into(),
+            ..Default::default()
+        };
+        assert_eq!(empty.to_command().unwrap(), parse("db.orders.find()"));
+    }
+
+    #[test]
+    fn a_structured_aggregate_builds_the_command_the_shell_text_parses_to() {
+        let request = AggregateRequest {
+            database: None,
+            collection: "orders".into(),
+            pipeline: serde_json::json!([{"$match": {"a": 1}}, {"$count": "n"}]),
+        };
+        assert_eq!(
+            request.to_command().unwrap(),
+            parse("db.orders.aggregate([{$match: {a: 1}}, {$count: 'n'}])")
+        );
+    }
+
+    #[test]
+    fn structured_requests_refuse_bad_names_shapes_and_limits() {
+        let find = |database: Option<&str>, collection: &str| FindRequest {
+            database: database.map(str::to_owned),
+            collection: collection.into(),
+            ..Default::default()
+        };
+        for (database, collection) in [
+            (None, ""),
+            (None, "$cmd"),
+            (None, "a$b"),
+            (None, "a\0b"),
+            (Some(""), "a"),
+            (Some("$external"), "a"),
+            (Some("a\0"), "a"),
+            (Some("a.b"), "a"),
+            (Some("a/b"), "a"),
+        ] {
+            assert!(
+                find(database, collection).to_command().is_err(),
+                "{database:?} {collection:?}"
+            );
+        }
+        let long = "a".repeat(MAX_NAME_LEN + 1);
+        assert!(find(None, &long).to_command().is_err());
+        assert!(find(None, "system.views").to_command().is_ok());
+
+        for limit in [0, -1, i64::MIN] {
+            let request = FindRequest {
+                limit: Some(limit),
+                ..find(None, "a")
+            };
+            assert!(request.to_command().is_err(), "{limit}");
+        }
+        let huge = FindRequest {
+            limit: Some(i64::MAX),
+            ..find(None, "a")
+        };
+        let Command::Collection {
+            op: Op::Find { limit, .. },
+            ..
+        } = huge.to_command().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(limit, Some(MAX_FIND_LIMIT));
+
+        for filter in [
+            serde_json::json!([]),
+            serde_json::json!("x"),
+            serde_json::json!(1),
+        ] {
+            let request = FindRequest {
+                filter: Some(filter.clone()),
+                ..find(None, "a")
+            };
+            assert!(request.to_command().is_err(), "{filter}");
+        }
+        for pipeline in [
+            serde_json::json!({"$match": {}}),
+            serde_json::json!([1]),
+            serde_json::json!([[]]),
+            serde_json::json!(null),
+        ] {
+            let request = AggregateRequest {
+                database: None,
+                collection: "a".into(),
+                pipeline: pipeline.clone(),
+            };
+            assert!(request.to_command().is_err(), "{pipeline}");
+        }
+    }
+
+    #[test]
+    fn json_reads_only_the_shells_helpers_and_never_makes_code() {
+        use serde_json::json;
+        for value in [
+            json!({"$code": "function() {}"}),
+            json!({"$code": "x", "$scope": {}}),
+            json!({"$dbPointer": {"$ref": "a", "$id": {"$oid": "65a1b2c3d4e5f60718293a4b"}}}),
+            json!({"$symbol": "x"}),
+            json!({"$binary": {"base64": "", "subType": "00"}}),
+        ] {
+            let bson = json_to_bson(&value).unwrap();
+            assert!(matches!(bson, Bson::Document(_)), "{value}: {bson:?}");
+        }
+        assert!(json_to_bson(&json!({"a\u{0}b": 1})).is_err());
+        assert!(json_to_bson(&json!([{"x": {"k\u{0}": 1}}])).is_err());
+        assert!(json_to_bson(&json!({"$oid": "zz"})).is_err());
+        assert!(json_to_bson(&json!({"$date": true})).is_err());
+        // With a second key it is a document, as in the shell, and the guard reads it.
+        assert!(matches!(
+            json_to_bson(&json!({"$oid": "65a1b2c3d4e5f60718293a4b", "x": 1})).unwrap(),
+            Bson::Document(_)
+        ));
+        assert_eq!(
+            json_to_bson(&json!(u64::MAX)).unwrap(),
+            Bson::Double(u64::MAX as f64)
+        );
     }
 }
