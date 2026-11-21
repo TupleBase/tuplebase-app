@@ -1134,6 +1134,8 @@ impl ConnectionsDialog {
             .iter()
             .filter(|c| shown.connected.contains(&c.name))
             .count();
+        // Connections a newer version added, which this one keeps but can't show.
+        let unsupported = shown.config.unsupported_count();
         h_flex()
             .w_full()
             .flex_none()
@@ -1160,7 +1162,11 @@ impl ConnectionsDialog {
                     .text_color(muted)
                     .child(text(format!("{saved} saved ·")))
                     .child(status_dot(Light::Connected, success, muted))
-                    .child(text(format!("{connected} connected"))),
+                    .child(text(format!("{connected} connected")))
+                    .when(unsupported > 0, |d| {
+                        let verb = if unsupported == 1 { "needs" } else { "need" };
+                        d.child(text(format!("· {unsupported} {verb} a newer TupleBase")))
+                    }),
             )
             .child(div().ml_auto().child(dialogs::close_button()))
     }
@@ -1738,6 +1744,25 @@ mod tests {
                 text_in(window, "connections-summary"),
                 "3 saved · 1 connected"
             );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_header_counts_connections_a_newer_version_added(cx: &mut TestAppContext) {
+        let mut file = serde_json::to_value(config_with_folders()).unwrap();
+        file["connections"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "name": "future", "adapter": "oracle" }));
+        let config: Config = serde_json::from_value(file).unwrap();
+        let (handle, _) = open(config, cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, _| {
+            assert_eq!(
+                text_in(window, "connections-summary"),
+                "3 saved · 0 connected · 1 needs a newer TupleBase"
+            );
+            assert!(!shows(window, "conn-future"));
         });
     }
 

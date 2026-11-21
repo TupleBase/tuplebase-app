@@ -12,7 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeSeq as _;
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::{Map, Value};
 
 /// Separates folder levels in a stored path, e.g. `RGG/storefront/bear`.
 const FOLDER_SEPARATOR: char = '/';
@@ -586,31 +588,167 @@ impl<'a> FolderNode<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The settings in [`CONFIG_FILE`]. Read through [`ConfigFile`] and written by its own
+/// [`Serialize`], so that what this version doesn't understand is kept (see [`Kept`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "ConfigFile")]
 pub struct Config {
     /// The file format: [`VERSION_IAM`] once a connection uses an IAM token, which older
     /// versions of the app can't read, so that they refuse the file instead of failing to
     /// parse it; otherwise [`VERSION_BASE`]. Kept up to date by [`Config::upsert`] and
     /// [`Config::remove`].
     pub version: u32,
-    /// Sidebar folder paths, so that empty folders are kept.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Sidebar folder paths, so that empty folders are kept. Left out of the file when
+    /// empty.
     pub folders: Vec<String>,
-    #[serde(default)]
+    /// The connections this version understands.
     pub connections: Vec<Connection>,
     /// Ask GitHub for a newer version at startup.
-    #[serde(default = "enabled")]
     pub check_for_updates: bool,
     /// Size of the app's text, in pixels.
-    #[serde(default = "default_font_size")]
     pub font_size: u8,
-    /// Light or dark colors, or whichever the system uses.
-    #[serde(default, skip_serializing_if = "Appearance::is_system")]
+    /// Light or dark colors, or whichever the system uses. Left out of the file for
+    /// [`Appearance::System`].
     pub appearance: Appearance,
+    /// What the file holds that this version doesn't understand, written back unchanged.
+    pub kept: Kept,
     /// Why this config must not be saved: the file it stands in for couldn't be read, and
     /// saving would delete what is in it. Never in the file.
-    #[serde(skip)]
     pub unsaved_because: Option<String>,
+}
+
+/// What a config file holds that this version doesn't understand, such as a connection
+/// a newer version added with an engine or sign-in this one doesn't know. It is never
+/// shown or connected to, and is written back unchanged, so that the newer version still
+/// finds it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Kept {
+    /// Each connection this version can't read, as the file held it, with its place
+    /// among all the connections there.
+    connections: Vec<(usize, Value)>,
+    /// The file's version, when it had such connections: one of them may need it, so
+    /// saving never writes a lower one. 0 otherwise.
+    version: u32,
+    /// Top-level settings this version doesn't know.
+    fields: Map<String, Value>,
+}
+
+impl Kept {
+    /// The names of the connections kept, where they have one.
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.connections
+            .iter()
+            .filter_map(|(_, raw)| raw.get("name")?.as_str())
+    }
+}
+
+/// [`Config`] as the file holds it, with each connection still raw: one this version
+/// can't read is kept instead of making the whole file unreadable.
+#[derive(Deserialize)]
+struct ConfigFile {
+    version: u32,
+    #[serde(default)]
+    folders: Vec<String>,
+    #[serde(default)]
+    connections: Vec<Value>,
+    #[serde(default = "enabled")]
+    check_for_updates: bool,
+    #[serde(default = "default_font_size")]
+    font_size: u8,
+    #[serde(default)]
+    appearance: Appearance,
+    #[serde(flatten)]
+    fields: Map<String, Value>,
+}
+
+impl From<ConfigFile> for Config {
+    fn from(file: ConfigFile) -> Self {
+        let mut connections = Vec::new();
+        let mut unsupported = Vec::new();
+        for (place, raw) in file.connections.into_iter().enumerate() {
+            match Connection::deserialize(&raw) {
+                Ok(conn) => connections.push(conn),
+                Err(_) => unsupported.push((place, raw)),
+            }
+        }
+        let version = if unsupported.is_empty() {
+            0
+        } else {
+            file.version
+        };
+        Self {
+            version: file.version,
+            folders: file.folders,
+            connections,
+            check_for_updates: file.check_for_updates,
+            font_size: file.font_size,
+            appearance: file.appearance,
+            kept: Kept {
+                connections: unsupported,
+                version,
+                fields: file.fields,
+            },
+            unsaved_because: None,
+        }
+    }
+}
+
+impl Serialize for Config {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct File<'a> {
+            version: u32,
+            #[serde(skip_serializing_if = "no_folders")]
+            folders: &'a [String],
+            connections: AllConnections<'a>,
+            check_for_updates: bool,
+            font_size: u8,
+            #[serde(skip_serializing_if = "Appearance::is_system")]
+            appearance: Appearance,
+            #[serde(flatten)]
+            fields: &'a Map<String, Value>,
+        }
+        fn no_folders(folders: &&[String]) -> bool {
+            folders.is_empty()
+        }
+        File {
+            version: self.version,
+            folders: &self.folders,
+            connections: AllConnections(self),
+            check_for_updates: self.check_for_updates,
+            font_size: self.font_size,
+            appearance: self.appearance,
+            fields: &self.kept.fields,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// A config's connections as the file lists them: those this version understands, with
+/// each kept one back in its place. That is exactly where it was when nothing else
+/// changed, and otherwise as near as there is room.
+struct AllConnections<'a>(&'a Config);
+
+impl Serialize for AllConnections<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Config {
+            connections, kept, ..
+        } = self.0;
+        let total = connections.len() + kept.connections.len();
+        let mut seq = serializer.serialize_seq(Some(total))?;
+        let mut known = connections.iter();
+        let mut kept = kept.connections.iter().peekable();
+        for place in 0..total {
+            if let Some((_, raw)) = kept.next_if(|(at, _)| *at <= place) {
+                seq.serialize_element(raw)?;
+            } else if let Some(conn) = known.next() {
+                seq.serialize_element(conn)?;
+            } else if let Some((_, raw)) = kept.next() {
+                seq.serialize_element(raw)?;
+            }
+        }
+        seq.end()
+    }
 }
 
 fn null_is_password<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Auth, D::Error> {
@@ -670,6 +808,7 @@ impl Default for Config {
             check_for_updates: true,
             font_size: DEFAULT_FONT_SIZE,
             appearance: Appearance::System,
+            kept: Kept::default(),
             unsaved_because: None,
         }
     }
@@ -887,35 +1026,50 @@ impl Config {
                 path.display()
             )
         })?;
-        let mut kept = None;
-        if existing.is_some_and(|bytes| Self::parse(&bytes).is_err()) {
-            // E.g. a newer TupleBase wrote it.
-            let to = unreadable_copy(path);
-            fs::rename(path, &to).with_context(|| {
-                format!(
-                    "keeping the unreadable {} as {}",
-                    path.display(),
-                    to.display()
-                )
-            })?;
-            kept = Some(to);
-        }
+        let mut moved = None;
         let mut config = self.clone();
+        match existing.map(|bytes| Self::parse(&bytes)) {
+            Some(Err(_)) => {
+                // E.g. a newer TupleBase wrote it.
+                let to = unreadable_copy(path);
+                fs::rename(path, &to).with_context(|| {
+                    format!(
+                        "keeping the unreadable {} as {}",
+                        path.display(),
+                        to.display()
+                    )
+                })?;
+                moved = Some(to);
+            }
+            // What the file holds now that this version doesn't understand, perhaps
+            // written by a newer version since this config was loaded: this version can
+            // never change it, so the file's own is the one to keep.
+            Some(Ok(on_disk)) => config.kept = on_disk.kept,
+            None => {}
+        }
         config.sync_version();
         if config.version > VERSION_BASE {
             keep_base_version(path)?;
         }
         write_atomic(path, &serde_json::to_string_pretty(&config)?)?;
-        Ok(kept)
+        Ok(moved)
     }
 
-    /// Sets the oldest file format that holds every connection.
+    /// Sets the oldest file format that holds every connection. It is never below the
+    /// version of a file holding connections this version can't read, which may need it.
     fn sync_version(&mut self) {
         let iam = self
             .connections
             .iter()
             .any(|c| matches!(c.auth, Auth::AwsIam(_)));
-        self.version = if iam { VERSION_IAM } else { VERSION_BASE };
+        let needed = if iam { VERSION_IAM } else { VERSION_BASE };
+        self.version = needed.max(self.kept.version);
+    }
+
+    /// How many connections the file holds that this version can't read, such as ones
+    /// a newer version added. They are kept but not shown.
+    pub fn unsupported_count(&self) -> usize {
+        self.kept.connections.len()
     }
 
     /// Makes the app's text `steps` pixels larger, or smaller for a negative number,
@@ -1077,6 +1231,10 @@ impl Config {
         });
         if let Some(existing) = clash {
             bail!("a connection named \"{}\" already exists", existing.name);
+        }
+        // One this version can't read still owns its name, in the credential store too.
+        if !unchanged && let Some(kept) = self.kept.names().find(|n| n.to_lowercase() == lower) {
+            bail!("a connection named \"{kept}\" already exists, saved by a newer TupleBase");
         }
         match previous.and_then(|p| self.connections.iter().position(|c| c.name == p)) {
             Some(i) => self.connections[i] = conn,
@@ -2021,8 +2179,8 @@ mod tests {
     fn saving_over_a_file_this_version_cannot_read_keeps_that_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILE);
-        // As written by a newer TupleBase.
-        let newer = r#"{"version": 2, "connections": [{"name": "kept"}]}"#;
+        // As written by a newer TupleBase, in a format this one doesn't know.
+        let newer = r#"{"version": 3, "connections": [{"name": "kept"}]}"#;
         fs::write(&path, newer).unwrap();
         assert!(Config::load_from(&path).is_err());
 
@@ -2094,5 +2252,199 @@ mod tests {
     fn adapter_serializes_lowercase() {
         let json = serde_json::to_string(&pg("a")).unwrap();
         assert!(json.contains(r#""adapter":"postgres""#));
+    }
+
+    /// A file from a newer version: the second connection uses an engine this version
+    /// doesn't know, the fourth a sign-in, the fifth a TLS mode; two entries aren't even
+    /// connections. Version 2, though no connection here needs it.
+    const NEWER_FILE: &str = r#"{
+  "version": 2,
+  "folders": [
+    "Prod"
+  ],
+  "connections": [
+    {
+      "name": "plain",
+      "adapter": "postgres",
+      "host": "db.example.com",
+      "port": 5432,
+      "user": "dev",
+      "readonly": false
+    },
+    {
+      "name": "Future",
+      "folder": "Prod/Old",
+      "adapter": "oracle",
+      "host": "ora.example.com",
+      "port": 1521,
+      "user": "scott",
+      "readonly": false,
+      "wallet": {
+        "z": 1,
+        "a": [
+          1.5,
+          null
+        ]
+      }
+    },
+    {
+      "name": "second",
+      "adapter": "mysql",
+      "host": "10.0.0.5",
+      "port": 3306,
+      "user": "app",
+      "readonly": false
+    },
+    {
+      "name": "vault",
+      "adapter": "postgres",
+      "host": "db.example.com",
+      "port": 5432,
+      "user": "dev",
+      "readonly": false,
+      "auth": {
+        "type": "hashicorp_vault",
+        "path": "db/creds"
+      }
+    },
+    {
+      "name": "pinned",
+      "adapter": "postgres",
+      "host": "db.example.com",
+      "port": 5432,
+      "user": "dev",
+      "readonly": false,
+      "tls": "verify-pinned"
+    },
+    42,
+    {
+      "adapter": "postgres"
+    }
+  ],
+  "check_for_updates": true,
+  "font_size": 15,
+  "theme_accent": "teal"
+}"#;
+
+    fn names(config: &Config) -> Vec<&str> {
+        config.connections.iter().map(|c| &*c.name).collect()
+    }
+
+    #[test]
+    fn connections_this_version_cannot_read_are_hidden_but_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, format!("{NEWER_FILE}\n")).unwrap();
+        let (config, message) = Config::load_or_keep_from(&path);
+        assert_eq!(message, None);
+        assert_eq!(names(&config), ["plain", "second"]);
+        assert_eq!(config.unsupported_count(), 5);
+        // Nothing offers them: not the tree, not a lookup by name (which MCP uses).
+        assert_eq!(config.tree().connection_count(), 2);
+        assert_eq!(config.find("Future"), None);
+        assert_eq!(config.find("vault"), None);
+        // Their folders aren't shown either.
+        assert_eq!(config.folders(), ["Prod"]);
+
+        // Saved back unchanged, in place, with the unknown top-level setting.
+        config.save_to(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{NEWER_FILE}\n")
+        );
+        assert_eq!(files_named(dir.path(), "unreadable").len(), 0);
+        let raw = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        assert_eq!(raw(&fs::read_to_string(&path).unwrap()), raw(NEWER_FILE));
+    }
+
+    #[test]
+    fn kept_connections_survive_edits_to_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, NEWER_FILE).unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        config.remove("plain");
+        config.upsert(pg("added"), None).unwrap();
+        config.remove_folder("Prod");
+        config.add_folder("", "Prod").unwrap();
+        config.rename_folder("Prod", "Live").unwrap();
+        config.save_to(&path).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let file: Value = serde_json::from_str(&text).unwrap();
+        let original: Value = serde_json::from_str(NEWER_FILE).unwrap();
+        let kept = |file: &Value| -> Vec<Value> {
+            file["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| Connection::deserialize(*c).is_err())
+                .cloned()
+                .collect()
+        };
+        // Each byte-for-byte as it was, its folder included.
+        assert_eq!(kept(&file), kept(&original));
+        assert_eq!(file["theme_accent"], "teal");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(names(&config), ["second", "added"]);
+        assert_eq!(config.unsupported_count(), 5);
+        assert_eq!(config.folders(), ["Live"]);
+    }
+
+    #[test]
+    fn a_name_a_kept_connection_has_is_taken() {
+        let mut config: Config = serde_json::from_str(NEWER_FILE).unwrap();
+        for name in ["future", "FUTURE", "Vault", "pinned"] {
+            let error = config.upsert(pg(name), None).unwrap_err().to_string();
+            assert!(error.contains("newer TupleBase"), "{name}: {error}");
+            let error = config.upsert(pg(name), Some("plain")).unwrap_err();
+            assert!(error.to_string().contains("already exists"), "{name}");
+        }
+        assert_eq!(names(&config), ["plain", "second"]);
+        config.upsert(pg("present"), None).unwrap();
+        config.upsert(pg("plain2"), Some("plain")).unwrap();
+        assert_eq!(names(&config), ["plain2", "second", "present"]);
+    }
+
+    #[test]
+    fn kept_connections_never_lower_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, NEWER_FILE).unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        assert_eq!(config.version, VERSION_IAM);
+        config.upsert(iam("iam"), None).unwrap();
+        config.remove("iam");
+        assert_eq!(config.version, VERSION_IAM);
+        config.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().version, VERSION_IAM);
+        // A version 1 file with one stays at version 1 until an IAM connection needs 2.
+        let v1 = NEWER_FILE.replacen(r#""version": 2"#, r#""version": 1"#, 1);
+        let mut config: Config = serde_json::from_str(&v1).unwrap();
+        config.sync_version();
+        assert_eq!(config.version, VERSION_BASE);
+        config.upsert(iam("iam"), None).unwrap();
+        assert_eq!(config.version, VERSION_IAM);
+        // A version this one doesn't know is still refused as a whole.
+        let v3 = NEWER_FILE.replacen(r#""version": 2"#, r#""version": 3"#, 1);
+        let error = format!("{:#}", Config::parse(v3.as_bytes()).unwrap_err());
+        assert!(error.contains("unsupported config version 3"), "{error}");
+    }
+
+    #[test]
+    fn a_save_keeps_connections_a_newer_version_added_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
+        fs::write(&path, V1_FILE).unwrap();
+        let mut config = Config::load_from(&path).unwrap();
+        // A newer TupleBase saves the file while this one runs.
+        fs::write(&path, NEWER_FILE).unwrap();
+        config.upsert(pg("mine"), None).unwrap();
+        assert_eq!(config.save_to(&path).unwrap(), None);
+        let saved = Config::load_from(&path).unwrap();
+        assert_eq!(saved.unsupported_count(), 5);
+        assert_eq!(saved.version, VERSION_IAM);
+        assert!(saved.find("mine").is_some());
+        assert_eq!(saved.find("plain"), config.find("plain"));
     }
 }
