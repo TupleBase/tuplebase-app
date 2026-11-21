@@ -1114,6 +1114,28 @@ pub async fn sdk_config(profile: &str, region: &str) -> Result<SdkConfig> {
         .build())
 }
 
+/// What a client of a local stand-in for an AWS service is built from, such as DynamoDB
+/// Local: fixed dummy credentials, which such a server accepts whatever they are, so no
+/// profile's are ever sent to it. An empty `region` means `us-east-1`.
+pub fn local_sdk_config(region: &str) -> SdkConfig {
+    let http = aws_smithy_http_client::Builder::new()
+        .tls_provider(TlsProvider::Rustls(CryptoMode::Ring))
+        .build_https();
+    let region = if region.is_empty() {
+        "us-east-1"
+    } else {
+        region
+    };
+    let credentials =
+        aws_sdk_ssm::config::Credentials::new("local", "local", None, None, "tuplebase-local");
+    SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(region.to_owned()))
+        .credentials_provider(SharedCredentialsProvider::new(credentials))
+        .http_client(http)
+        .build()
+}
+
 /// Credentials from the profile named `profile` only, with `config`'s region and HTTP
 /// client for whatever it has to ask, such as STS for a role.
 fn profile_credentials(

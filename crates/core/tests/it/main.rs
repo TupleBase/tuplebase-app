@@ -11,6 +11,7 @@
 
 mod aws;
 mod db;
+mod dynamo;
 mod mongo;
 mod sqlite;
 mod ssh;

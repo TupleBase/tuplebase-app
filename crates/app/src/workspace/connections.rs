@@ -1267,7 +1267,15 @@ impl ConnectionsDialog {
             conn.folder.split('/').collect::<Vec<_>>().join(" / ")
         };
         // Only what the config holds: nothing is looked up, and never a password.
-        let (place_label, place) = if conn.adapter.is_file() {
+        let (place_label, place) = if conn.adapter.is_aws_region() {
+            // An endpoint URL, such as DynamoDB Local's, or else the AWS region.
+            let label = if conn.host.trim().is_empty() {
+                "Region"
+            } else {
+                "Endpoint"
+            };
+            (label, conn.location())
+        } else if conn.adapter.is_file() {
             ("File", conn.database.clone())
         } else if conn.location() != conn.host {
             ("Host", format!("from {}", conn.location()))

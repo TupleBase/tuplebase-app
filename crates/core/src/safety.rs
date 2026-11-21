@@ -16,6 +16,10 @@
 //! MongoDB and DocumentDB have no SQL and no read-only transaction. Their guard,
 //! [`check_mongo`], reads the command the shell parser built (`mongo_shell`) and allows
 //! only reads on a fixed list; `db` then runs it as one typed read call.
+//!
+//! DynamoDB has no read-only transaction either. Its guard, [`check_partiql`], allows one
+//! plain `SELECT` with no comment and no `;` anywhere; `db` then sends it alone with
+//! `ExecuteStatement`.
 
 use std::ops::Range;
 
@@ -65,6 +69,7 @@ fn token(flavor: ScriptFlavor, escapes: Escapes, sql: &str, i: usize) -> (Token,
     let postgres = matches!(flavor, ScriptFlavor::Postgres | ScriptFlavor::Redshift);
     let redshift = flavor == ScriptFlavor::Redshift;
     let mysql = flavor == ScriptFlavor::Mysql;
+    let partiql = flavor == ScriptFlavor::PartiQl;
     let bytes = sql.as_bytes();
     let rest = &sql[i..];
     match bytes[i] {
@@ -97,7 +102,7 @@ fn token(flavor: ScriptFlavor, escapes: Escapes, sql: &str, i: usize) -> (Token,
             };
             (kind, block_comment_len(rest, postgres))
         }
-        quote @ (b'\'' | b'"' | b'`') if quote != b'`' || !postgres => {
+        quote @ (b'\'' | b'"' | b'`') if quote != b'`' || !(postgres || partiql) => {
             let escape_string = (redshift && quote == b'\'')
                 || (postgres
                     && i > 0
@@ -397,6 +402,8 @@ fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
         Adapter::Redshift => &["call", "fetch"],
         // No SQL: `db` never asks.
         Adapter::Mongodb | Adapter::Documentdb => &[],
+        // PartiQL results are read for items whatever the statement: `db` never asks.
+        Adapter::Dynamodb => &[],
     }
 }
 
@@ -473,6 +480,66 @@ pub fn check_read_only(adapter: Adapter, sql: &str) -> Result<(), String> {
         return Err("read-only: SELECT ... INTO OUTFILE/DUMPFILE is not allowed".into());
     }
     Ok(())
+}
+
+/// Rejects any PartiQL statement that is not one plain `SELECT`, for DynamoDB, which
+/// has no read-only transaction (S2). An allowlist of one keyword: `EXISTS` and every
+/// other statement are refused. Where how DynamoDB reads the text is not confirmed, it
+/// refuses: a `;`, `--`, `/*` or `*/` anywhere, even inside a string or a quoted name,
+/// so no difference in reading quotes can hide a second statement or a comment.
+/// `db` then sends the statement alone, with `ExecuteStatement`, which takes exactly
+/// one; never `BatchExecuteStatement` or `ExecuteTransaction`.
+/// The longest PartiQL statement DynamoDB accepts.
+const PARTIQL_MAX_LEN: usize = 8192;
+
+pub fn check_partiql(adapter: Adapter, sql: &str) -> Result<(), String> {
+    if adapter.info().script != ScriptFlavor::PartiQl {
+        return Err(format!(
+            "read-only: {} doesn't run PartiQL",
+            adapter.label()
+        ));
+    }
+    // Checked as it will be sent: `db` passes statements without their closing `;`.
+    let statement = sql.trim();
+    // DynamoDB refuses longer statements anyway; refusing first keeps the check cheap.
+    if statement.len() > PARTIQL_MAX_LEN {
+        return Err(format!(
+            "read-only: a statement can be at most {PARTIQL_MAX_LEN} characters"
+        ));
+    }
+    // Outside strings and quoted names, only printable ASCII and plain line breaks: a
+    // Unicode separator or control character the server might read as a break between
+    // statements never reaches it.
+    let odd = |c: char| !(c.is_ascii_graphic() || matches!(c, ' ' | '\t' | '\r' | '\n'));
+    if tokens(adapter, statement).any(|(kind, text)| kind != Token::Quoted && text.chars().any(odd))
+    {
+        return Err(
+            "read-only: outside quotes, only plain ASCII text and line breaks are allowed".into(),
+        );
+    }
+    if statement.contains(';') {
+        return Err("read-only: run one statement at a time, with no ; in it".into());
+    }
+    if ["--", "/*", "*/"]
+        .iter()
+        .any(|mark| statement.contains(mark))
+    {
+        return Err("read-only: comments are not allowed, even inside a string".into());
+    }
+    if split_statements(adapter, statement).len() != 1
+        || tokens(adapter, statement).any(|(kind, _)| kind == Token::Comment)
+    {
+        return Err("read-only: run exactly one statement".into());
+    }
+    // The very first token, with nothing skipped but whitespace.
+    let first = tokens(adapter, statement).find(|&(kind, _)| kind != Token::Space);
+    match first {
+        Some((Token::Word, word)) if word.eq_ignore_ascii_case("select") => Ok(()),
+        _ => Err(format!(
+            "read-only: only SELECT statements are allowed (got \"{}\")",
+            first_keyword(adapter, statement).unwrap_or_default()
+        )),
+    }
 }
 
 /// The aggregation stages a read-only pipeline may use. None of them writes: `$out` and
@@ -1527,6 +1594,95 @@ mod tests {
         let second = statement_at(adapter, text, text.len()).unwrap();
         assert_eq!(&text[second], "db.b.find()");
         assert_eq!(statement_at(adapter, text, 12), None);
+    }
+
+    #[test]
+    fn partiql_read_only_allows_one_select() {
+        let ok = |sql| check_partiql(Adapter::Dynamodb, sql);
+        for sql in [
+            r#"SELECT * FROM "users""#,
+            r#"  select pk, "name" FROM users WHERE pk = 'a''b'"#,
+            "SELECT * FROM users WHERE note = 'it''s'\n",
+        ] {
+            assert_eq!(ok(sql), Ok(()), "{sql}");
+        }
+    }
+
+    #[test]
+    fn partiql_read_only_refuses_everything_else() {
+        let refused = |sql: &str| check_partiql(Adapter::Dynamodb, sql).is_err();
+        for sql in [
+            "INSERT INTO users VALUE {'pk': 'a'}",
+            "UPDATE users SET a = 1 WHERE pk = 'a'",
+            "DELETE FROM users WHERE pk = 'a'",
+            "CREATE TABLE x",
+            "EXISTS(SELECT * FROM users WHERE pk = 'a')",
+            "(SELECT * FROM users)",
+            "",
+            "   ",
+            // A second statement, however it hides. Even a closing `;`, which `db`
+            // never sends.
+            "SELECT * FROM users;",
+            "SELECT * FROM users; DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users WHERE a = ';' ",
+            "SELECT * FROM \"a;b\"",
+            "SELECT * FROM users WHERE a = 'x\\'; DELETE FROM users WHERE pk = 'a' --'",
+            "SELECT * FROM users WHERE a = `x;` ",
+            // Comments, wherever they are.
+            "-- note\nSELECT * FROM users",
+            "/* x */ SELECT * FROM users",
+            "SELECT * FROM users -- note",
+            "SELECT * FROM users /* x */",
+            "SELECT * FROM users WHERE a = '--'",
+            "SELECT * FROM users WHERE a = '*/'",
+            "/*/ SELECT 1 */ DELETE FROM users WHERE pk = 'a'",
+            // A first word that only starts like SELECT, or isn't plain ASCII.
+            "SELECTED FROM users",
+            "SEL\u{a0}ECT * FROM users",
+            "'SELECT' FROM users",
+            // Unicode separators and controls the server might read as a break.
+            "SELECT * FROM users\u{37e} DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users\u{ff1b} DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users\u{2028}DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users\u{200b}",
+            "SELECT * FROM users\u{feff}",
+            "SELECT * FROM users\u{85}WHERE a = 1",
+            "SELECT * FROM users\u{0}DELETE FROM users",
+            "SELECT * FROM users\u{b}WHERE a = 1",
+        ] {
+            assert!(refused(sql), "{sql:?}");
+        }
+        // Too long, even if harmless.
+        let long = format!("SELECT * FROM users WHERE a = '{}'", "x".repeat(8200));
+        assert!(refused(&long));
+        // Unicode inside a string or a quoted name is fine.
+        assert!(!refused("SELECT * FROM \"café\" WHERE a = 'naïve\u{2028}'"));
+        // Only for PartiQL.
+        assert!(check_partiql(Adapter::Postgres, "SELECT 1").is_err());
+    }
+
+    #[test]
+    fn partiql_scripts_split_on_semicolons_outside_quotes() {
+        let split = |sql| split_statements(Adapter::Dynamodb, sql);
+        assert_eq!(
+            split("SELECT * FROM \"a;b\"; SELECT 'c;d'; -- x;\nSELECT 3 /* ; */"),
+            [
+                "SELECT * FROM \"a;b\"",
+                "SELECT 'c;d'",
+                "-- x;\nSELECT 3 /* ; */"
+            ]
+        );
+        // No backslash escapes, and backticks quote nothing.
+        assert_eq!(
+            split(r"SELECT 'a\'; SELECT 2"),
+            [r"SELECT 'a\'", "SELECT 2"]
+        );
+        assert_eq!(split("SELECT `a; SELECT 2"), ["SELECT `a", "SELECT 2"]);
+        // Block comments don't nest.
+        assert_eq!(
+            split("/* /* */ SELECT 1; SELECT 2"),
+            ["/* /* */ SELECT 1", "SELECT 2"]
+        );
     }
 
     #[test]

@@ -63,6 +63,12 @@ fn logo(adapter: Adapter) -> Logo {
             color: 0x9D2B6B,
             letters: "DD",
         },
+        // TupleBase's own key, for items reached by key, not AWS's service icon.
+        Adapter::Dynamodb => Logo {
+            glyph: include_bytes!("../../../assets/logos/dynamodb.svg"),
+            color: 0x2E4A9E,
+            letters: "DY",
+        },
     }
 }
 

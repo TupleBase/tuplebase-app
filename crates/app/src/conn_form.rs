@@ -79,6 +79,9 @@ pub struct ConnForm {
     pub(crate) folder: String,
     name: Entity<InputState>,
     host: Entity<InputState>,
+    /// A service in an AWS region (DynamoDB): its endpoint URL, saved as the host. Empty
+    /// means AWS itself.
+    endpoint: Entity<InputState>,
     port: Entity<InputState>,
     database: Entity<InputState>,
     user: Entity<InputState>,
@@ -136,6 +139,13 @@ impl ConnForm {
         let field = |f: fn(&Connection) -> String| existing.map(f).unwrap_or_default();
         let name = input("orders-db", field(|c| c.name.clone()));
         let host = input("localhost", field(|c| c.host.clone()));
+        let endpoint = input(
+            "Optional: http://localhost:8000 for DynamoDB Local",
+            existing
+                .filter(|c| c.adapter.is_aws_region())
+                .map(|c| c.host.clone())
+                .unwrap_or_default(),
+        );
         let port = input("Default", field(|c| c.port.to_string()));
         let engine_search = input("Search engines", String::new());
         let database = input("Optional", field(|c| c.database.clone()));
@@ -224,6 +234,7 @@ impl ConnForm {
             folder,
             name,
             host,
+            endpoint,
             port,
             database,
             user,
@@ -333,6 +344,9 @@ impl ConnForm {
         };
         set(&self.name, conn.name.clone());
         set(&self.host, conn.host.clone());
+        if conn.adapter.is_aws_region() {
+            set(&self.endpoint, conn.host.clone());
+        }
         set(&self.port, conn.port.to_string());
         set(&self.database, conn.database.clone());
         set(&self.user, conn.user.clone());
@@ -406,9 +420,14 @@ impl ConnForm {
                 String::new()
             }
         };
-        let host_shown = !self.host_from_secret();
+        // A service in an AWS region has no host, port, database, user, encryption or
+        // tunnel: an endpoint URL, if any, and an AWS profile.
+        let aws_region = self.adapter.is_aws_region();
+        let host_shown = !self.host_from_secret() && !aws_region;
         let port_text = visible(&self.port, host_shown, cx);
-        let port = if port_text.is_empty() {
+        let port = if aws_region {
+            0
+        } else if port_text.is_empty() {
             self.adapter.default_port()
         } else {
             match port_text.parse() {
@@ -420,7 +439,7 @@ impl ConnForm {
                 }
             }
         };
-        let ssh = if self.use_ssh && !self.adapter.is_file() {
+        let ssh = if self.use_ssh && !self.adapter.is_file() && !aws_region {
             let Some(port) = self.ssh_port_value(cx) else {
                 self.error = Some("SSH port must be a number.".into());
                 cx.notify();
@@ -451,13 +470,21 @@ impl ConnForm {
                 name: text(&self.name, cx),
                 folder: self.folder.clone(),
                 adapter: self.adapter,
-                host: visible(&self.host, host_shown, cx),
+                host: if aws_region {
+                    text(&self.endpoint, cx)
+                } else {
+                    visible(&self.host, host_shown, cx)
+                },
                 port,
-                database: text(&self.database, cx),
-                user: visible(&self.user, !self.iam_names_the_user(cx), cx),
+                database: visible(&self.database, !aws_region, cx),
+                user: visible(&self.user, !self.iam_names_the_user(cx) && !aws_region, cx),
                 readonly: self.readonly,
                 color: self.color.clone(),
-                tls: self.tls,
+                tls: if aws_region {
+                    TlsMode::default()
+                } else {
+                    self.tls
+                },
                 ssh,
                 auth,
                 // Where it was found no longer applies to another server, such as one a
@@ -602,9 +629,10 @@ impl ConnForm {
             self.tls = TlsMode::Require;
         }
         self.adapter = adapter;
-        // A way to sign in the new engine doesn't take goes back to a password.
+        // A way to sign in the new engine doesn't take goes back to its first: a
+        // password, or an AWS profile for DynamoDB.
         if !adapter.auth_kinds().contains(&self.auth_kind) {
-            self.auth_kind = AuthKind::Password;
+            self.auth_kind = adapter.auth_kinds()[0];
         }
         self.user.update(cx, |input, cx| {
             input.set_placeholder(adapter.user_hint(), window, cx);
@@ -634,6 +662,8 @@ impl ConnForm {
             self.chosen = true;
             let first = if adapter.is_file() {
                 &self.database
+            } else if adapter.is_aws_region() {
+                &self.aws_profile
             } else {
                 &self.host
             };
@@ -810,7 +840,12 @@ impl ConnForm {
     }
 
     fn render_auth(&self, kind: AuthKind, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        choice("auth", kind.label(), self.auth_kind == kind, cx).on_click(cx.listener(
+        // A service in an AWS region signs with the profile itself, not a token from it.
+        let label = match kind {
+            AuthKind::AwsIam if self.adapter.is_aws_region() => "AWS profile",
+            kind => kind.label(),
+        };
+        choice("auth", label, self.auth_kind == kind, cx).on_click(cx.listener(
             move |this, _, _, cx| {
                 this.choose_auth(kind);
                 cx.notify();
@@ -820,8 +855,10 @@ impl ConnForm {
 
     fn choose_auth(&mut self, kind: AuthKind) {
         self.auth_kind = kind;
-        // RDS takes an IAM token only over an encrypted connection.
-        if kind == AuthKind::AwsIam && self.tls == TlsMode::Prefer {
+        // RDS takes an IAM token only over an encrypted connection. AWS services are
+        // always reached over HTTPS, with no setting for it.
+        if kind == AuthKind::AwsIam && self.tls == TlsMode::Prefer && !self.adapter.is_aws_region()
+        {
             self.tls = TlsMode::Require;
         }
     }
@@ -1093,42 +1130,96 @@ impl ConnForm {
             )
     }
 
+    /// Signing in to a service in an AWS region: the profile and region, and an endpoint
+    /// URL for a local stand-in such as DynamoDB Local.
+    fn render_aws_region(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex().flex_wrap().gap_2().children(
+                    self.adapter
+                        .auth_kinds()
+                        .iter()
+                        .map(|&k| self.render_auth(k, cx)),
+                ),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(field(
+                        "AWS profile",
+                        Input::new(&self.aws_profile).id("conn-aws-profile"),
+                        cx,
+                    ))
+                    .child(field(
+                        "Region",
+                        Input::new(&self.aws_region).id("conn-aws-region"),
+                        cx,
+                    )),
+            )
+            .child(
+                field(
+                    "Endpoint URL",
+                    Input::new(&self.endpoint).id("conn-endpoint"),
+                    cx,
+                )
+                .child(hint(
+                    "Leave empty for AWS. For DynamoDB Local, give its URL and no profile: \
+                     it is sent dummy credentials, never yours.",
+                    cx,
+                )),
+            )
+            .child(
+                hint(
+                    "Each request is signed with the profile's credentials, or the default \
+                     ones when it is empty. For AWS to refuse writes too, use a profile \
+                     whose IAM policy allows only reads.",
+                    cx,
+                )
+                .id("conn-aws-region-hint")
+                .test_support(),
+            )
+    }
+
     fn render_security(&self, cx: &mut Context<Self>) -> Div {
         v_flex()
             .gap_3()
-            .when(!self.adapter.is_file(), |el| {
-                el.child(field(
-                    "Encryption",
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
-                    cx,
-                ))
-                .when(self.source.is_some(), |el| {
-                    el.child(
-                        hint(
-                            "Verified checks the certificate with Amazon's RDS authorities. \
+            .when(
+                !self.adapter.is_file() && !self.adapter.is_aws_region(),
+                |el| {
+                    el.child(field(
+                        "Encryption",
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
+                        cx,
+                    ))
+                    .when(self.source.is_some(), |el| {
+                        el.child(
+                            hint(
+                                "Verified checks the certificate with Amazon's RDS authorities. \
                              Through an SSH tunnel, choose Required: the certificate names \
                              the database, not the tunnel.",
-                            cx,
+                                cx,
+                            )
+                            .id("conn-tls-hint")
+                            .test_support(),
                         )
-                        .id("conn-tls-hint")
-                        .test_support(),
+                    })
+                    .child(
+                        Checkbox::new("use-ssh")
+                            .cursor_pointer()
+                            .label("Connect through an SSH tunnel")
+                            .checked(self.use_ssh)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                this.use_ssh = *checked;
+                                cx.notify();
+                            })),
                     )
-                })
-                .child(
-                    Checkbox::new("use-ssh")
-                        .cursor_pointer()
-                        .label("Connect through an SSH tunnel")
-                        .checked(self.use_ssh)
-                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                            this.use_ssh = *checked;
-                            cx.notify();
-                        })),
-                )
-                .when(self.use_ssh, |el| el.child(self.render_ssh(cx)))
-            })
+                    .when(self.use_ssh, |el| el.child(self.render_ssh(cx)))
+                },
+            )
             .child(
                 Checkbox::new("readonly")
                     .cursor_pointer()
@@ -1456,6 +1547,8 @@ impl Render for ConnForm {
             if self.adapter.is_file() {
                 let file = Input::new(&self.database).id("conn-database");
                 sections.push(("File", field("Database file", file, cx)));
+            } else if self.adapter.is_aws_region() {
+                sections.push(("Credentials", self.render_aws_region(cx)));
             } else {
                 sections.push(("Server", self.render_server(cx)));
                 sections.push(("Credentials", self.render_credentials(cx)));
@@ -1748,8 +1841,8 @@ mod tests {
         act(handle, cx, |window, cx| {
             assert!(window.find("engines-SQL").visible());
             assert!(window.find("engines-Document").visible());
-            // No key-value engine yet: an empty family isn't shown.
-            assert!(window.try_find("engines-Key-value").is_none());
+            assert!(window.find("engines-Key-value").visible());
+            assert!(window.find("adapter-Amazon DynamoDB").visible());
             assert!(window.find("adapter-Amazon DocumentDB").visible());
             window.click("engine-search", cx);
             window.input("mongo", cx);
@@ -1872,6 +1965,71 @@ mod tests {
             assert!(window.find("conn-password").visible());
             assert_eq!(form.read(cx).auth_kind, AuthKind::Password);
         });
+    }
+
+    #[gpui_kit::test]
+    fn a_dynamodb_connection_asks_for_a_profile_region_and_endpoint_only(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        let saved = saved(&form, cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        // Chosen after a server engine with a typed port and encryption on.
+        pick(handle, "Amazon DocumentDB", cx);
+        act(handle, cx, |window, cx| {
+            window.click("conn-port", cx);
+            window.input("27018", cx);
+        });
+        pick(handle, "Amazon DynamoDB", cx);
+        act(handle, cx, |window, cx| {
+            for id in [
+                "conn-aws-profile",
+                "conn-aws-region",
+                "conn-endpoint",
+                "auth-AWS profile",
+                "readonly",
+                "conn-name",
+            ] {
+                assert!(window.find(id).visible(), "{id}");
+            }
+            for id in [
+                "conn-host",
+                "conn-port",
+                "conn-database",
+                "conn-user",
+                "conn-password",
+                "tls-Required",
+                "use-ssh",
+                "auth-Password",
+                "auth-IAM token",
+                "auth-Secrets Manager",
+            ] {
+                assert!(window.try_find(id).is_none(), "{id}");
+            }
+            assert_eq!(form.read(cx).auth_kind, AuthKind::AwsIam);
+            window.click("conn-name", cx);
+            window.input("local-dynamo", cx);
+            window.click("conn-aws-region", cx);
+            window.input("eu-west-1", cx);
+            window.click("conn-endpoint", cx);
+            window.input("http://localhost:58000", cx);
+        });
+        act(handle, cx, |window, cx| window.click("save", cx));
+        let saved = saved.borrow();
+        let conn = saved.last().expect("saved");
+        assert_eq!(conn.adapter, Adapter::Dynamodb);
+        assert_eq!(conn.host, "http://localhost:58000");
+        assert_eq!(
+            (conn.port, conn.user.as_str(), conn.database.as_str()),
+            (0, "", "")
+        );
+        assert_eq!(conn.tls, tuplebase_core::config::TlsMode::default());
+        assert!(conn.ssh.is_none());
+        assert_eq!(
+            conn.auth,
+            Auth::AwsIam(tuplebase_core::config::AwsIamAuth {
+                profile: String::new(),
+                region: "eu-west-1".into(),
+            })
+        );
     }
 
     #[gpui_kit::test]

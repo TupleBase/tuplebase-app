@@ -36,7 +36,7 @@ scripts/                   install, packaging, release helpers
 | `config`       | connection settings and the config directory              | nothing                                                 |
 | `secrets`      | passwords in the OS credential store                      | nothing                                                 |
 | `state`        | unsaved SQL, query history, panel sizes, last search, open tabs | `config`                                                |
-| `safety`       | statement classification for the read-only guard, and the Mongo shell command check | `config` `mongo_shell`                    |
+| `safety`       | statement classification for the read-only guard, the Mongo shell command check, and the PartiQL check | `config` `mongo_shell`  |
 | `mongo_shell`  | the Mongo shell commands TupleBase reads: parser, command tree, splitting scripts | nothing                                 |
 | `ssh`          | SSH tunnels                                               | `config`                                                |
 | `cloud`        | cloud providers, one file each (`cloud/aws.rs`)           | `config`                                                |
@@ -44,13 +44,14 @@ scripts/                   install, packaging, release helpers
 | `mcp_status`   | heartbeat files of running MCP servers                    | `config`                                                |
 | `app_status`   | the file naming the connections open in the app           | `config`                                                |
 | `updates`      | the GitHub release check                                  | `config`                                                |
-| `db`           | the database API, pools, running SQL and Mongo shell commands, the read-only guard | `config` `ssh` `safety` `mongo_shell`  |
+| `db`           | the database API, pools, running SQL, Mongo shell commands and PartiQL, the read-only guard | `config` `ssh` `safety` `mongo_shell` |
 | `db/connect`   | opening a pool, for every engine: credentials, tunnel, token renewal, RDS authorities, pool size | `config` `secrets` `ssh` `credentials` `cloud`, and `db` |
 | `db/postgres`  | PostgreSQL's connect options and pool, own SQL, read-only statements, value decoding | `config`, and `db` (its parent) and `db/connect` |
 | `db/mysql`     | MySQL's and MariaDB's connect options and pool, SQL, read-only statements, decoding | `config`, and `db` (its parent) and `db/connect` |
 | `db/sqlite`    | SQLite's connect options and pools (one read-only), own SQL, read-only switch, value decoding | `config` `ssh`, and `db` (its parent) and `db/connect` |
 | `db/redshift`  | Redshift's connect options and pool (PostgreSQL's driver), own catalog SQL, read-only statements, decoding | `config`, and `db` (its parent), `db/connect` and `db/postgres` |
 | `db/mongo`     | MongoDB's and DocumentDB's client options and connecting, running parsed shell commands (reads as typed read calls only), listing, field sampling, the server read-only probe, BSON to JSON | `config` `mongo_shell`, and `db` (its parent) and `db/connect` |
+| `db/dynamo`    | DynamoDB's client (`aws-sdk-dynamodb`, its `SdkConfig` from `cloud::aws`), running PartiQL one statement per `ExecuteStatement` with paging, listing tables and indexes, keys and attribute sampling, attribute values to JSON | `config` `cloud` `safety`, and `db` (its parent), `db/connect` and `db/mongo` |
 | `db/decode`    | value decoding the engine modules share                   | nothing                                                 |
 | `agents`       | the MCP server's entry in each agent's config file        | `updates`                                               |
 | `chat`         | running the user's agent for the chat panel               | `config` `agents`                                       |
@@ -63,7 +64,10 @@ scripts/                   install, packaging, release helpers
   `db/connect` uses it. Update the table when a module's imports change.
 - **L6. One module owns each outside system.** SQL and drivers in `db` and `safety`, the
   credential store in `secrets`, each cloud provider's SDK in its own `cloud` module (the
-  AWS SDK in `cloud::aws`), SSH in `ssh`, each file format in the module that names it.
+  AWS SDK in `cloud::aws`, except `aws-sdk-dynamodb`, which is DynamoDB's database driver
+  and lives in `db/dynamo`, taking its `SdkConfig` from `cloud::aws::sdk_config`, or
+  `cloud::aws::local_sdk_config` for DynamoDB Local), SSH in
+  `ssh`, each file format in the module that names it.
   Other modules call that module instead of the system.
 - **L7. Engine-specific SQL lives in its engine module under `db/`.** `db.rs` keeps the
   public API and what every engine shares; a method that needs engine-specific SQL picks

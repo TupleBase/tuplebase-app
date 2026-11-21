@@ -845,8 +845,8 @@ pub(super) fn value(bson: &Bson) -> Value {
     }
 }
 
-/// Standard base64, with padding.
-fn base64(bytes: &[u8]) -> String {
+/// Standard base64, with padding. DynamoDB's binary values use it too.
+pub(super) fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {

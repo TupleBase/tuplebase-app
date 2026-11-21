@@ -47,7 +47,8 @@ const NO_COMMAND: &str = "No command at the cursor. Select one, or run all with 
 /// Why a read-only document connection says only TupleBase guards it.
 const SERVER_GUARD_HINT: &str = "TupleBase lets only reads through. The server didn't show \
      that it refuses this user's writes: sign in as a read-only user, such as one with only \
-     the read role, for the server to refuse them too.";
+     the read role, or on DynamoDB use an AWS profile whose IAM policy allows only reads, \
+     for the server to refuse them too.";
 
 const EDIT_ICON: &[u8] = include_bytes!("../../../assets/icons/square-pen.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
@@ -230,15 +231,16 @@ impl ConnectionTab {
             Family::Sql => "sql",
             // Mongo shell commands read as JavaScript.
             Family::Document => "javascript",
-            // No engine of this family yet: plain text.
-            Family::KeyValue => "text",
+            // DynamoDB's PartiQL reads as SQL.
+            Family::KeyValue => "sql",
         };
         editor.set_highlighter(language, cx);
     }
 
     /// Sets the editor's completions for `conn`: SQL keywords and names, or for a
     /// document engine its collections, methods and operators, narrowed to what the
-    /// read-only guard allows on a read-only connection.
+    /// read-only guard allows on a read-only connection. PartiQL gets none: SQL's
+    /// keywords would offer much that DynamoDB doesn't run.
     fn configure_completions(editor: &mut EditorState, conn: &Connection, names: &SchemaNames) {
         let provider: Option<Rc<dyn gpui_kit::component::input::CompletionProvider>> =
             match conn.adapter.family() {
@@ -499,13 +501,19 @@ impl ConnectionTab {
         if self.run != run {
             return;
         }
-        let sql = self.conn.adapter.family() == Family::Sql;
+        let family = self.conn.adapter.family();
+        let sql = family == Family::Sql;
         self.status = match &result {
             Ok(run) => {
-                let done = if sql {
-                    summary(&run.result, run.statements)
-                } else {
-                    document_summary(&run.result, run.statements)
+                let done = match family {
+                    Family::Sql => summary(&run.result, run.statements),
+                    Family::Document => document_summary(&run.result, run.statements),
+                    Family::KeyValue => item_summary(run),
+                };
+                // Such as that DynamoDB stopped at its most pages, a likely full scan.
+                let done = match run.result.note {
+                    Some(note) if !sql => format!("{done} · {note}"),
+                    _ => done,
                 };
                 // What the run changed in its open transaction was not kept: say so.
                 // Only SQL engines have transactions.
@@ -878,6 +886,32 @@ pub(crate) fn document_summary(r: &tuplebase_core::db::QueryResult, commands: us
     }
 }
 
+/// [`summary`] for a key-value engine: items, and for a statement that wrote, only that
+/// it ran, as DynamoDB doesn't say how many items it changed.
+pub(crate) fn item_summary(run: &ScriptResult) -> String {
+    let r = &run.result;
+    let ms = r.elapsed_ms;
+    let count = |n: usize| {
+        if n == 1 {
+            "1 item".to_owned()
+        } else {
+            format!("{n} items")
+        }
+    };
+    let outcome = if run.changed && r.rows.is_empty() {
+        format!("Done in {ms} ms")
+    } else if r.truncated {
+        format!("First {} in {ms} ms", count(r.rows.len()))
+    } else {
+        format!("{} in {ms} ms", count(r.rows.len()))
+    };
+    if run.statements > 1 {
+        format!("{} statements. {outcome}", run.statements)
+    } else {
+        outcome
+    }
+}
+
 /// What a document engine's completions may offer on `conn`.
 fn mongo_scope(conn: &Connection) -> MongoScope {
     let database = match conn.database.trim() {
@@ -902,7 +936,7 @@ fn history_label(sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
-    use super::{ConnectionTab, HISTORY_LABEL_CHARS, Status, history_label, summary};
+    use super::{ConnectionTab, HISTORY_LABEL_CHARS, Status, history_label, item_summary, summary};
     use crate::workspace::Workspace;
     use crate::workspace::tests::{config_with_connection, open, open_tab, window_action};
     use gpui_kit::test::TestWindowExt;
@@ -910,7 +944,7 @@ mod tests {
     use serde_json::json;
     use std::rc::Rc;
     use tuplebase_core::config::{Adapter, Family};
-    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE};
+    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE, ScriptResult};
 
     /// The test connection's tab, open and done connecting, with "SELECT 1;" in its
     /// editor.
@@ -2098,6 +2132,64 @@ mod tests {
             assert_eq!(detail.shown(cx), "{\n  id: 1\n}");
             assert_eq!(detail.text().read(cx).language_name(), "text");
         });
+    }
+
+    // DynamoDB tabs.
+
+    #[gpui_kit::test]
+    fn a_dynamodb_tab_edits_partiql_as_sql(cx: &mut TestAppContext) {
+        let (_, _, tab) = open_db(cx);
+        let language = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let editor = tab.read(cx).editor.read(cx);
+                (
+                    editor.language_name().to_string(),
+                    editor.lsp().completion_provider.is_some(),
+                )
+            })
+        };
+        // From MongoDB's JavaScript to PartiQL, read as SQL with no SQL completions.
+        for (adapter, expected) in [
+            (Adapter::Mongodb, ("javascript".to_owned(), true)),
+            (Adapter::Dynamodb, ("sql".to_owned(), false)),
+        ] {
+            cx.update(|cx| {
+                tab.update(cx, |this, cx| {
+                    let mut conn = this.connection().clone();
+                    conn.adapter = adapter;
+                    this.set_connection(conn, cx);
+                });
+            });
+            assert_eq!(language(cx), expected, "{adapter:?}");
+        }
+    }
+
+    #[test]
+    fn item_summaries_count_items_and_say_when_a_statement_wrote() {
+        let run = |rows: usize, truncated, changed, statements| ScriptResult {
+            result: QueryResult {
+                columns: Vec::new(),
+                rows: vec![Vec::new(); rows],
+                truncated,
+                rows_affected: None,
+                elapsed_ms: 5,
+                note: None,
+                documents: Some(Vec::new()),
+                server_read_only: None,
+            },
+            statements,
+            changed,
+            rolled_back: false,
+        };
+        assert_eq!(item_summary(&run(1, false, false, 1)), "1 item in 5 ms");
+        assert_eq!(
+            item_summary(&run(3, true, false, 1)),
+            "First 3 items in 5 ms"
+        );
+        assert_eq!(
+            item_summary(&run(0, false, true, 2)),
+            "2 statements. Done in 5 ms"
+        );
     }
 
     #[gpui_kit::test]
