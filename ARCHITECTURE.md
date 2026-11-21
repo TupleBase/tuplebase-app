@@ -35,7 +35,7 @@ scripts/                   install, packaging, release helpers
 | -------------- | --------------------------------------------------------- | ------------------------------------------------------- |
 | `config`       | connection settings and the config directory              | nothing                                                 |
 | `secrets`      | passwords in the OS credential store                      | nothing                                                 |
-| `state`        | unsaved SQL, query history, panel sizes, last search      | `config`                                                |
+| `state`        | unsaved SQL, query history, panel sizes, last search, open tabs | `config`                                                |
 | `safety`       | statement classification for the read-only guard          | `config`                                                |
 | `ssh`          | SSH tunnels                                               | `config`                                                |
 | `cloud`        | cloud providers, one file each (`cloud/aws.rs`)           | `config`                                                |

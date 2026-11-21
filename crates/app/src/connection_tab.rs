@@ -107,6 +107,9 @@ pub(crate) struct ConnectionTab {
     pub(crate) status: Status,
     /// Set from asking for a pool until the answer.
     pub(crate) connecting: bool,
+    /// Whether the tab has started: loaded its schema and asked for a pool. A tab
+    /// brought back at launch waits until it is first shown or runs something.
+    pub(crate) started: bool,
     /// Whether the connection has an open pool.
     connected: bool,
     /// The query run whose result is still to show; an earlier one's is dropped.
@@ -144,9 +147,8 @@ impl ConnectionTab {
             button.set_adapter(conn.adapter, cx);
             button
         });
+        // Given its connection by `start`, as loading it opens a pool.
         let schema = cx.new(|cx| SchemaPanel::new(db.clone(), names, window, cx));
-        let shown = conn.clone();
-        schema.update(cx, |schema, cx| schema.set_connection(Some(shown), cx));
         let results = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
         let row_detail = cx.new(|cx| RowDetail::new(window, cx));
         let _subscriptions = vec![
@@ -191,6 +193,7 @@ impl ConnectionTab {
             schema,
             status: Status::Idle,
             connecting: false,
+            started: false,
             connected: false,
             run: 0,
             history,
@@ -257,15 +260,30 @@ impl ConnectionTab {
     /// Starts again with `conn`, such as after its settings were edited: the rows and
     /// tables shown so far go, and it connects anew.
     pub(crate) fn reconnect(&mut self, conn: Connection, cx: &mut Context<Self>) {
-        self.set_connection(conn.clone(), cx);
+        self.set_connection(conn, cx);
         self.close_row_detail(cx);
         self.results.update(cx, |table, cx| {
             table.delegate_mut().clear();
             table.refresh(cx);
         });
+        self.load_schema(cx);
+        self.connect(cx);
+    }
+
+    /// Loads the schema and connects, the first time only.
+    pub(crate) fn start(&mut self, cx: &mut Context<Self>) {
+        if !self.started {
+            self.load_schema(cx);
+            self.connect(cx);
+        }
+    }
+
+    /// Shows the connection's tables, which opens its pool.
+    fn load_schema(&mut self, cx: &mut Context<Self>) {
+        self.started = true;
+        let conn = self.conn.clone();
         self.schema
             .update(cx, |schema, cx| schema.set_connection(Some(conn), cx));
-        self.connect(cx);
     }
 
     /// Opens a pool, or checks the one open; the workspace shows the answer.
@@ -358,6 +376,10 @@ impl ConnectionTab {
     pub(crate) fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
         if !self.can_run() {
             return;
+        }
+        // Running opens the pool; the schema follows it.
+        if !self.started {
+            self.load_schema(cx);
         }
         cx.emit(TabEvent::Ran(sql.clone()));
         self.status = Status::Busy("Running…".into());
