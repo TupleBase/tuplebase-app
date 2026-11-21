@@ -65,6 +65,10 @@ can hide a write. A new flavor needs tests beside the existing
 ones, including one showing that a read-only script can't hide a write. Don't change
 `READ_KEYWORDS` or `check_read_only` without the user's agreement (S2).
 
+Add the engine's arm to `row_keywords`: the statements that return rows without starting with a
+read keyword, such as `CALL`, so `returns_rows` reads them for rows instead of a row count. It is
+not part of the read-only guard.
+
 ## 3. The engine module (`core/src/db/<engine>.rs`)
 
 Declare it with `mod <engine>;` at the top of `db.rs`. Copy the shape of `db/postgres.rs`: the same
@@ -74,6 +78,7 @@ function names, each taking the engine's pool.
 | ----------------------------- | ------------------------------------------------------------------- |
 | `OBJECTS`                     | one query per kind of object beyond tables, each returning schema, name and detail |
 | `DIALECT`                     | `read_only_begin` and `read_only_end`, run around each statement in read-only mode; `objects: OBJECTS` |
+| `end_transaction(conn)`       | after each run, ends any transaction it left open, so the connection goes back to the pool without one |
 | `column_names(pool)`          | distinct column names for autocomplete, at most 5000                |
 | `tables(pool)`                | schema, name and `BASE TABLE` or `VIEW` for each table and view     |
 | `columns(pool, …, table)`     | name, type and `YES`/`NO` nullable; take the engine's default schema when none is given |
@@ -90,7 +95,8 @@ that builds SQL text, such as call templates or quoting.
 Add one arm per `Db` method. Each arm calls the engine module, and `db.rs` keeps only the code every
 engine shares:
 
-- `Db::test`, `Db::run` (`run_all!(pool, <engine>::DIALECT, <engine>::value)`),
+- `Db::test`, `Db::run`
+  (`run_all!(pool, <engine>::DIALECT, <engine>::value, <engine>::end_transaction)`),
   `list_column_names`, `list_tables`, `list_objects`, `describe_table`, `object_definition` and
   `call_template` (a `bail!` arm if the engine has no routines, as for SQLite).
 - In the tests at the bottom of `db.rs`, add an arm to `dialect` and add the engine to

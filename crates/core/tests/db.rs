@@ -561,6 +561,19 @@ async fn a_transaction_left_open_ends_with_its_run() {
             .await;
         assert!(failed.is_err());
         assert_eq!(count(&db).await, [0], "{adapter:?}");
+        if adapter == Adapter::Mariadb {
+            // A connection left without autocommit gets it back, so later writes on it
+            // aren't rolled back at the end of their run.
+            db.execute(&conn, "SET autocommit = 0", WRITE)
+                .await
+                .unwrap();
+            for _ in 0..EVERY_CONNECTION {
+                db.execute(&conn, "INSERT INTO it_txn_leak VALUES (4)", WRITE)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(count(&Db::new()).await, [EVERY_CONNECTION as i64]);
+        }
         db.execute(&conn, "DROP TABLE it_txn_leak", WRITE)
             .await
             .unwrap();

@@ -85,9 +85,12 @@ pub(super) const DIALECT: Dialect = Dialect {
 };
 
 /// Ends any transaction a run left open, so the connection goes back to the pool
-/// without one. With none open, `ROLLBACK` does nothing.
+/// without one. With none open, `ROLLBACK` does nothing. Autocommit comes back on after
+/// it, not before, which would commit: a run that turned it off would otherwise leave
+/// every later write on this connection to be rolled back here.
 pub(super) async fn end_transaction(conn: &mut MySqlConnection) -> Result<()> {
     conn.execute("ROLLBACK").await?;
+    conn.execute("SET autocommit = 1").await?;
     Ok(())
 }
 
