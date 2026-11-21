@@ -109,12 +109,14 @@ pub(super) const DIALECT: Dialect = Dialect {
 
 /// Ends any transaction a run left open, such as one it began, or one a failed
 /// statement aborted, so the connection goes back to the pool without one. Returns
-/// whether there was one.
+/// whether there was one, to tell the user.
 ///
 /// The driver doesn't expose the server's transaction status, so this asks: sent as a
 /// simple query outside a transaction, a statement starts its own, at the same moment;
 /// inside one, the transaction started earlier. In one a failed statement aborted, any
-/// query is refused with `in_failed_sql_transaction`.
+/// query is refused with `in_failed_sql_transaction`. The answer only decides whether
+/// to tell: two times in the same microsecond would read as no transaction, so
+/// `ROLLBACK` is sent either way (with none open, PostgreSQL only warns).
 pub(super) async fn end_transaction(
     conn: &mut PgConnection,
     _script_left_open: bool,
@@ -133,9 +135,7 @@ pub(super) async fn end_transaction(
         }
         Err(e) => return Err(e.into()),
     };
-    if open {
-        conn.execute("ROLLBACK").await?;
-    }
+    conn.execute("ROLLBACK").await?;
     Ok(open)
 }
 
