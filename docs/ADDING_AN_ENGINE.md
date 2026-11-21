@@ -75,7 +75,7 @@ not part of the read-only guard.
 ## 3. The engine module (`core/src/db/<engine>.rs`)
 
 Declare it with `mod <engine>;` at the top of `db.rs`. Copy the shape of `db/postgres.rs`: the same
-function names, each taking the engine's pool.
+function names. `options` and `connect` take the connection; the rest take the engine's pool.
 
 | Item                          | What it does                                                        |
 | ----------------------------- | ------------------------------------------------------------------- |

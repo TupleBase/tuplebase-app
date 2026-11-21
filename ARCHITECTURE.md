@@ -68,12 +68,12 @@ scripts/                   install, packaging, release helpers
   which names any difference between them where it occurs. A feature only one engine has,
   such as MySQL events, lives only in that engine's module. The module's `DIALECT` holds
   its fixed statements, such as the read-only ones `db.rs` runs around each statement (S2).
-  Opening a pool is in `db/connect.rs`, with one connect-options function per engine.
+  Each engine module also opens its own pool (`options`, `connect`, `renew`); `db/connect.rs`
+  keeps what every engine shares: credentials, the SSH tunnel and token renewal.
   What needs no SQL (name, default port, file or server, quoting, script splitting) is in
   one `EngineInfo` per engine in `config`, from `Adapter::info`, so every module can read
   it. Match on `Adapter` and `Pool` without a catch-all, so a new engine makes the compiler
-  list each place to fill in (`Pool::set_options` is the one exception: options can't
-  belong to another engine's pool). A new engine is a new module plus one arm per feature; see
+  list each place to fill in. A new engine is a new module plus one arm per feature; see
   [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md).
 
 ## Inside `app`
