@@ -19,6 +19,8 @@ pub struct Discovered {
     pub adapter: Option<Adapter>,
     /// The provider's name for the engine, such as `aurora-postgresql`.
     pub engine: String,
+    /// The engine's version, such as `16.3`; empty when the provider names none.
+    pub version: String,
     pub host: String,
     pub port: u16,
     pub database: String,
@@ -42,6 +44,42 @@ impl Discovered {
     /// Whether the app can connect to it.
     pub fn usable(&self) -> bool {
         self.adapter.is_some() && !self.host.is_empty()
+    }
+
+    /// The engine as people name it, with its version: `Aurora PostgreSQL 15.4`,
+    /// `Redshift Serverless`, or the provider's name for one the app doesn't know.
+    pub fn engine_label(&self) -> String {
+        let name = match self.engine.as_str() {
+            "aurora-postgresql" => "Aurora PostgreSQL".to_owned(),
+            "aurora-mysql" | "aurora" => "Aurora MySQL".to_owned(),
+            "redshift-serverless" => "Redshift Serverless".to_owned(),
+            _ => match self.adapter {
+                Some(adapter) => adapter.label().to_owned(),
+                None => self.engine.clone(),
+            },
+        };
+        match self.version.as_str() {
+            "" => name,
+            version => format!("{name} {version}"),
+        }
+    }
+
+    /// Whether a search for `query` finds it: each word of the query, ignoring case, is
+    /// in its name, engine, version, region, endpoint or status. An empty query finds all.
+    pub fn matches(&self, query: &str) -> bool {
+        let fields = [
+            &self.label,
+            &self.engine,
+            &self.engine_label(),
+            &self.source.region,
+            &self.host,
+            &self.status,
+        ]
+        .map(|f| f.to_lowercase());
+        query
+            .to_lowercase()
+            .split_whitespace()
+            .all(|word| fields.iter().any(|field| field.contains(word)))
     }
 
     /// The connection it suggests: its name, endpoint, master user and database, with its
@@ -127,6 +165,7 @@ mod tests {
             label: "orders".into(),
             adapter: Some(Adapter::Postgres),
             engine: "postgres".into(),
+            version: "16.3".into(),
             host: "orders.abc.eu-west-1.rds.amazonaws.com".into(),
             port: 5432,
             database: "orders".into(),
@@ -160,6 +199,26 @@ mod tests {
         assert_eq!(conn.source, Some(found().source));
         let mut config = crate::config::Config::default();
         config.upsert(conn, None).unwrap();
+    }
+
+    #[test]
+    fn a_search_matches_every_word_in_any_field_ignoring_case() {
+        let mut aurora = found();
+        aurora.engine = "aurora-postgresql".into();
+        assert_eq!(aurora.engine_label(), "Aurora PostgreSQL 16.3");
+        assert!(aurora.matches(""));
+        assert!(aurora.matches("ORDERS"));
+        assert!(aurora.matches("aurora eu-west"));
+        assert!(aurora.matches("postgresql 16"));
+        assert!(aurora.matches("abc.eu-west-1.rds"));
+        assert!(aurora.matches("  available  "));
+        assert!(!aurora.matches("orders mysql"));
+        assert!(!aurora.matches("us-east-1"));
+        let mut legacy = found();
+        legacy.adapter = None;
+        legacy.engine = "oracle-ee".into();
+        legacy.version.clear();
+        assert_eq!(legacy.engine_label(), "oracle-ee");
     }
 
     #[test]
