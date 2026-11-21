@@ -6,6 +6,7 @@ mod chat;
 mod completions;
 mod conn_form;
 mod conn_source;
+mod connection_tab;
 mod dialogs;
 mod logos;
 mod results;
@@ -21,8 +22,8 @@ mod workspace;
 use gpui_kit::component::{GlobalState, TitleBar};
 use gpui_kit::*;
 use workspace::{
-    About, AddMcpToAgents, CheckForUpdates, DecreaseFontSize, IncreaseFontSize, OpenSettings,
-    ResetFontSize, Workspace,
+    About, AddMcpToAgents, CheckForUpdates, DecreaseFontSize, IncreaseFontSize, OpenConnections,
+    OpenSettings, ResetFontSize, Workspace,
 };
 
 actions!(tuplebase, [Quit]);
@@ -38,6 +39,7 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("About TupleBase", About),
             MenuItem::action("Check for Updates…", CheckForUpdates),
             MenuItem::separator(),
+            MenuItem::action("Connections…", OpenConnections),
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::action("Add MCP Server to Agents", AddMcpToAgents),
             MenuItem::separator(),
@@ -76,7 +78,8 @@ fn main() {
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some(tuplebase_core::PRODUCT_NAME.into()),
-                    traffic_light_position: Some(point(px(13.), px(13.))),
+                    // Centred in the top bar.
+                    traffic_light_position: Some(point(px(13.), px(15.))),
                     ..TitleBar::title_bar_options()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

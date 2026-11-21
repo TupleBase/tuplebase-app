@@ -78,25 +78,28 @@ scripts/                   install, packaging, release helpers
 
 ## Inside `app`
 
-| Module               | Owns                                                        |
-| -------------------- | ----------------------------------------------------------- |
-| `main`               | startup, window, key bindings                               |
-| `workspace`          | the main window: connection sidebar, SQL editor, results    |
-| `workspace/settings` | the Settings dialog                                         |
-| `conn_form`          | the add and edit connection form                            |
-| `conn_source`        | the first step of adding one: where the database is         |
-| `aws_picker`         | finding a database in AWS to fill in the form               |
-| `dialogs`            | the close icon and confirm buttons the app's dialogs share  |
-| `schema`             | the schema browser                                          |
-| `results`            | the table that shows a query result                         |
-| `row_detail`         | the panel that shows one result row field by field          |
-| `chat`               | the chat panel                                              |
-| `completions`        | SQL autocomplete                                            |
-| `run_button`         | the Run button beside the statement under the cursor        |
-| `tree_nav`           | keyboard navigation shared by the trees                     |
-| `runtime`            | the Tokio runtime for background work                       |
-| `saving`             | background saves of one file, written in the order made     |
-| `theme`, `logos`     | colors and icons                                            |
+| Module                  | Owns                                                       |
+| ----------------------- | ---------------------------------------------------------- |
+| `main`                  | startup, window, key bindings                              |
+| `workspace`             | the main window: the open connections, one tab each        |
+| `workspace/top_bar`     | the bar of tabs, with Connections, chat, Settings and MCP  |
+| `workspace/connections` | the Connections dialog: the folder tree, to open a tab     |
+| `workspace/settings`    | the Settings dialog                                        |
+| `connection_tab`        | one open connection: SQL editor, schema, results, status   |
+| `conn_form`             | the add and edit connection form                           |
+| `conn_source`           | the first step of adding one: where the database is        |
+| `aws_picker`            | finding a database in AWS to fill in the form              |
+| `dialogs`               | the close icon and confirm buttons the app's dialogs share |
+| `schema`                | the schema browser                                         |
+| `results`               | the table that shows a query result                        |
+| `row_detail`            | the panel that shows one result row field by field         |
+| `chat`                  | the chat panel                                             |
+| `completions`           | SQL autocomplete                                           |
+| `run_button`            | the Run button beside the statement under the cursor       |
+| `tree_nav`              | keyboard navigation shared by the trees                    |
+| `runtime`               | the Tokio runtime for background work                      |
+| `saving`                | background saves of one file, written in the order made    |
+| `theme`, `logos`        | colors and icons                                           |
 
 - **A1. Never block the UI thread.** Database, file, keychain and network I/O run on the
   Tokio runtime through `runtime`; the UI updates when the result arrives.
