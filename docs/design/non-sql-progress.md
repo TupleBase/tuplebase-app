@@ -20,7 +20,7 @@ Plan: nosql-plan.md (same folder). User said (2026-11-21): "be autonomous, use y
 - [x] Local servers: no docker daemon by default; start with `(dockerd >log 2>&1 &)`. Images mongo:8.0 and amazon/dynamodb-local:latest pulled and run fine (ports 57017, 58000 used in probe).
 - [x] PR 1 core refactor: #47 merged (cde7608). Note: integration test crates hit async "queries overflow the depth limit" when nesting another async fn under Db::run; try #![recursion_limit = "256"] in the test crate(s) first.
 - [x] PR 2 Mongo + DocumentDB core: #48 merged (51dcc27). Adversarial review: no writes; fixed $_internalJs* JS bypass ($_ keys refused), maxTimeMS 60s cap, allowDiskUse refused; view-stored $function documented as limit. Disk: tb-redesign target hit 45 GB -> run `cargo clean` there between big PRs if df shows < 10 GB.
-- [ ] PR 3 Mongo UI polish
+- [x] PR 3 Mongo UI polish: built, clippy and tests green; real app checked under Xvfb (completions, documents with absent vs null, row detail tree, indexes). Fresh containers need `scripts/ci-linux-deps.sh` plus `mesa-vulkan-drivers xdotool` for Xvfb runs; the sshd compose service can't install openssh here (no apk network), so the ssh IT tests fail locally only.
 - [ ] PR 4 DocumentDB AWS
 - [ ] PR 5 DynamoDB (min e2e)
 - [ ] PR 6 MCP

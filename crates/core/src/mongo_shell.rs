@@ -591,8 +591,6 @@ fn line_column(src: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
-/// The deepest nesting of documents and arrays accepted, so a hostile input can't
-/// exhaust the stack.
 /// The collection methods that read, as the parser reads them after `db.<collection>.`;
 /// the editor's completions offer these names.
 pub const READ_METHODS: [&str; 7] = [
@@ -642,6 +640,8 @@ pub const FIND_CURSOR_METHODS: [&str; 7] = [
 /// The methods that may follow `aggregate(...)`.
 pub const AGGREGATE_CURSOR_METHODS: [&str; 3] = ["pretty", "toArray", "explain"];
 
+/// The deepest nesting of documents and arrays accepted, so a hostile input can't
+/// exhaust the stack.
 const MAX_DEPTH: usize = 100;
 
 struct Parser<'a> {
