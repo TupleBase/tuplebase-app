@@ -6,8 +6,10 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::updates;
@@ -225,11 +227,76 @@ fn add_in(home: &Path, os: Os, server: &str, only: Option<&str>) -> Vec<AgentSta
 }
 
 fn add(agent: &Agent, server: &str) -> Result<()> {
-    let text = read_config(&agent.config)?;
-    if let Some(updated) = change(agent.format, &text, server)? {
-        write_keeping_file(&agent.config, &updated)?;
+    // Two adds at once, such as Add all and one agent's Add, take turns.
+    static ADDING: Mutex<()> = Mutex::new(());
+    let _adding = ADDING.lock().unwrap_or_else(PoisonError::into_inner);
+    update_file(&agent.config, |text| change(agent.format, text, server))
+}
+
+/// How often a file that keeps changing under us is tried again.
+const ATTEMPTS: usize = 5;
+
+/// Applies `change` to the file and writes the result, without losing what another
+/// program writes meanwhile. Agents rewrite their own config while they run (Claude Code
+/// saves `~/.claude.json` often), so the file is read again right before the new one
+/// replaces it. If it changed, the change is made again on what is there now.
+fn update_file(path: &Path, mut change: impl FnMut(&str) -> Result<Option<String>>) -> Result<()> {
+    for _ in 0..ATTEMPTS {
+        let text = read_config(path)?;
+        let Some(updated) = change(&text)? else {
+            return Ok(());
+        };
+        let pending = Pending::write(path, &updated)?;
+        if read_config(path)? == text {
+            return pending.replace();
+        }
     }
-    Ok(())
+    bail!("the file kept changing while it was written, so it was left alone; try again")
+}
+
+/// The new text of a config file, written beside it and not yet in its place. Removed
+/// unless [`Pending::replace`] moves it there.
+struct Pending {
+    tmp: PathBuf,
+    target: PathBuf,
+}
+
+impl Pending {
+    /// Follows a symlink and keeps the file's permissions: these files can hold tokens.
+    fn write(path: &Path, text: &str) -> Result<Self> {
+        static WRITES: AtomicU64 = AtomicU64::new(0);
+        let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let permissions = fs::metadata(&target).ok().map(|m| m.permissions());
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        // Its own name, so two writers never share one.
+        let n = WRITES.fetch_add(1, Ordering::Relaxed);
+        let mut name = target.file_name().unwrap_or_default().to_owned();
+        name.push(format!(".tuplebase-{}-{n}.tmp", std::process::id()));
+        let pending = Self {
+            tmp: target.with_file_name(name),
+            target,
+        };
+        let context = || format!("writing {}", pending.tmp.display());
+        write_private(&pending.tmp, text).with_context(context)?;
+        if let Some(permissions) = permissions {
+            fs::set_permissions(&pending.tmp, permissions).with_context(context)?;
+        }
+        Ok(pending)
+    }
+
+    fn replace(self) -> Result<()> {
+        fs::rename(&self.tmp, &self.target)
+            .with_context(|| format!("writing {}", self.target.display()))
+    }
+}
+
+impl Drop for Pending {
+    /// Nothing is left behind, also when the file was replaced (then there is nothing).
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.tmp);
+    }
 }
 
 /// A file that doesn't exist yet reads as empty.
@@ -338,24 +405,6 @@ fn change_toml(text: &str, server: &str) -> Result<Option<String>> {
     } else {
         updated
     }))
-}
-
-/// Replaces the file atomically, following a symlink and keeping its permissions: these
-/// files can hold tokens.
-fn write_keeping_file(path: &Path, text: &str) -> Result<()> {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let permissions = fs::metadata(&target).ok().map(|m| m.permissions());
-    if let Some(dir) = target.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    let tmp = target.with_extension("tuplebase-tmp");
-    let _ = fs::remove_file(&tmp);
-    write_private(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Some(permissions) = permissions {
-        fs::set_permissions(&tmp, permissions)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-    }
-    fs::rename(&tmp, &target).with_context(|| format!("writing {}", target.display()))
 }
 
 /// Not readable by others even for a moment.
@@ -604,6 +653,107 @@ mod tests {
         assert!(config(Os::Linux).starts_with("/h/.config/Claude"));
     }
 
+    /// A `~/.claude.json` as Claude Code keeps it: much more than servers.
+    const CLAUDE_JSON: &str = r#"{
+  "numStartups": 42,
+  "projects": { "/home/me/app": { "allowedTools": ["Bash(ls)"] } },
+  "mcpServers": { "other": { "type": "stdio", "command": "/bin/other" } },
+  "oauthAccount": { "emailAddress": "me@example.com" }
+}
+"#;
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn files_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn adding_to_claude_code_keeps_the_users_other_entries() {
+        let home = tempfile::tempdir().unwrap();
+        added(home.path(), ".claude");
+        let config = home.path().join(".claude.json");
+        fs::write(&config, CLAUDE_JSON).unwrap();
+        let result = add_in(home.path(), Os::Linux, SERVER, Some("Claude Code"));
+        assert_eq!(state_of(&result, "Claude Code"), AgentState::Added);
+        let value = read_json(&config);
+        assert_eq!(value["numStartups"], 42);
+        assert_eq!(
+            value["projects"]["/home/me/app"]["allowedTools"][0],
+            "Bash(ls)"
+        );
+        assert_eq!(value["oauthAccount"]["emailAddress"], "me@example.com");
+        assert_eq!(value["mcpServers"]["other"]["command"], "/bin/other");
+        assert_eq!(value["mcpServers"]["tuplebase"]["command"], SERVER);
+        assert_eq!(value["mcpServers"]["tuplebase"]["type"], "stdio");
+        assert_eq!(files_in(home.path()), [".claude", ".claude.json"]);
+    }
+
+    #[test]
+    fn what_the_agent_writes_meanwhile_is_kept() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".claude.json");
+        fs::write(&config, CLAUDE_JSON).unwrap();
+        let mut calls = 0;
+        update_file(&config, |text| {
+            calls += 1;
+            if calls == 1 {
+                // Claude Code saves its own change after we read the file.
+                let mut value: Value = serde_json::from_str(text).unwrap();
+                value["numStartups"] = json!(43);
+                value["mcpServers"]["added-meanwhile"] = json!({"command": "/bin/new"});
+                fs::write(&config, value.to_string()).unwrap();
+            }
+            change_json(text, "mcpServers", true, SERVER)
+        })
+        .unwrap();
+        assert_eq!(calls, 2, "the change is made again on the new file");
+        let value = read_json(&config);
+        assert_eq!(value["numStartups"], 43);
+        assert_eq!(
+            value["mcpServers"]["added-meanwhile"]["command"],
+            "/bin/new"
+        );
+        assert_eq!(value["mcpServers"]["other"]["command"], "/bin/other");
+        assert_eq!(value["mcpServers"]["tuplebase"]["command"], SERVER);
+        assert_eq!(
+            value["projects"]["/home/me/app"]["allowedTools"][0],
+            "Bash(ls)"
+        );
+        assert_eq!(files_in(home.path()), [".claude.json"]);
+    }
+
+    #[test]
+    fn a_file_that_keeps_changing_is_left_to_its_writer() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(".claude.json");
+        fs::write(&config, CLAUDE_JSON).unwrap();
+        let mut startups = 100;
+        let error = update_file(&config, |text| {
+            startups += 1;
+            let mut value: Value = serde_json::from_str(text).unwrap();
+            value["numStartups"] = json!(startups);
+            fs::write(&config, value.to_string()).unwrap();
+            change_json(text, "mcpServers", true, SERVER)
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("kept changing"), "{error:#}");
+        let value = read_json(&config);
+        assert_eq!(
+            value["numStartups"], startups,
+            "the last write is not undone"
+        );
+        assert!(value["mcpServers"].get("tuplebase").is_none());
+        assert_eq!(files_in(home.path()), [".claude.json"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn writing_keeps_permissions_and_symlinks() {
@@ -614,7 +764,7 @@ mod tests {
         fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
         let link = dir.path().join("link.json");
         symlink(&real, &link).unwrap();
-        write_keeping_file(&link, "{\"a\":1}\n").unwrap();
+        update_file(&link, |_| Ok(Some("{\"a\":1}\n".to_owned()))).unwrap();
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
         assert_eq!(fs::read_to_string(&real).unwrap(), "{\"a\":1}\n");
         let mode = fs::metadata(&real).unwrap().permissions().mode() & 0o777;
