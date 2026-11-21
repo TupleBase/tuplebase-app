@@ -23,6 +23,7 @@ use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::mysql::MySqlPool;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
@@ -469,45 +470,61 @@ impl Db {
         let mut changed = false;
 
         macro_rules! run_all {
-            ($pool:expr, $dialect:expr, $decode:path) => {{
+            ($pool:expr, $dialect:expr, $decode:path, $end_transaction:path) => {{
                 let Dialect {
                     read_only_begin: begin,
                     read_only_end: end,
                     ..
                 } = $dialect;
-                let mut c = $pool.acquire().await?;
-                for (index, sql) in statements.iter().copied().enumerate() {
-                    if read_only {
-                        c.execute(begin).await?;
-                    }
-                    let mut out = run!(&mut *c, conn.adapter, sql, opts.max_rows, $decode);
-                    // The statement never ran, and its types are known now: run it again,
-                    // in a new read-only transaction when it had one.
-                    if out.as_ref().is_err_and(lost_unnamed_statement) {
+                let mut c = Lease::new($pool.acquire().await?);
+                let ran = async {
+                    for (index, sql) in statements.iter().copied().enumerate() {
                         if read_only {
-                            c.execute(end).await?;
                             c.execute(begin).await?;
                         }
-                        out = run!(&mut *c, conn.adapter, sql, opts.max_rows, $decode);
+                        let mut out = run!(&mut **c, conn.adapter, sql, opts.max_rows, $decode);
+                        // The statement never ran, and its types are known now: run it
+                        // again, in a new read-only transaction when it had one.
+                        if out.as_ref().is_err_and(lost_unnamed_statement) {
+                            if read_only {
+                                c.execute(end).await?;
+                                c.execute(begin).await?;
+                            }
+                            out = run!(&mut **c, conn.adapter, sql, opts.max_rows, $decode);
+                        }
+                        if read_only && c.execute(end).await.is_err() {
+                            c.close_on_drop();
+                        }
+                        let result = if total > 1 {
+                            out.with_context(|| format!("statement {} of {total}", index + 1))?
+                        } else {
+                            out?
+                        };
+                        changed |= result.rows_affected.is_some();
+                        if shown.is_none() || !result.columns.is_empty() {
+                            shown = Some(result);
+                        }
                     }
-                    if read_only && c.execute(end).await.is_err() {
-                        c.close_on_drop();
-                    }
-                    let result = if total > 1 {
-                        out.with_context(|| format!("statement {} of {total}", index + 1))?
-                    } else {
-                        out?
-                    };
-                    changed |= result.rows_affected.is_some();
-                    if shown.is_none() || !result.columns.is_empty() {
-                        shown = Some(result);
-                    }
+                    Ok::<_, anyhow::Error>(())
                 }
+                .await;
+                // Whether the statements succeeded or not, none of them may leave a
+                // transaction open on a connection that later work, from another tab or
+                // the MCP server, would get from the pool.
+                if $end_transaction(&mut **c).await.is_ok() {
+                    c.reusable();
+                }
+                ran?;
             }};
         }
         match self.pool(conn).await? {
-            Pool::Pg(pool) => run_all!(pool, postgres::DIALECT, postgres::value),
-            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value),
+            Pool::Pg(pool) => run_all!(
+                pool,
+                postgres::DIALECT,
+                postgres::value,
+                postgres::end_transaction
+            ),
+            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value, mysql::end_transaction),
             Pool::Sqlite(pools) => {
                 let pool = if read_only {
                     for statement in statements {
@@ -517,7 +534,12 @@ impl Db {
                 } else {
                     pools.main
                 };
-                run_all!(pool, sqlite::DIALECT, sqlite::value)
+                run_all!(
+                    pool,
+                    sqlite::DIALECT,
+                    sqlite::value,
+                    sqlite::end_transaction
+                )
             }
         }
 
@@ -672,6 +694,50 @@ fn same_target(a: &Connection, b: &Connection) -> bool {
     a.folder.clone_from(&b.folder);
     a.color.clone_from(&b.color);
     a == *b
+}
+
+/// A pooled connection for one run. Dropped before [`Lease::reusable`], it is closed
+/// instead of going back to the pool: a run cut short, or whose transaction couldn't be
+/// ended, may have left one open on it.
+struct Lease<DB: sqlx::Database> {
+    conn: PoolConnection<DB>,
+    reusable: bool,
+}
+
+impl<DB: sqlx::Database> Lease<DB> {
+    fn new(conn: PoolConnection<DB>) -> Self {
+        Self {
+            conn,
+            reusable: false,
+        }
+    }
+
+    /// No transaction is open: the connection may go back to the pool.
+    fn reusable(&mut self) {
+        self.reusable = true;
+    }
+}
+
+impl<DB: sqlx::Database> std::ops::Deref for Lease<DB> {
+    type Target = PoolConnection<DB>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl<DB: sqlx::Database> std::ops::DerefMut for Lease<DB> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
+}
+
+impl<DB: sqlx::Database> Drop for Lease<DB> {
+    fn drop(&mut self) {
+        if !self.reusable {
+            self.conn.close_on_drop();
+        }
+    }
 }
 
 /// Whether PostgreSQL lost the statement before running it. The driver prepares each

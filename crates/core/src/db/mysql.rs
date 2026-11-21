@@ -8,7 +8,7 @@
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use sqlx::mysql::{MySqlPool, MySqlRow};
+use sqlx::mysql::{MySqlConnection, MySqlPool, MySqlRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue};
 use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo, ValueRef};
@@ -83,6 +83,13 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "ROLLBACK",
     objects: OBJECTS,
 };
+
+/// Ends any transaction a run left open, so the connection goes back to the pool
+/// without one. With none open, `ROLLBACK` does nothing.
+pub(super) async fn end_transaction(conn: &mut MySqlConnection) -> Result<()> {
+    conn.execute("ROLLBACK").await?;
+    Ok(())
+}
 
 pub(super) async fn column_names(pool: &MySqlPool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(

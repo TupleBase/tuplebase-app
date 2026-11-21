@@ -4,10 +4,10 @@ use std::fmt::Write as _;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use sqlx::postgres::{PgPool, PgRow, PgValueFormat};
+use sqlx::postgres::{PgConnection, PgPool, PgRow, PgValueFormat};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{JsonValue, Uuid};
-use sqlx::{Row, TypeInfo, ValueRef};
+use sqlx::{Executor, Row, TypeInfo, ValueRef};
 
 use super::decode::{bytes, decode_first, fallback, float, text, type_name_or_return};
 use super::{
@@ -106,6 +106,14 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "ROLLBACK",
     objects: OBJECTS,
 };
+
+/// Ends any transaction a run left open, such as one it began, or one a failed
+/// statement aborted, so the connection goes back to the pool without one. With none
+/// open, PostgreSQL only warns.
+pub(super) async fn end_transaction(conn: &mut PgConnection) -> Result<()> {
+    conn.execute("ROLLBACK").await?;
+    Ok(())
+}
 
 pub(super) async fn column_names(pool: &PgPool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(

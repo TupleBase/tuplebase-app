@@ -485,6 +485,89 @@ async fn sqlite_indexes_and_triggers_are_listed() {
 /// A fresh connection doesn't know a custom type yet. Looking it up must not lose the
 /// statement that asked for it: PostgreSQL drops the unnamed prepared statement whenever
 /// another query runs on the connection.
+/// More than a pool holds: the pool hands its idle connections out in turn, so this many
+/// queries reach each of them.
+const EVERY_CONNECTION: usize = 8;
+
+/// A pooled connection never goes back with a transaction open: the next query, from
+/// another tab or the MCP server, would run inside it.
+#[tokio::test]
+async fn a_transaction_left_open_ends_with_its_run() {
+    each_adapter(async |db, conn| {
+        // The rows each connection sees.
+        let count = async |db: &Db| {
+            let mut seen = Vec::new();
+            for _ in 0..EVERY_CONNECTION {
+                let r = db
+                    .execute(&conn, "SELECT COUNT(*) FROM it_txn_leak", WRITE)
+                    .await
+                    .unwrap();
+                seen.push(r.rows[0][0].as_i64().unwrap());
+            }
+            seen.dedup();
+            seen
+        };
+        // Separate statements: MariaDB commits around each DDL statement anyway.
+        for sql in [
+            "DROP TABLE IF EXISTS it_txn_leak",
+            "CREATE TABLE it_txn_leak (id INT)",
+        ] {
+            db.execute(&conn, sql, WRITE).await.unwrap();
+        }
+        db.execute_script(
+            &conn,
+            "START TRANSACTION; INSERT INTO it_txn_leak VALUES (1)",
+            WRITE,
+        )
+        .await
+        .unwrap();
+        let adapter = conn.adapter;
+        assert_eq!(
+            count(&db).await,
+            [0],
+            "{adapter:?}: ran in the open transaction"
+        );
+        if adapter == Adapter::Postgres {
+            // Read-only work gets its own read-only transaction, not the one left open.
+            db.execute(&conn, "START TRANSACTION", WRITE).await.unwrap();
+            for _ in 0..EVERY_CONNECTION {
+                let r = db
+                    .execute(&conn, "SHOW transaction_read_only", READ)
+                    .await
+                    .unwrap();
+                assert_eq!(r.rows, [[json!("on")]]);
+            }
+        }
+        // A later COMMIT doesn't commit what an earlier run left open.
+        db.execute_script(
+            &conn,
+            "START TRANSACTION; INSERT INTO it_txn_leak VALUES (2)",
+            WRITE,
+        )
+        .await
+        .unwrap();
+        for _ in 0..EVERY_CONNECTION {
+            db.execute(&conn, "COMMIT", WRITE).await.unwrap();
+        }
+        assert_eq!(count(&Db::new()).await, [0], "{adapter:?}");
+        // A script that fails inside a transaction leaves every connection usable.
+        let failed = db
+            .execute_script(
+                &conn,
+                "START TRANSACTION; INSERT INTO it_txn_leak VALUES (3); \
+                 INSERT INTO it_txn_missing VALUES (1)",
+                WRITE,
+            )
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(count(&db).await, [0], "{adapter:?}");
+        db.execute(&conn, "DROP TABLE it_txn_leak", WRITE)
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn postgres_shows_nan_infinity_and_numerics_of_any_size_exactly() {
     if !enabled() {

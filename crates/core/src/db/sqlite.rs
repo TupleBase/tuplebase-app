@@ -5,10 +5,12 @@ use std::ffi::CStr;
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
-use libsqlite3_sys::{SQLITE_OK, sqlite3_errmsg, sqlite3_finalize, sqlite3_prepare_v2};
+use libsqlite3_sys::{
+    SQLITE_OK, sqlite3_errmsg, sqlite3_finalize, sqlite3_get_autocommit, sqlite3_prepare_v2,
+};
 use serde_json::{Value, json};
-use sqlx::sqlite::{SqlitePool, SqliteRow};
-use sqlx::{Row, TypeInfo, ValueRef};
+use sqlx::sqlite::{SqliteConnection, SqlitePool, SqliteRow};
+use sqlx::{Executor, Row, TypeInfo, ValueRef};
 
 use super::decode::{bytes, decode_first, fallback, float, type_name_or_return};
 use super::{Dialect, ObjectInfo, ObjectKind, Source, objects, unsupported};
@@ -33,6 +35,21 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "PRAGMA query_only = OFF",
     objects: OBJECTS,
 };
+
+/// Ends any transaction a run left open, so the connection goes back to the pool
+/// without one, and without the lock that would keep everyone else from writing.
+/// SQLite says whether one is open; `ROLLBACK` without one is an error.
+pub(super) async fn end_transaction(conn: &mut SqliteConnection) -> Result<()> {
+    let open = {
+        let mut handle = conn.lock_handle().await?;
+        // SAFETY: the locked handle keeps sqlx off the connection until it's dropped.
+        unsafe { sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) == 0 }
+    };
+    if open {
+        conn.execute("ROLLBACK").await?;
+    }
+    Ok(())
+}
 
 /// Refuses `sql` unless SQLite reads it as one statement (S2). Given several, sqlx runs
 /// them all, one after another, so a second statement that the guard's own splitter

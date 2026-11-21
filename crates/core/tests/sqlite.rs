@@ -62,6 +62,50 @@ async fn user_count(db: &Db, conn: &Connection) -> i64 {
     r.rows[0][0].as_i64().unwrap()
 }
 
+/// A pooled connection never goes back with a transaction open: the next query would
+/// run inside it, and its lock would keep everyone else from writing.
+#[tokio::test]
+async fn a_transaction_left_open_ends_with_its_run() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    db.execute_script(
+        &conn,
+        "BEGIN; INSERT INTO users (id, name) VALUES (3, 'Left open')",
+        WRITE,
+    )
+    .await
+    .unwrap();
+    let r = db
+        .execute(&conn, "SELECT COUNT(*) FROM users", WRITE)
+        .await
+        .unwrap();
+    assert_eq!(r.rows, [[json!(2)]], "ran in the open transaction");
+    // Another connection to the file can write.
+    Db::new()
+        .execute(
+            &conn,
+            "INSERT INTO users (id, name) VALUES (4, 'Other')",
+            WRITE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_count(&db, &conn).await, 3);
+    // A failure inside a transaction leaves none open either.
+    let failed = db
+        .execute_script(&conn, "BEGIN; INSERT INTO missing VALUES (1)", WRITE)
+        .await;
+    assert!(failed.is_err());
+    db.execute(&conn, "BEGIN", WRITE).await.unwrap();
+    db.execute(&conn, "INSERT INTO users (id, name) VALUES (5, 'x')", WRITE)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_count(&Db::new(), &conn).await,
+        4,
+        "no transaction swallowed it"
+    );
+}
+
 #[tokio::test]
 async fn select_decodes_values() {
     let (_dir, conn) = database().await;
