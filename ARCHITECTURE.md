@@ -44,10 +44,10 @@ scripts/                   install, packaging, release helpers
 | `app_status`   | the file naming the connections open in the app           | `config`                                                |
 | `updates`      | the GitHub release check                                  | `config`                                                |
 | `db`           | the database API, pools, running SQL, the read-only guard | `config` `ssh` `safety`                                 |
-| `db/connect`   | opening a pool: credentials, tunnel, each engine's options | `config` `secrets` `ssh` `credentials` `cloud`, and `db` |
-| `db/postgres`  | PostgreSQL's own SQL, read-only statements, value decoding | `config`, and `db` (its parent)                         |
-| `db/mysql`     | MySQL's and MariaDB's SQL, read-only statements, decoding | `config`, and `db` (its parent)                         |
-| `db/sqlite`    | SQLite's own SQL, read-only switch, value decoding        | `config`, and `db` (its parent)                         |
+| `db/connect`   | opening a pool, for every engine: credentials, tunnel, token renewal, RDS authorities, pool size | `config` `secrets` `ssh` `credentials` `cloud`, and `db` |
+| `db/postgres`  | PostgreSQL's connect options and pool, own SQL, read-only statements, value decoding | `config`, and `db` (its parent) and `db/connect` |
+| `db/mysql`     | MySQL's and MariaDB's connect options and pool, SQL, read-only statements, decoding | `config`, and `db` (its parent) and `db/connect` |
+| `db/sqlite`    | SQLite's connect options and pools (one read-only), own SQL, read-only switch, value decoding | `config` `ssh`, and `db` (its parent) and `db/connect` |
 | `db/decode`    | value decoding the engine modules share                   | nothing                                                 |
 | `agents`       | the MCP server's entry in each agent's config file        | `updates`                                               |
 | `chat`         | running the user's agent for the chat panel               | `config` `agents`                                       |
@@ -68,12 +68,12 @@ scripts/                   install, packaging, release helpers
   which names any difference between them where it occurs. A feature only one engine has,
   such as MySQL events, lives only in that engine's module. The module's `DIALECT` holds
   its fixed statements, such as the read-only ones `db.rs` runs around each statement (S2).
-  Opening a pool is in `db/connect.rs`, with one connect-options function per engine.
+  Each engine module also opens its own pool (`options`, `connect`, `renew`); `db/connect.rs`
+  keeps what every engine shares: credentials, the SSH tunnel and token renewal.
   What needs no SQL (name, default port, file or server, quoting, script splitting) is in
   one `EngineInfo` per engine in `config`, from `Adapter::info`, so every module can read
   it. Match on `Adapter` and `Pool` without a catch-all, so a new engine makes the compiler
-  list each place to fill in (`Pool::set_options` is the one exception: options can't
-  belong to another engine's pool). A new engine is a new module plus one arm per feature; see
+  list each place to fill in. A new engine is a new module plus one arm per feature; see
   [docs/ADDING_AN_ENGINE.md](docs/ADDING_AN_ENGINE.md).
 
 ## Inside `app`

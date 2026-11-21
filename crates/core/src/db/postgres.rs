@@ -1,20 +1,22 @@
-//! PostgreSQL: its catalog queries, object sources, routine calls and value decoding.
+//! PostgreSQL: connecting, its catalog queries, object sources, routine calls and value
+//! decoding.
 
 use std::fmt::Write as _;
 
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use sqlx::postgres::{PgConnection, PgPool, PgRow, PgValueFormat};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgRow, PgSslMode, PgValueFormat};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{JsonValue, Uuid};
 use sqlx::{Executor, Row, TypeInfo, ValueRef};
 
+use super::connect::{extra_roots, pool_options};
 use super::decode::{bytes, decode_first, fallback, float, text, type_name_or_return};
 use super::{
     Dialect, ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
     sql_comment, unsupported,
 };
-use crate::config::Adapter;
+use crate::config::{Adapter, Connection, TlsMode};
 
 /// Each query returns schema, name and detail.
 const OBJECTS: &[(ObjectKind, &str)] = &[
@@ -380,6 +382,58 @@ fn numeric(bytes: &[u8]) -> Option<String> {
         out.push_str(&fraction);
     }
     Some(out)
+}
+
+/// Options to reach `conn` at `host:port`, which is the local end of the tunnel when
+/// there is one.
+pub(super) fn options(
+    conn: &Connection,
+    host: &str,
+    port: u16,
+    password: Option<&str>,
+) -> PgConnectOptions {
+    let mut opts = PgConnectOptions::new()
+        .host(host)
+        .port(port)
+        .username(&conn.user)
+        .ssl_mode(match conn.tls {
+            TlsMode::Prefer => PgSslMode::Prefer,
+            TlsMode::Require => PgSslMode::Require,
+            TlsMode::Verify => PgSslMode::VerifyFull,
+        });
+    if !conn.database.is_empty() {
+        opts = opts.database(&conn.database);
+    }
+    if let Some(pw) = password {
+        opts = opts.password(pw);
+    }
+    if let Some(pem) = extra_roots(conn) {
+        opts = opts.ssl_root_cert_from_pem(pem.to_vec());
+    }
+    opts
+}
+
+/// Opens `conn`'s pool at `host:port`.
+pub(super) async fn connect(
+    conn: &Connection,
+    host: &str,
+    port: u16,
+    password: Option<&str>,
+) -> Result<PgPool> {
+    Ok(pool_options()
+        .connect_with(options(conn, host, port, password))
+        .await?)
+}
+
+/// What the pool's new connections open with from now on, such as a renewed password.
+pub(super) fn renew(
+    pool: &PgPool,
+    conn: &Connection,
+    host: &str,
+    port: u16,
+    password: Option<&str>,
+) {
+    pool.set_connect_options(options(conn, host, port, password));
 }
 
 #[cfg(test)]

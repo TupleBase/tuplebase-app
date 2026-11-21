@@ -6,7 +6,9 @@
 //! This file holds the public API and what all engines share. Each [`Db`] method that
 //! needs engine-specific SQL picks the engine module by the pool and calls it:
 //! [`postgres`], [`mysql`] (MySQL and MariaDB) and [`sqlite`]. A feature only one engine
-//! has, such as MySQL events, lives only in that engine's module.
+//! has, such as MySQL events, lives only in that engine's module. So does connecting:
+//! [`Pool::open`] and [`Pool::renew`] call the engine module's `connect` and `renew`,
+//! and [`connect`] holds what every engine shares (credentials, tunnel, token renewal).
 
 mod connect;
 mod decode;
@@ -25,7 +27,6 @@ use serde_json::Value;
 use sqlx::mysql::MySqlPool;
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPool;
-use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
 use tokio::sync::Mutex;
 
@@ -34,6 +35,7 @@ use crate::safety;
 use crate::ssh::Tunnel;
 
 use connect::{Refresher, connect};
+use sqlite::SqlitePools;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QueryResult {
@@ -292,25 +294,39 @@ enum Pool {
     Sqlite(SqlitePools),
 }
 
-/// A SQLite file's pools. SQLite has no read-only transaction, and a statement can turn
-/// `PRAGMA query_only` off again, so read-only work (S2) runs on connections SQLite
-/// opened read-only: they refuse to write, whatever the statement says.
-#[derive(Clone)]
-struct SqlitePools {
-    /// Everything else. Read-only too when the connection is.
-    main: SqlitePool,
-    read_only: SqlitePool,
-}
-
 impl Pool {
+    /// Opens `conn`'s pool at `host:port`, which is the local end of the tunnel when there
+    /// is one, with the engine module's connect options.
+    async fn open(
+        conn: &Connection,
+        host: &str,
+        port: u16,
+        password: Option<&str>,
+    ) -> Result<Pool> {
+        Ok(match conn.adapter {
+            Adapter::Postgres => Pool::Pg(postgres::connect(conn, host, port, password).await?),
+            Adapter::Mariadb | Adapter::Mysql => {
+                Pool::My(mysql::connect(conn, host, port, password).await?)
+            }
+            Adapter::Sqlite => Pool::Sqlite(sqlite::connect(conn).await?),
+        })
+    }
+
+    /// What new connections open with from now on: options made again from `conn` and
+    /// `password`, such as a renewed IAM token. Connections already open keep theirs.
+    fn renew(&self, conn: &Connection, host: &str, port: u16, password: Option<&str>) {
+        match self {
+            Pool::Pg(p) => postgres::renew(p, conn, host, port, password),
+            Pool::My(p) => mysql::renew(p, conn, host, port, password),
+            Pool::Sqlite(p) => sqlite::renew(p, conn),
+        }
+    }
+
     async fn close(&self) {
         match self {
             Pool::Pg(p) => p.close().await,
             Pool::My(p) => p.close().await,
-            Pool::Sqlite(p) => {
-                p.main.close().await;
-                p.read_only.close().await;
-            }
+            Pool::Sqlite(p) => p.close().await,
         }
     }
 }

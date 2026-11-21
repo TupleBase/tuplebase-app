@@ -1,4 +1,5 @@
-//! SQLite: its catalog queries, object sources and value decoding. SQLite has no
+//! SQLite: connecting, with a pool of its own for read-only work, its catalog queries,
+//! object sources and value decoding. SQLite has no
 //! functions or procedures to call.
 
 use std::ffi::CStr;
@@ -9,11 +10,14 @@ use libsqlite3_sys::{
     SQLITE_OK, sqlite3_errmsg, sqlite3_finalize, sqlite3_get_autocommit, sqlite3_prepare_v2,
 };
 use serde_json::{Value, json};
-use sqlx::sqlite::{SqliteConnection, SqlitePool, SqliteRow};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePool, SqliteRow};
 use sqlx::{Executor, Row, TypeInfo, ValueRef};
 
+use super::connect::pool_options;
 use super::decode::{bytes, decode_first, fallback, float, type_name_or_return};
 use super::{Dialect, ObjectInfo, ObjectKind, Source, objects, unsupported};
+use crate::config::Connection;
+use crate::ssh;
 
 /// Each query returns schema, name and detail.
 const OBJECTS: &[(ObjectKind, &str)] = &[
@@ -177,6 +181,54 @@ pub(super) fn value(row: &SqliteRow, i: usize) -> Value {
     fallback(row, i, &type_name)
 }
 
+/// A SQLite file's pools. SQLite has no read-only transaction, and a statement can turn
+/// `PRAGMA query_only` off again, so read-only work (S2) runs on connections SQLite
+/// opened read-only: they refuse to write, whatever the statement says.
+#[derive(Clone)]
+pub(super) struct SqlitePools {
+    /// Everything else. Read-only too when the connection is.
+    pub(super) main: SqlitePool,
+    pub(super) read_only: SqlitePool,
+}
+
+impl SqlitePools {
+    pub(super) async fn close(&self) {
+        self.main.close().await;
+        self.read_only.close().await;
+    }
+}
+
+/// Options to open `conn`'s file, read-only when the connection is.
+pub(super) fn options(conn: &Connection) -> SqliteConnectOptions {
+    SqliteConnectOptions::new()
+        .filename(ssh::expand_home(&conn.database))
+        .read_only(conn.readonly)
+}
+
+/// Opens `conn`'s file. A file needs no host, port or password.
+pub(super) async fn connect(conn: &Connection) -> Result<SqlitePools> {
+    open(options(conn)).await
+}
+
+/// What the pools' new connections open with from now on.
+pub(super) fn renew(pools: &SqlitePools, conn: &Connection) {
+    set_options(pools, options(conn));
+}
+
+async fn open(opts: SqliteConnectOptions) -> Result<SqlitePools> {
+    Ok(SqlitePools {
+        read_only: pool_options().connect_lazy_with(opts.clone().read_only(true)),
+        main: pool_options().connect_with(opts).await?,
+    })
+}
+
+fn set_options(pools: &SqlitePools, opts: SqliteConnectOptions) {
+    pools
+        .read_only
+        .set_connect_options(opts.clone().read_only(true));
+    pools.main.set_connect_options(opts);
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -209,5 +261,32 @@ mod tests {
         }
         let missing = check_one_statement(&pool, "SELECT * FROM missing").await;
         assert!(missing.unwrap_err().to_string().contains("missing"));
+    }
+
+    /// Part of the read-only guard (S2): whatever the statement check lets through, the
+    /// read-only pool's connections can't write, also after the options change.
+    #[tokio::test]
+    async fn sqlite_read_only_work_runs_on_connections_that_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("app.sqlite"))
+            .create_if_missing(true);
+        let opened = open(options.clone()).await.unwrap();
+        let renewed = open(options.clone()).await.unwrap();
+        set_options(&renewed, options);
+        opened
+            .main
+            .execute("CREATE TABLE t (a); INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+        for pools in [&opened, &renewed] {
+            let write = "PRAGMA query_only = OFF; DELETE FROM t";
+            assert!(pools.read_only.execute(write).await.is_err());
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+                .fetch_one(&pools.read_only)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
     }
 }

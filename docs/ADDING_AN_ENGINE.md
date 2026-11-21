@@ -12,9 +12,12 @@ Where an engine's code lives:
 - **Its SQL** (catalog queries, read-only statements, object sources, routine calls, value
   decoding): its own module, `core/src/db/<engine>.rs` (L7). The module's `DIALECT` constant holds
   its fixed statements and the kinds of object it lists.
-- **Connecting** (driver options, TLS, the pool): one options function per engine in
-  `core/src/db/connect.rs`, and the `Pool` variant in `core/src/db.rs`. Which credentials and
-  tunnels apply is decided by `is_file`, in `core/src/credentials.rs` and `Connection::validate`.
+- **Connecting** (driver options, TLS, timeouts, the pool): its own module too, in `options`,
+  `connect` and `renew`, and the `Pool` variant in `core/src/db.rs`. `core/src/db/connect.rs`
+  keeps only what every engine shares (credentials, the SSH tunnel, renewing IAM tokens, the RDS
+  authorities and the pool's size and timeout), so a new engine doesn't change it. Which
+  credentials and tunnels apply is decided by `is_file`, in `core/src/credentials.rs` and
+  `Connection::validate`.
 - **How it looks**: its logo and color in `app/src/logos.rs`.
 
 Engines that work alike share a module, as MySQL and MariaDB share `db/mysql.rs`. Branch on the
@@ -72,7 +75,7 @@ not part of the read-only guard.
 ## 3. The engine module (`core/src/db/<engine>.rs`)
 
 Declare it with `mod <engine>;` at the top of `db.rs`. Copy the shape of `db/postgres.rs`: the same
-function names, each taking the engine's pool.
+function names. `options` and `connect` take the connection; the rest take the engine's pool.
 
 | Item                          | What it does                                                        |
 | ----------------------------- | ------------------------------------------------------------------- |
@@ -86,6 +89,9 @@ function names, each taking the engine's pool.
 | `object_definition(pool, o)`  | the object's `CREATE` statement, as a `Source`                      |
 | `call_template(pool, o)`      | only if the engine has functions or procedures                      |
 | `value(row, i)`               | one result cell as JSON, using the helpers in `db/decode.rs`        |
+| `options(conn, host, port, password)` | the driver's connect options; see step 5               |
+| `connect(conn, host, port, password)` | opens the engine's pool with those options             |
+| `renew(pool, conn, host, port, password)` | gives the open pool new options, such as a renewed IAM token |
 
 Leave out the system schemas, as the other modules do. Add unit tests beside the code for anything
 that builds SQL text, such as call templates or quoting.
@@ -102,19 +108,24 @@ engine shares:
 - In the tests at the bottom of `db.rs`, add an arm to `dialect` and add the engine to
   `read_only_statements_are_pinned` and `each_engine_lists_its_own_kinds_of_object`.
 
-## 5. Connecting (`core/src/db/connect.rs`, `core/src/db.rs`)
+## 5. Connecting (the engine module, `core/src/db.rs`)
 
-- `db.rs`: the `Pool` variant and its arm in `Pool::close`.
-- `db/connect.rs`:
-  - an `Options` variant and an `<engine>_options` function beside `postgres_options`. It sets
-    host, port, user, password and database, and maps each `TlsMode` to the driver's TLS mode.
-    For `TlsMode::Verify`, it adds `extra_roots(conn)` to the trusted authorities, so RDS hosts
-    verify. A file engine opens `ssh::expand_home(&conn.database)`, read-only when the connection
-    is, like `sqlite_options`;
-  - its arms in `connect_options` and `open_pool`;
-  - its arm in `Pool::set_options`. This one has a `_ => {}` arm for options of another engine, so
-    the compiler won't ask for it. A missing arm would mean a renewed IAM token never reaches the
-    pool.
+- The engine module (step 3):
+  - `options(conn, host, port, password)`, like `postgres::options`. It sets host, port, user,
+    password and database, and maps each `TlsMode` to the driver's TLS mode. For
+    `TlsMode::Verify`, it adds `connect::extra_roots(conn)` to the trusted authorities, so RDS
+    hosts verify. `host` and `port` are where to connect: the tunnel's local end when there is
+    one. A file engine takes only `conn` and opens `ssh::expand_home(&conn.database)`, read-only
+    when the connection is, like `sqlite::options`;
+  - `connect(...)`, which opens the pool with `connect::pool_options()`, so every engine has the
+    same pool size and acquire timeout. If read-only work needs a pool of its own, as on SQLite
+    (`sqlite::SqlitePools`, S2), the module opens both here;
+  - `renew(pool, ...)`, which builds the options again and gives them to the open pool, to every
+    pool it holds. Without it a renewed IAM token never reaches the pool.
+- `db.rs`: the `Pool` variant and its arms in `Pool::open`, `Pool::renew` and `Pool::close`.
+  None has a catch-all, so the compiler asks for each.
+- `db/connect.rs` needs no change: it resolves the credentials, opens the tunnel and keeps the
+  token fresh for every engine, through `Pool::open` and `Pool::renew`.
 - Credentials and SSH tunnels apply to every server engine and to no file engine, through
   `is_file` in `credentials::resolve_with` and `Connection::validate`. An IAM token
   (`Auth::AwsIam`) needs the driver to send the token as the password. MySQL also needs
