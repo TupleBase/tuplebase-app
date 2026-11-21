@@ -1,4 +1,5 @@
-//! Working state kept between launches: unsaved SQL, query history and panel sizes.
+//! Working state kept between launches: unsaved SQL, query history, panel sizes and the
+//! open tabs.
 //!
 //! Stored next to the connections file. It never holds passwords, but query text can
 //! contain any value someone typed into it.
@@ -13,6 +14,7 @@ use crate::config::{self, write_atomic};
 
 pub const STATE_FILE: &str = "state.json";
 const HISTORY_LIMIT: usize = 500;
+const STALE_SIDEBAR_PANEL: &str = "sidebar";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -34,6 +36,12 @@ pub struct SessionState {
     /// Where the last search for databases in AWS looked, to look there again.
     #[serde(default, skip_serializing_if = "CloudSearch::is_empty")]
     pub aws_search: CloudSearch,
+    /// The connections open in tabs, in the order the tabs show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_tabs: Vec<String>,
+    /// The tab that was on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<String>,
 }
 
 /// A search for databases in a cloud account: the profile and regions it used.
@@ -65,10 +73,13 @@ impl SessionState {
     }
 
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut state: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The width of the sidebar the tabs replaced.
+        state.panels.remove(STALE_SIDEBAR_PANEL);
+        state
     }
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
@@ -130,11 +141,27 @@ impl SessionState {
         for entry in self.history.iter_mut().filter(|e| e.connection == old) {
             entry.connection = new.to_owned();
         }
+        for tab in self.open_tabs.iter_mut().filter(|tab| *tab == old) {
+            *tab = new.to_owned();
+        }
+        if self.active_tab.as_deref() == Some(old) {
+            self.active_tab = Some(new.to_owned());
+        }
     }
 
     pub fn remove_connection(&mut self, name: &str) {
         self.drafts.remove(name);
         self.history.retain(|e| e.connection != name);
+        self.open_tabs.retain(|tab| tab != name);
+        if self.active_tab.as_deref() == Some(name) {
+            self.active_tab = None;
+        }
+    }
+
+    /// Remembers the open tabs, in order, and the one on screen.
+    pub fn set_tabs(&mut self, open: Vec<String>, active: Option<String>) {
+        self.open_tabs = open;
+        self.active_tab = active;
     }
 }
 
@@ -200,10 +227,16 @@ mod tests {
         let mut state = SessionState::default();
         state.record("a", "one");
         state.set_draft("a", "draft");
+        state.set_tabs(vec!["x".into(), "a".into()], Some("a".into()));
         state.rename_connection("a", "b");
         assert_eq!(state.drafts["b"], "draft");
         assert_eq!(state.history_for("b").count(), 1);
+        assert_eq!(state.open_tabs, ["x", "b"]);
+        assert_eq!(state.active_tab.as_deref(), Some("b"));
         state.remove_connection("b");
+        assert_eq!(state.open_tabs, ["x"]);
+        assert_eq!(state.active_tab, None);
+        state.remove_connection("x");
         assert_eq!(state, SessionState::default());
     }
 
@@ -213,7 +246,8 @@ mod tests {
         let path = dir.path().join(STATE_FILE);
         let mut state = SessionState::default();
         state.set_draft("a", "select 1");
-        state.panels.insert("sidebar".into(), 340);
+        state.panels.insert("chat".into(), 340);
+        state.set_tabs(vec!["b".into(), "a".into()], Some("a".into()));
         state.aws_search = CloudSearch {
             profile: "prod".into(),
             regions: vec!["eu-west-1".into(), "us-east-1".into()],
@@ -230,5 +264,25 @@ mod tests {
         assert!(!text.contains("aws_search"), "{text}");
         let old: SessionState = serde_json::from_str(r#"{"drafts":{}}"#).unwrap();
         assert!(old.aws_search.is_empty());
+    }
+
+    #[test]
+    fn no_tabs_write_nothing_and_a_file_from_before_tabs_loads() {
+        let text = serde_json::to_string(&SessionState::default()).unwrap();
+        assert!(
+            !text.contains("open_tabs") && !text.contains("active_tab"),
+            "{text}"
+        );
+        // As written before tabs were remembered, with the old sidebar's size in it.
+        let old = r#"{"drafts":{"a":"select 1"},"history":[],"panels":{"sidebar":300}}"#;
+        let old: SessionState = serde_json::from_str(old).unwrap();
+        assert_eq!(old.drafts["a"], "select 1");
+        assert!(old.open_tabs.is_empty());
+        assert_eq!(old.active_tab, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(STATE_FILE);
+        std::fs::write(&path, r#"{"panels":{"sidebar":300,"chat":420}}"#).unwrap();
+        let loaded = SessionState::load_from(&path);
+        assert_eq!(loaded.panels.keys().collect::<Vec<_>>(), ["chat"]);
     }
 }

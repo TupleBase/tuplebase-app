@@ -71,6 +71,8 @@ impl Workspace {
                     .h_full()
                     .min_w_0()
                     .overflow_x_scroll()
+                    // The tabs come first, so a tab's index is its child's.
+                    .track_scroll(&self.tab_scroll)
                     .children(tabs)
                     .child(
                         Button::new("new-tab")

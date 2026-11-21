@@ -280,6 +280,8 @@ pub struct Workspace {
     tabs: Vec<OpenTab>,
     /// The name of the tab on screen.
     active: Option<String>,
+    /// Scrolls the tab on screen into view when there are more tabs than fit.
+    tab_scroll: ScrollHandle,
     form: Option<Entity<ConnForm>>,
     /// The status line of the empty screen, shown when no tab is open.
     status: Status,
@@ -337,6 +339,7 @@ impl Workspace {
         .detach();
         let mut this = Self::with_config(config, status, window, cx);
         this.session = SessionState::load();
+        this.restore_tabs(window, cx);
         this.watch_mcp_servers(cx);
         this.watch_connections(cx);
         if this.config.check_for_updates {
@@ -419,7 +422,7 @@ impl Workspace {
     /// Closes a connection, and its tab with it: keeping the tab would let its next query
     /// quietly connect again.
     fn close_tab(&mut self, name: String, cx: &mut Context<Self>) {
-        self.remove_tab(&name);
+        self.remove_tab(&name, cx);
         self.connected.remove(&name);
         cx.notify();
         let db = self.db.clone();
@@ -437,18 +440,24 @@ impl Workspace {
 
     /// Takes `name`'s tab off the screen; the one to its right shows instead, else the
     /// one to its left.
-    fn remove_tab(&mut self, name: &str) {
+    fn remove_tab(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(ix) = self.tab_index(name) else {
             return;
         };
         self.tabs.remove(ix);
         if self.active.as_deref() == Some(name) {
-            self.active = self
-                .tabs
-                .get(ix)
-                .or_else(|| ix.checked_sub(1).and_then(|ix| self.tabs.get(ix)))
-                .map(|open| open.name.clone());
+            self.active = None;
+            let next = if ix < self.tabs.len() {
+                Some(ix)
+            } else {
+                ix.checked_sub(1)
+            };
+            if let Some(next) = next {
+                self.put_on_screen(next, cx);
+            }
         }
+        self.remember_tabs(cx);
+        cx.notify();
     }
 
     fn watch_mcp_servers(&self, cx: &mut Context<Self>) {
@@ -796,6 +805,7 @@ impl Workspace {
             config,
             tabs: Vec::new(),
             active: None,
+            tab_scroll: ScrollHandle::new(),
             form: None,
             session: SessionState::default(),
             _session_save: None,
@@ -828,9 +838,57 @@ impl Workspace {
     fn activate_tab(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_index(name).is_some() {
             self.form = None;
-            self.active = Some(name.to_owned());
+            self.show_tab(name, cx);
             self.focus_active_editor(window, cx);
+        }
+    }
+
+    /// Puts `name`'s tab on screen and remembers it.
+    fn show_tab(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tab_index(name) {
+            self.put_on_screen(ix, cx);
+            self.remember_tabs(cx);
             cx.notify();
+        }
+    }
+
+    /// Makes tab `ix` the one on screen, scrolled into view. A tab brought back at
+    /// launch connects now, the first time it shows.
+    fn put_on_screen(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let open = &self.tabs[ix];
+        open.tab.update(cx, |tab, cx| tab.start(cx));
+        self.active = Some(open.name.clone());
+        self.tab_scroll.scroll_to_item(ix);
+    }
+
+    /// Has the open tabs and the one on screen saved, to bring them back at launch.
+    fn remember_tabs(&mut self, cx: &mut Context<Self>) {
+        let open: Vec<String> = self.tabs.iter().map(|open| open.name.clone()).collect();
+        if self.session.open_tabs != open || self.session.active_tab != self.active {
+            self.session.set_tabs(open, self.active.clone());
+            self.schedule_session_save(cx);
+        }
+    }
+
+    /// Brings back the tabs open when the app last closed, in their order, skipping
+    /// connections deleted since. Only the one on screen connects: each of the others
+    /// could ask for a password or a sign-in, so they wait until first shown.
+    fn restore_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // What is remembered stays as it is until a tab changes: a config that failed
+        // to load must not make the app forget its tabs.
+        let names = self.session.open_tabs.clone();
+        for name in names {
+            self.add_tab(name, window, cx);
+        }
+        let active = self
+            .session
+            .active_tab
+            .as_deref()
+            .and_then(|name| self.tab_index(name))
+            .or((!self.tabs.is_empty()).then_some(0));
+        if let Some(ix) = active {
+            self.put_on_screen(ix, cx);
+            self.focus_active_editor(window, cx);
         }
     }
 
@@ -848,17 +906,28 @@ impl Workspace {
     fn open_connection(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.form = None;
         if let Some(tab) = self.tab(&name).cloned() {
-            self.active = Some(name);
+            let started = tab.read(cx).started;
+            self.show_tab(&name, cx);
             tab.update(cx, |tab, cx| {
-                if matches!(tab.status, Status::Failed(_)) {
+                if started && matches!(tab.status, Status::Failed(_)) {
                     tab.connect(cx);
                 }
             });
-            cx.notify();
             return;
         }
+        if self.add_tab(name.clone(), window, cx) {
+            self.show_tab(&name, cx);
+        }
+    }
+
+    /// Adds a tab for `name` at the end, not yet connecting. False if `name` is gone
+    /// from the config or already has a tab.
+    fn add_tab(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.tab_index(&name).is_some() {
+            return false;
+        }
         let Some(conn) = self.config.find(&name).cloned() else {
-            return;
+            return false;
         };
         self.db.allow_connecting(&name);
         let draft = self.session.drafts.get(&name).cloned().unwrap_or_default();
@@ -870,17 +939,13 @@ impl Workspace {
         let tab = cx.new(|cx| ConnectionTab::new(db, conn, draft, history, panels, window, cx));
         let _subscription = cx.subscribe_in(&tab, window, Self::on_tab_event);
         let connected = self.connected.contains(&name);
-        tab.update(cx, |tab, cx| {
-            tab.set_connected(connected, cx);
-            tab.connect(cx);
-        });
+        tab.update(cx, |tab, cx| tab.set_connected(connected, cx));
         self.tabs.push(OpenTab {
-            name: name.clone(),
+            name,
             tab,
             _subscription,
         });
-        self.active = Some(name);
-        cx.notify();
+        true
     }
 
     fn on_tab_event(
@@ -1109,7 +1174,6 @@ impl Workspace {
             // Its new settings take effect: it connects again.
             Some(tab) => {
                 self.form = None;
-                self.active = Some(name.clone());
                 self.db.allow_connecting(&name);
                 let conn = self.config.find(&name).cloned();
                 tab.update(cx, |tab, cx| {
@@ -1117,7 +1181,7 @@ impl Workspace {
                         tab.reconnect(conn, cx);
                     }
                 });
-                cx.notify();
+                self.show_tab(&name, cx);
             }
             // Renaming one that is not open leaves the open tab on screen.
             None if renamed_from.is_some() => {
@@ -1164,7 +1228,7 @@ impl Workspace {
     }
 
     fn delete_connection(&mut self, name: String, cx: &mut Context<Self>) {
-        self.remove_tab(&name);
+        self.remove_tab(&name, cx);
         if self
             .form
             .as_ref()
@@ -3728,5 +3792,234 @@ pub(crate) mod tests {
             let status = &tab.read(cx).status;
             assert!(matches!(status, Status::Busy(s) if s.as_ref() == "Running…"));
         });
+    }
+
+    /// Opens the window as a launch does after the tabs `open` were left open, with
+    /// `active` on screen. "other" has a draft.
+    fn restore(
+        config: Config,
+        open_tabs: &[&str],
+        active: Option<&str>,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<Workspace>) {
+        let (handle, workspace) = open(config, cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.session.set_draft("other", "select 'other'");
+                let open_tabs = open_tabs.iter().map(|name| name.to_string()).collect();
+                this.session.set_tabs(open_tabs, active.map(str::to_owned));
+                this.restore_tabs(window, cx);
+            })
+        });
+        (handle, workspace)
+    }
+
+    /// The open tabs and the tab on screen, as the session will save them.
+    fn saved_tabs(
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) -> (Vec<String>, Option<String>) {
+        workspace.read_with(cx, |this, _| {
+            (
+                this.session.open_tabs.clone(),
+                this.session.active_tab.clone(),
+            )
+        })
+    }
+
+    /// Whether `name`'s tab has asked for a pool: connected, or loaded its schema.
+    fn started(workspace: &Entity<Workspace>, name: &str, cx: &mut TestAppContext) -> bool {
+        cx.update(|cx| {
+            let tab = workspace
+                .read(cx)
+                .tab(name)
+                .expect("the tab is open")
+                .read(cx);
+            let loading = !matches!(tab.schema.read(cx).load, crate::schema::Load::Idle);
+            assert_eq!(tab.started, loading, "{name}");
+            assert_eq!(tab.started, tab.connecting, "{name}");
+            tab.started
+        })
+    }
+
+    #[gpui_kit::test]
+    fn tabs_come_back_in_order_without_a_deleted_one_and_only_the_shown_one_connects(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, workspace) = restore(
+            config_with_three_connections(),
+            &["third", "gone", "db", "other"],
+            Some("db"),
+            cx,
+        );
+        assert_eq!(tab_names(&workspace, cx), ["third", "db", "other"]);
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("db"));
+        assert!(started(&workspace, "db", cx));
+        assert!(!started(&workspace, "third", cx));
+        assert!(!started(&workspace, "other", cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            let other = this.tab("other").unwrap().read(cx);
+            assert_eq!(other.editor.read(cx).value().as_str(), "select 'other'");
+            assert_eq!(other.light(), Light::Off);
+            // Nothing changed yet, so what was remembered stays as it was.
+            assert!(!this.session_unsaved);
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("tab-third").visible());
+            assert!(window.try_find("tab-gone").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_restored_tab_connects_when_first_shown_and_is_remembered(cx: &mut TestAppContext) {
+        let (handle, workspace) = restore(
+            config_with_three_connections(),
+            &["db", "gone", "other"],
+            Some("db"),
+            cx,
+        );
+        window_action(handle, cx, |window, cx| window.click("tab-other", cx));
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+        assert!(started(&workspace, "other", cx));
+        assert_eq!(
+            saved_tabs(&workspace, cx),
+            (vec!["db".into(), "other".into()], Some("other".into()))
+        );
+        assert!(workspace.read_with(cx, |this, _| this.session_unsaved));
+    }
+
+    #[gpui_kit::test]
+    fn opening_a_restored_tab_from_the_dialog_connects_it(cx: &mut TestAppContext) {
+        let (handle, workspace) = restore(
+            config_with_two_connections(),
+            &["db", "other"],
+            Some("db"),
+            cx,
+        );
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            window.double_click("conn-other", cx)
+        });
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+        assert!(started(&workspace, "other", cx));
+    }
+
+    #[gpui_kit::test]
+    fn running_in_a_restored_tab_connects_it(cx: &mut TestAppContext) {
+        let (_, workspace) = restore(
+            config_with_two_connections(),
+            &["db", "other"],
+            Some("db"),
+            cx,
+        );
+        let other = cx.update(|cx| workspace.read(cx).tab("other").unwrap().clone());
+        other.update(cx, |tab, cx| tab.run_sql("select 1".into(), cx));
+        cx.update(|cx| {
+            let tab = other.read(cx);
+            assert!(tab.started);
+            assert!(!matches!(
+                tab.schema.read(cx).load,
+                crate::schema::Load::Idle
+            ));
+            assert!(matches!(&tab.status, Status::Busy(s) if s.as_ref() == "Running…"));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn without_a_remembered_tab_on_screen_the_first_shows(cx: &mut TestAppContext) {
+        let (_, workspace) = restore(config_with_two_connections(), &["other", "db"], None, cx);
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+        assert!(started(&workspace, "other", cx));
+        assert!(!started(&workspace, "db", cx));
+        let (_, workspace) = restore(config_with_two_connections(), &["other"], Some("gone"), cx);
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+    }
+
+    #[gpui_kit::test]
+    fn with_nothing_remembered_no_tab_opens(cx: &mut TestAppContext) {
+        let (handle, workspace) = restore(config_with_two_connections(), &[], None, cx);
+        assert!(tab_names(&workspace, cx).is_empty());
+        assert_eq!(active_name(&workspace, cx), None);
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("tab-db").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn opening_switching_and_closing_tabs_is_remembered(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_three_connections(), cx);
+        open_tab(handle, &workspace, "db", cx);
+        open_tab(handle, &workspace, "other", cx);
+        open_tab(handle, &workspace, "third", cx);
+        assert_eq!(
+            saved_tabs(&workspace, cx),
+            (
+                vec!["db".into(), "other".into(), "third".into()],
+                Some("third".into())
+            )
+        );
+        window_action(handle, cx, |window, cx| window.click("tab-other", cx));
+        assert_eq!(saved_tabs(&workspace, cx).1.as_deref(), Some("other"));
+        window_action(handle, cx, |window, cx| window.click("tab-close-other", cx));
+        assert_eq!(
+            saved_tabs(&workspace, cx),
+            (vec!["db".into(), "third".into()], Some("third".into()))
+        );
+        window_action(handle, cx, |window, cx| window.click("tab-close-db", cx));
+        window_action(handle, cx, |window, cx| window.click("tab-close-third", cx));
+        assert_eq!(saved_tabs(&workspace, cx), (Vec::new(), None));
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_shown_tab_connects_the_restored_one_that_shows_next(cx: &mut TestAppContext) {
+        let (handle, workspace) = restore(
+            config_with_two_connections(),
+            &["db", "other"],
+            Some("db"),
+            cx,
+        );
+        window_action(handle, cx, |window, cx| window.click("tab-close-db", cx));
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+        assert!(started(&workspace, "other", cx));
+        assert_eq!(
+            saved_tabs(&workspace, cx),
+            (vec!["other".into()], Some("other".into()))
+        );
+    }
+
+    #[gpui_kit::test]
+    fn renaming_and_deleting_a_connection_update_the_remembered_tabs(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_three_connections(), cx);
+        open_tab(handle, &workspace, "db", cx);
+        open_tab(handle, &workspace, "other", cx);
+        let form = edit_form(handle, &workspace, "db", cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let mut renamed = this.config.find("db").unwrap().clone();
+                renamed.name = "renamed".into();
+                let mut saved = this.config.clone();
+                saved.upsert(renamed.clone(), Some("db")).unwrap();
+                let saving = super::Saving {
+                    form,
+                    connection: renamed,
+                    previous: Some("db".into()),
+                };
+                this.finish_saving_connection(saving, saved, Ok(None), window, cx);
+            });
+        });
+        // Saving the edit shows the edited connection.
+        assert_eq!(
+            saved_tabs(&workspace, cx),
+            (
+                vec!["renamed".into(), "other".into()],
+                Some("renamed".into())
+            )
+        );
+        workspace.update(cx, |this, cx| this.delete_connection("renamed".into(), cx));
+        assert_eq!(
+            saved_tabs(&workspace, cx),
+            (vec!["other".into()], Some("other".into()))
+        );
     }
 }
