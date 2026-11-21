@@ -18,6 +18,17 @@ use serde::{Deserialize, Serialize};
 const FOLDER_SEPARATOR: char = '/';
 
 /// The folder a folder path sits in; `""` at the top level.
+/// Whether `host` is a Redshift Serverless workgroup's own endpoint,
+/// `<workgroup>.<account>.<region>.redshift-serverless.amazonaws.com` (`.com.cn` in China).
+pub fn is_redshift_serverless_host(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    let rest = host
+        .strip_suffix(".redshift-serverless.amazonaws.com")
+        .or_else(|| host.strip_suffix(".redshift-serverless.amazonaws.com.cn"));
+    // At least the workgroup, the account and the region.
+    rest.is_some_and(|rest| rest.split('.').filter(|label| !label.is_empty()).count() >= 3)
+}
+
 pub fn parent_of(path: &str) -> &str {
     path.rsplit_once(FOLDER_SEPARATOR)
         .map_or("", |(parent, _)| parent)
@@ -443,6 +454,15 @@ impl Connection {
         }
     }
 
+    /// Whether AWS, not the connection, names the database user: IAM sign-in to a
+    /// Redshift Serverless workgroup, whose `GetCredentials` takes the user from the IAM
+    /// identity (`IAM:<user>` or `IAMR:<role>`). The connection's user is then not used.
+    pub fn iam_names_the_user(&self) -> bool {
+        self.adapter == Adapter::Redshift
+            && matches!(self.auth, Auth::AwsIam(_))
+            && is_redshift_serverless_host(&self.host)
+    }
+
     /// RDS refuses IAM tokens over a connection that isn't encrypted, and a token sent
     /// in the clear could be read on the way. Checked on save and again on connect, for
     /// files edited by hand.
@@ -486,7 +506,7 @@ impl Connection {
             if self.host.trim().is_empty() {
                 bail!("host is required for \"{}\"", self.name);
             }
-            if self.user.trim().is_empty() {
+            if self.user.trim().is_empty() && !self.iam_names_the_user() {
                 bail!("user is required for \"{}\"", self.name);
             }
             self.check_iam_encryption()?;
@@ -1746,6 +1766,35 @@ mod tests {
         conn.name = "x".into();
         conn.host = " ".into();
         assert!(config.upsert(conn, None).is_err());
+    }
+
+    #[test]
+    fn serverless_iam_needs_no_user_but_a_cluster_does() {
+        let mut config = Config::default();
+        let mut conn = pg("wg");
+        conn.adapter = Adapter::Redshift;
+        conn.user.clear();
+        conn.tls = TlsMode::Require;
+        conn.auth = Auth::AwsIam(AwsIamAuth::default());
+        conn.host = "analytics.123456789012.eu-west-1.redshift-serverless.amazonaws.com".into();
+        assert!(conn.iam_names_the_user());
+        config.upsert(conn.clone(), None).unwrap();
+        // A cluster signs in as the user it is asked for.
+        conn.name = "cluster".into();
+        conn.host = "warehouse.abc123.eu-west-1.redshift.amazonaws.com".into();
+        assert!(!conn.iam_names_the_user());
+        assert!(config.upsert(conn.clone(), None).is_err());
+        // So does a workgroup with a password.
+        conn.host = "analytics.123456789012.eu-west-1.redshift-serverless.amazonaws.com".into();
+        conn.auth = Auth::Password;
+        assert!(!conn.iam_names_the_user());
+        assert!(config.upsert(conn, None).is_err());
+        assert!(is_redshift_serverless_host(
+            "WG.123456789012.cn-north-1.redshift-serverless.amazonaws.com.cn."
+        ));
+        assert!(!is_redshift_serverless_host(
+            "redshift-serverless.amazonaws.com"
+        ));
     }
 
     fn in_folder(name: &str, folder: &str) -> Connection {

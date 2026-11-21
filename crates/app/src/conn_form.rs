@@ -1,17 +1,23 @@
 //! Add / edit connection form. Collects values; the workspace persists them.
+//!
+//! A new connection is typed in or found in AWS, and a switch at the top moves between the
+//! two without losing what either holds. The buttons sit in a footer outside the
+//! scrolling part, so they are always in view.
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use tuplebase_core::cloud::Discovered;
 use tuplebase_core::config::{
-    Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Source, SshConfig, TlsMode,
+    self, Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Source, SshConfig, TlsMode,
 };
 use tuplebase_core::ssh;
 use tuplebase_core::state::CloudSearch;
 
+use crate::aws_picker::{AwsPicker, AwsPickerEvent};
 use crate::conn_source::{ConnSource, ConnSourceEvent};
 use crate::logos;
 use crate::runtime::io;
@@ -38,12 +44,29 @@ pub enum ConnFormEvent {
     SearchedAws(CloudSearch),
 }
 
+/// How a new connection is being filled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Typed in.
+    Manual,
+    /// Found in AWS first.
+    Aws,
+}
+
 pub struct ConnForm {
     /// The step before the form for a new connection: where the database is.
     start: Option<Entity<ConnSource>>,
     _start_subscription: Option<Subscription>,
-    /// What to know about a database that was found, shown above the form.
-    notice: Option<SharedString>,
+    mode: Mode,
+    /// Where the last search in AWS looked, for the picker.
+    last_aws: CloudSearch,
+    /// Finding the database in AWS, kept once opened so switching back finds it as left.
+    picker: Option<Entity<AwsPicker>>,
+    _picker_subscriptions: Vec<Subscription>,
+    /// The database found in AWS that filled in the form, shown above it.
+    found: Option<Box<Discovered>>,
+    form_scroll: ScrollHandle,
+    _subscriptions: Vec<Subscription>,
     previous: Option<String>,
     adapter: Adapter,
     /// A new connection asks for the database first and shows the rest once it is chosen.
@@ -140,16 +163,28 @@ impl ConnForm {
         let ssh_fingerprint = input("SHA256:…", ssh_field(|s| s.fingerprint.clone()));
         // A new connection first asks where the database is.
         let (start, start_subscription) = if existing.is_none() {
-            let start = cx.new(|_| ConnSource::new(last_aws));
+            let start = cx.new(|_| ConnSource);
             let subscription = cx.subscribe_in(&start, window, Self::on_start_event);
             (Some(start), Some(subscription))
         } else {
             (None, None)
         };
+        // The host decides whether Redshift Serverless names the user.
+        let subscriptions = vec![cx.subscribe(&host, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })];
         Self {
             start,
             _start_subscription: start_subscription,
-            notice: None,
+            mode: Mode::Manual,
+            last_aws,
+            picker: None,
+            _picker_subscriptions: Vec::new(),
+            found: None,
+            form_scroll: ScrollHandle::new(),
+            _subscriptions: subscriptions,
             previous: existing.map(|c| c.name.clone()),
             adapter: existing.map_or(Adapter::Postgres, |c| c.adapter),
             chosen: existing.is_some(),
@@ -189,29 +224,70 @@ impl ConnForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.start = None;
+        self._start_subscription = None;
         match event {
-            ConnSourceEvent::Manual => self.close_start(cx),
-            ConnSourceEvent::Use { connection, note } => {
-                self.prefill(connection, window, cx);
-                self.notice = note.clone().map(Into::into);
-                self.close_start(cx);
-            }
-            ConnSourceEvent::SearchedAws(search) => {
-                cx.emit(ConnFormEvent::SearchedAws(search.clone()));
-            }
+            ConnSourceEvent::Manual => self.show_manual(cx),
+            ConnSourceEvent::Aws => self.show_aws(window, cx),
         }
     }
 
-    fn close_start(&mut self, cx: &mut Context<Self>) {
-        self.start = None;
-        self._start_subscription = None;
+    fn show_manual(&mut self, cx: &mut Context<Self>) {
+        self.mode = Mode::Manual;
         cx.notify();
     }
 
-    /// The step before the form, while it is shown.
+    /// Shows the search in AWS, as it was left.
+    fn show_aws(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = Mode::Aws;
+        let picker = match &self.picker {
+            Some(picker) => picker.clone(),
+            None => {
+                let last = self.last_aws.clone();
+                let picker = cx.new(|cx| AwsPicker::new(last, window, cx));
+                self._picker_subscriptions = vec![
+                    cx.subscribe_in(&picker, window, |this, _, event, window, cx| match event {
+                        AwsPickerEvent::Use(found) => this.use_found(found, window, cx),
+                        AwsPickerEvent::Searched(search) => {
+                            this.last_aws = search.clone();
+                            cx.emit(ConnFormEvent::SearchedAws(search.clone()));
+                        }
+                    }),
+                    // The footer's button follows the picker's choice.
+                    cx.observe(&picker, |_, _, cx| cx.notify()),
+                ];
+                self.picker = Some(picker.clone());
+                picker
+            }
+        };
+        picker.update(cx, |picker, cx| picker.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Fills in the form with a database found in AWS and shows it from the top, with
+    /// the keys where something is still missing.
+    fn use_found(&mut self, found: &Discovered, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = found.connection() else {
+            return;
+        };
+        self.prefill(&connection, window, cx);
+        self.found = Some(Box::new(found.clone()));
+        self.mode = Mode::Manual;
+        self.error = None;
+        self.form_scroll.set_offset(point(px(0.), px(0.)));
+        let next = if connection.auth.is_password() {
+            &self.password
+        } else {
+            &self.name
+        };
+        next.update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// The search in AWS, once opened.
     #[cfg(test)]
-    pub fn start(&self) -> Option<&Entity<ConnSource>> {
-        self.start.as_ref()
+    pub fn aws_picker(&self) -> Option<&Entity<AwsPicker>> {
+        self.picker.as_ref()
     }
 
     /// Fills the form with a connection that was found, to check and save as new.
@@ -245,6 +321,14 @@ impl ConnForm {
     /// Whether the secret names the host, so the Host and Port fields are hidden.
     fn host_from_secret(&self) -> bool {
         self.uses_secret() && self.use_secret_host && !self.adapter.is_file()
+    }
+
+    /// Whether AWS names the database user from the IAM identity (Redshift Serverless),
+    /// so the User field is not used.
+    fn iam_names_the_user(&self, cx: &App) -> bool {
+        self.adapter == Adapter::Redshift
+            && self.auth_kind == AuthKind::AwsIam
+            && config::is_redshift_serverless_host(&self.host.read(cx).value())
     }
 
     /// Whether the credentials come from a secret or parameter in AWS.
@@ -331,7 +415,7 @@ impl ConnForm {
                 host: visible(&self.host, host_shown, cx),
                 port,
                 database: text(&self.database, cx),
-                user: text(&self.user, cx),
+                user: visible(&self.user, !self.iam_names_the_user(cx), cx),
                 readonly: self.readonly,
                 color: self.color.clone(),
                 tls: self.tls,
@@ -511,12 +595,20 @@ impl ConnForm {
             AuthKind::AwsSecret => "Secret name or ARN",
             AuthKind::AwsParameter => "Parameter name",
             AuthKind::Password | AuthKind::AwsIam => {
-                return column.child(hint(
+                let text = if self.iam_names_the_user(cx) {
+                    "Each time you connect, AWS signs you in to the workgroup as your IAM \
+                     identity (IAM:<user> or IAMR:<role>), so no database user is needed. \
+                     Your identity needs redshift-serverless:GetCredentials on it."
+                } else if self.adapter == Adapter::Redshift {
+                    "Each time you connect, AWS gives a temporary password for the user \
+                     below, which must already exist. Your identity needs \
+                     redshift:GetClusterCredentials."
+                } else {
                     "A token for the user below is made from your AWS profile each time you \
                      connect. The user needs rds-db:connect, and the database IAM \
-                     authentication turned on.",
-                    cx,
-                ));
+                     authentication turned on."
+                };
+                return column.child(hint(text, cx).id("conn-iam-hint").test_support());
             }
         };
         column
@@ -652,6 +744,7 @@ impl ConnForm {
 
     fn render_credentials(&self, cx: &mut Context<Self>) -> Div {
         let kind = self.auth_kind;
+        let user_shown = !self.iam_names_the_user(cx);
         v_flex()
             .gap_3()
             .child(
@@ -665,7 +758,9 @@ impl ConnForm {
             .child(
                 h_flex()
                     .gap_3()
-                    .child(field("User", Input::new(&self.user).id("conn-user"), cx))
+                    .when(user_shown, |el| {
+                        el.child(field("User", Input::new(&self.user).id("conn-user"), cx))
+                    })
                     .when(kind == AuthKind::Password, |el| {
                         el.child(field(
                             "Password",
@@ -822,14 +917,200 @@ fn section(step: usize, title: &'static str, body: Div, cx: &App) -> Div {
         .child(body)
 }
 
+/// The column the form is laid out in.
+const COLUMN_WIDTH: f32 = 600.;
+
+impl ConnForm {
+    /// Typing the details in, or finding them in AWS: a new connection's two ways.
+    fn render_mode_switch(&self, cx: &mut Context<Self>) -> Div {
+        let option = |id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>| {
+            let theme = cx.theme();
+            let selected = self.mode == mode;
+            div()
+                .id(id)
+                .test_support()
+                .flex_1()
+                .py_1()
+                .text_center()
+                .text_sm()
+                .rounded(theme.radius)
+                .cursor_pointer()
+                .when(selected, |el| {
+                    el.bg(theme.background)
+                        .font_medium()
+                        .border_1()
+                        .border_color(theme.border)
+                })
+                .when(!selected, |el| el.text_color(theme.muted_foreground))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| match mode {
+                    Mode::Manual => this.show_manual(cx),
+                    Mode::Aws => this.show_aws(window, cx),
+                }))
+        };
+        h_flex()
+            .flex_none()
+            .p_0p5()
+            .gap_0p5()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().muted)
+            .child(option("mode-manual", "Enter details", Mode::Manual, cx))
+            .child(option("mode-aws", "Find in AWS", Mode::Aws, cx))
+    }
+
+    /// The database found in AWS that filled in the form, with a way back to the list.
+    fn render_found(&self, found: &Discovered, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        v_flex()
+            .gap_2()
+            .p_3()
+            .rounded(theme.radius_lg)
+            .bg(theme.muted)
+            .child(
+                h_flex()
+                    .id("conn-found")
+                    .test_support()
+                    .gap_3()
+                    .when_some(found.adapter, |el, adapter| {
+                        el.child(logos::icon(adapter, 20.))
+                    })
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .font_semibold()
+                                    .child(found.label.clone()),
+                            )
+                            .child(div().truncate().text_xs().text_color(muted).child(format!(
+                                "Found in AWS · {} · {}",
+                                found.engine_label(),
+                                found.source.region
+                            ))),
+                    )
+                    .child(
+                        Button::new("conn-found-change")
+                            .cursor_pointer()
+                            .small()
+                            .label("Change")
+                            .on_click(cx.listener(|this, _, window, cx| this.show_aws(window, cx))),
+                    ),
+            )
+            .when_some(found.note.clone(), |el, note| {
+                el.child(
+                    div()
+                        .id("conn-notice")
+                        .test_support()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(note),
+                )
+            })
+    }
+
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let picking = self.start.is_none() && self.mode == Mode::Aws;
+        let can_use = self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.read(cx).can_use(cx));
+        let save_shown = !picking && self.start.is_none() && self.chosen;
+        let buttons = h_flex()
+            .gap_2()
+            .when(picking, |el| {
+                el.child(
+                    Button::new("aws-use")
+                        .cursor_pointer()
+                        .primary()
+                        .label("Use this database")
+                        .disabled(!can_use)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(picker) = this.picker.clone() {
+                                picker.update(cx, |picker, cx| picker.use_selected(cx));
+                            }
+                        })),
+                )
+            })
+            .when(save_shown, |el| {
+                el.child(
+                    Button::new("save")
+                        .cursor_pointer()
+                        .primary()
+                        .label("Save connection")
+                        .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                )
+            })
+            .child(
+                Button::new("cancel")
+                    .cursor_pointer()
+                    .ghost()
+                    .label("Cancel")
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ConnFormEvent::Cancel))),
+            )
+            .when(picking, |el| {
+                el.child(div().flex_1()).child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Double-click or Enter also uses it."),
+                )
+            });
+        v_flex()
+            .id("conn-footer")
+            .test_support()
+            .flex_none()
+            .w_full()
+            .items_center()
+            .py_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                v_flex()
+                    .w(px(COLUMN_WIDTH))
+                    .gap_2()
+                    .when_some(self.error.clone(), |el, error| {
+                        el.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                    })
+                    .child(buttons),
+            )
+    }
+}
+
 impl Render for ConnForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let chosen = self.chosen;
-        let title = if self.previous.is_some() {
-            "Edit connection"
-        } else {
+        let new = self.previous.is_none();
+        let title = if new {
             "New connection"
+        } else {
+            "Edit connection"
         };
+        let heading = div().text_xl().font_semibold().child(title);
+        let switch = (new && self.start.is_none()).then(|| self.render_mode_switch(cx));
+        let column = || v_flex().w(px(COLUMN_WIDTH)).gap_4();
+        let footer = self.render_footer(cx);
+        // Finding it in AWS: the list scrolls in its own area, the rest stays put.
+        if let (None, Mode::Aws, Some(picker)) = (&self.start, self.mode, self.picker.clone()) {
+            return v_flex()
+                .size_full()
+                .child(
+                    v_flex().flex_1().min_h_0().w_full().items_center().child(
+                        column()
+                            .flex_1()
+                            .min_h_0()
+                            .pt_8()
+                            .pb_4()
+                            .child(heading)
+                            .children(switch)
+                            .child(div().flex_1().min_h_0().child(picker)),
+                    ),
+                )
+                .child(footer);
+        }
         // In the order shown; each is numbered by its place.
         let mut sections = vec![("Database", self.render_database(cx))];
         if chosen {
@@ -849,24 +1130,16 @@ impl Render for ConnForm {
             .collect();
         if let Some(start) = self.start.clone() {
             sections = vec![start.into_any_element()];
-        } else if let Some(notice) = self.notice.clone() {
-            let notice = div()
-                .id("conn-notice")
-                .test_support()
-                .p_3()
-                .rounded(cx.theme().radius)
-                .bg(cx.theme().muted)
-                .text_sm()
-                .child(notice);
-            sections.insert(0, notice.into_any_element());
+        } else if let Some(found) = self.found.clone() {
+            sections.insert(0, self.render_found(&found, cx).into_any_element());
         }
-        let column = || v_flex().w(px(560.)).gap_4();
         v_flex()
             .size_full()
             .child(
                 div()
                     .id("conn-form")
                     .test_support()
+                    .track_scroll(&self.form_scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -875,50 +1148,291 @@ impl Render for ConnForm {
                             column()
                                 .pt_8()
                                 .pb_6()
-                                .child(div().text_xl().font_semibold().child(title))
+                                .child(heading)
+                                .children(switch)
                                 .children(sections),
                         ),
                     ),
             )
-            // Outside the scrolling part, so Save and any error stay in view.
-            .child(
-                v_flex()
-                    .w_full()
-                    .items_center()
-                    .py_3()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        column()
-                            .gap_2()
-                            .when_some(self.error.clone(), |el, error| {
-                                el.child(div().text_sm().text_color(cx.theme().danger).child(error))
-                            })
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .when(chosen, |el| {
-                                        el.child(
-                                            Button::new("save")
-                                                .cursor_pointer()
-                                                .primary()
-                                                .label("Save connection")
-                                                .on_click(
-                                                    cx.listener(|this, _, _, cx| this.save(cx)),
-                                                ),
-                                        )
-                                    })
-                                    .child(
-                                        Button::new("cancel")
-                                            .cursor_pointer()
-                                            .ghost()
-                                            .label("Cancel")
-                                            .on_click(cx.listener(|_, _, _, cx| {
-                                                cx.emit(ConnFormEvent::Cancel)
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
+            // Outside the scrolling part, so the buttons and any error stay in view.
+            .child(footer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // No glob from gpui_kit: its `test` macro would shadow the built-in `#[test]`.
+    use super::{ConnForm, ConnFormEvent, Mode};
+    use crate::aws_picker::tests::{found, many};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, px, size};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tuplebase_core::cloud::Discovery;
+    use tuplebase_core::config::{Adapter, Auth, Connection};
+    use tuplebase_core::state::CloudSearch;
+
+    /// A new connection's form in a window of a laptop's size.
+    fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ConnForm>) {
+        let (handle, form) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::workspace::bind_keys(cx);
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| ConnForm::new(None, String::new(), CloudSearch::default(), window, cx))
+            })
+            .expect("open test window")
+        });
+        cx.update_window(handle, |_, window, _| {
+            window.resize(size(px(1280.), px(760.)))
+        })
+        .unwrap();
+        (handle, form)
+    }
+
+    fn act<R>(
+        handle: AnyWindowHandle,
+        cx: &mut TestAppContext,
+        f: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App) -> R,
+    ) -> R {
+        let result = cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            f(window, cx)
+        });
+        cx.run_until_parked();
+        result.unwrap()
+    }
+
+    fn show(form: &Entity<ConnForm>, discovery: Discovery, cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let picker = form.read(cx).aws_picker().cloned().expect("AWS step");
+            picker.update(cx, |p, cx| p.set_discovery(discovery, cx));
+        });
+    }
+
+    fn saved(form: &Entity<ConnForm>, cx: &mut TestAppContext) -> Rc<RefCell<Vec<Connection>>> {
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        cx.update(|cx| {
+            let saved = saved.clone();
+            cx.subscribe(form, move |_, event, _| {
+                if let ConnFormEvent::Save { connection, .. } = event {
+                    saved.borrow_mut().push(connection.clone());
+                }
+            })
+            .detach();
+        });
+        saved
+    }
+
+    /// Whether `id` lies in the window, not below its bottom edge.
+    fn in_view(window: &gpui_kit::Window, id: &'static str) -> bool {
+        let bounds = window.find(id).bounds();
+        bounds.bottom() <= window.viewport_size().height && window.find(id).visible()
+    }
+
+    #[gpui_kit::test]
+    fn the_buttons_stay_in_view_beside_a_long_list_and_after_using_one(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-aws", cx));
+        show(
+            &form,
+            Discovery {
+                found: many(40),
+                ..Discovery::default()
+            },
+            cx,
+        );
+        act(handle, cx, |window, _| {
+            // The list scrolls in its own area; the button is in the footer below it.
+            assert!(in_view(window, "aws-use"));
+            assert!(window.within("conn-footer").try_find("aws-use").is_some());
+            assert!(window.within("aws-results").try_find("aws-use").is_none());
+            let list = window.find("aws-results").bounds();
+            assert!(list.bottom() <= window.find("conn-footer").bounds().top());
+            let last = window.find("aws-result-39").bounds();
+            assert!(
+                last.top() >= list.bottom(),
+                "the list scrolls to reach the last one"
+            );
+            assert!(window.find("aws-search").visible());
+            assert_ne!(window.find("aws-use").disabled(), Some(true));
+        });
+        act(handle, cx, |window, cx| window.click("aws-use", cx));
+        act(handle, cx, |window, _| {
+            // The form shows what was found from the top, and Save is in view.
+            assert!(window.try_find("aws-results").is_none());
+            assert!(window.find("conn-found").visible());
+            assert!(
+                window.find("conn-found").bounds().top() < window.find("conn-name").bounds().top()
+            );
+            assert!(in_view(window, "conn-found"));
+            assert!(in_view(window, "save"));
+            assert!(window.within("conn-form").try_find("save").is_none());
+            assert_eq!(window.find("conn-name").focused(), Some(true));
+        });
+        cx.update(|cx| assert_eq!(form.read(cx).name.read(cx).value(), "db-02"));
+    }
+
+    #[gpui_kit::test]
+    fn the_list_keeps_room_in_a_short_window_with_many_profiles(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        cx.update_window(handle, |_, window, _| {
+            window.resize(size(px(1000.), px(560.)))
+        })
+        .unwrap();
+        act(handle, cx, |window, cx| window.click("source-aws", cx));
+        act(handle, cx, |window, cx| {
+            let picker = form.read(cx).aws_picker().cloned().expect("AWS step");
+            let profiles = (0..40)
+                .map(|i| tuplebase_core::cloud::aws::Profile {
+                    name: format!("account-{i:02}-admin"),
+                    region: Some("eu-west-1".into()),
+                })
+                .collect();
+            picker.update(cx, |p, cx| p.set_profiles(Ok(profiles), window, cx));
+        });
+        show(
+            &form,
+            Discovery {
+                found: many(40),
+                ..Discovery::default()
+            },
+            cx,
+        );
+        act(handle, cx, |window, _| {
+            assert!(in_view(window, "aws-use"));
+            assert!(in_view(window, "aws-find"));
+            assert!(in_view(window, "aws-search"));
+            let list = window.find("aws-results").bounds();
+            assert!(list.bottom() <= window.find("conn-footer").bounds().top());
+            assert!(list.size.height >= px(4. * 34.), "{list:?}");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn moving_with_the_keys_scrolls_the_selection_into_view(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-aws", cx));
+        show(
+            &form,
+            Discovery {
+                found: many(40),
+                ..Discovery::default()
+            },
+            cx,
+        );
+        act(handle, cx, |window, cx| window.click("aws-search", cx));
+        act(handle, cx, |window, cx| {
+            for _ in 0..30 {
+                window.press("down", cx);
+            }
+        });
+        let index = cx.update(|cx| {
+            let picker = form.read(cx).aws_picker().cloned().unwrap();
+            picker.read(cx).selected_index().expect("selected")
+        });
+        act(handle, cx, |window, _| {
+            let list = window.find("aws-results").bounds();
+            let row = window
+                .find(gpui_kit::SharedString::from(format!("aws-result-{index}")))
+                .bounds();
+            assert!(
+                row.top() >= list.top() && row.bottom() <= list.bottom(),
+                "{row:?} in {list:?}"
+            );
+        });
+    }
+
+    #[gpui_kit::test]
+    fn switching_between_typing_and_aws_keeps_both_and_change_goes_back(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        act(handle, cx, |window, cx| window.click("adapter-MySQL", cx));
+        act(handle, cx, |window, cx| {
+            window.click("conn-host", cx);
+            window.input("db.internal", cx);
+            window.click("mode-aws", cx);
+        });
+        act(handle, cx, |window, _| {
+            assert!(window.try_find("conn-host").is_none());
+            assert!(window.find("aws-find").visible());
+            // Nothing chosen yet.
+            assert_eq!(window.find("aws-use").disabled(), Some(true));
+        });
+        show(
+            &form,
+            Discovery {
+                found: vec![found("orders", Some(Adapter::Postgres))],
+                ..Discovery::default()
+            },
+            cx,
+        );
+        act(handle, cx, |window, cx| window.click("mode-manual", cx));
+        act(handle, cx, |window, cx| {
+            // What was typed is still there, and the list waits as it was left.
+            assert_eq!(window.find("conn-host").value(), Some("db.internal"));
+            window.click("mode-aws", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.find("aws-result-0").visible());
+            window.press("enter", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert_eq!(
+                window.find("conn-host").value(),
+                Some("orders.abc.eu-west-1.rds.amazonaws.com")
+            );
+            assert!(window.find("conn-notice").visible());
+            window.click("conn-found-change", cx);
+        });
+        act(handle, cx, |window, _| {
+            assert!(window.find("aws-result-0").visible());
+            assert!(window.find("aws-chosen").visible());
+        });
+        cx.update(|cx| assert_eq!(form.read(cx).mode, Mode::Aws));
+    }
+
+    #[gpui_kit::test]
+    fn serverless_iam_asks_for_no_user(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        let saved = saved(&form, cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        act(handle, cx, |window, cx| {
+            window.click("adapter-Redshift", cx)
+        });
+        act(handle, cx, |window, cx| {
+            window.click("conn-name", cx);
+            window.input("analytics", cx);
+            window.click("conn-host", cx);
+            window.input("warehouse.abc123.eu-west-1.redshift.amazonaws.com", cx);
+            window.click("auth-IAM token", cx);
+        });
+        act(handle, cx, |window, cx| {
+            // A cluster signs in as the user it is asked for.
+            assert!(window.find("conn-user").visible());
+            window.click("conn-user", cx);
+            window.input("analyst", cx);
+            form.update(cx, |form, cx| {
+                form.host.update(cx, |host, cx| {
+                    host.set_value(
+                        "analytics.123456789012.eu-west-1.redshift-serverless.amazonaws.com",
+                        window,
+                        cx,
+                    )
+                });
+                cx.notify();
+            });
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-user").is_none());
+            assert!(window.find("conn-iam-hint").visible());
+            window.click("save", cx);
+        });
+        let saved = saved.borrow();
+        let connection = saved.first().expect("saved");
+        assert!(matches!(connection.auth, Auth::AwsIam(_)));
+        // Not used, so not kept.
+        assert_eq!(connection.user, "");
+        let mut config = tuplebase_core::config::Config::default();
+        config.upsert(connection.clone(), None).unwrap();
     }
 }

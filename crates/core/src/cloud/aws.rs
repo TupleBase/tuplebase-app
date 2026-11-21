@@ -709,6 +709,8 @@ struct Found<'a> {
     service: Service,
     label: &'a str,
     engine: &'a str,
+    /// The engine's version, such as `16.3`, when the provider names one.
+    version: Option<&'a str>,
     host: &'a str,
     port: Option<i32>,
     database: Option<&'a str>,
@@ -729,6 +731,7 @@ fn from_instance(instance: &DbInstance, profile: &str, region: &str) -> Discover
             service: Service::Rds,
             label: instance.db_instance_identifier().unwrap_or_default(),
             engine: instance.engine().unwrap_or_default(),
+            version: instance.engine_version(),
             host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
             port: endpoint.and_then(|e| e.port()),
             database: instance.db_name(),
@@ -751,6 +754,7 @@ fn from_cluster(cluster: &DbCluster, public: bool, profile: &str, region: &str) 
             service: Service::Rds,
             label: cluster.db_cluster_identifier().unwrap_or_default(),
             engine: cluster.engine().unwrap_or_default(),
+            version: cluster.engine_version(),
             host: cluster.endpoint().unwrap_or_default(),
             port: cluster.port(),
             database: cluster.database_name(),
@@ -780,6 +784,7 @@ fn from_redshift_cluster(
             service: Service::Redshift,
             label: cluster.cluster_identifier().unwrap_or_default(),
             engine: REDSHIFT_ENGINE,
+            version: cluster.cluster_version(),
             host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
             port: endpoint.and_then(|e| e.port()),
             database: cluster.db_name(),
@@ -810,6 +815,8 @@ fn from_workgroup(
             service: Service::RedshiftServerless,
             label: workgroup.workgroup_name().unwrap_or_default(),
             engine: REDSHIFT_SERVERLESS_ENGINE,
+            // Serverless has no version to choose.
+            version: None,
             host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
             port: endpoint.and_then(|e| e.port()).or(workgroup.port()),
             database: namespace.and_then(|n| n.db_name()),
@@ -900,6 +907,7 @@ fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
         label: found.label.to_owned(),
         adapter,
         engine: found.engine.to_owned(),
+        version: found.version.unwrap_or_default().to_owned(),
         host: found.host.to_owned(),
         port: found
             .port
@@ -1483,6 +1491,29 @@ mod tests {
         assert_eq!(region("localhost"), None);
         assert!(is_rds_host("orders.abc123.eu-west-1.rds.amazonaws.com"));
         assert!(!is_rds_host("rds.amazonaws.com.example.com"));
+    }
+
+    #[test]
+    fn the_config_knows_a_workgroup_endpoint_as_this_module_does() {
+        for host in [
+            "analytics.123456789012.eu-west-1.redshift-serverless.amazonaws.com",
+            "WG.123456789012.CN-NORTH-1.redshift-serverless.amazonaws.com.cn.",
+            "warehouse.abc123.eu-west-1.redshift.amazonaws.com",
+            "orders.abc123.eu-west-1.rds.amazonaws.com",
+            "redshift-serverless.amazonaws.com",
+            "123456789012.eu-west-1.redshift-serverless.amazonaws.com",
+            "db.example.com",
+        ] {
+            let here = matches!(
+                redshift_target(host),
+                Some((RedshiftTarget::Workgroup(_), _))
+            );
+            assert_eq!(
+                crate::config::is_redshift_serverless_host(host),
+                here,
+                "{host}"
+            );
+        }
     }
 
     #[test]

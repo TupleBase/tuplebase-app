@@ -26,6 +26,7 @@ use tuplebase_core::secrets::{ConnectionSecrets, Secret};
 use tuplebase_core::state::SessionState;
 use tuplebase_core::{app_status, mcp_status, secrets, updates};
 
+use crate::aws_picker;
 use crate::chat::{ChatEvent, ChatPanel};
 use crate::completions;
 use crate::conn_form::{ConnForm, ConnFormEvent};
@@ -109,6 +110,7 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(tree_nav::key_bindings());
     cx.bind_keys(connections::key_bindings());
     cx.bind_keys(completions::key_bindings());
+    cx.bind_keys(aws_picker::key_bindings());
 }
 
 /// Menu items must work whatever has focus, so their actions are global and go to the
@@ -2704,8 +2706,7 @@ pub(crate) mod tests {
         // The search itself runs on the runtime, which tests don't; give its answer.
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
-            let source = form.read(cx).start().cloned().expect("source step shown");
-            let picker = source.read(cx).aws_picker().cloned().expect("AWS step");
+            let picker = form.read(cx).aws_picker().cloned().expect("AWS step");
             picker.update(cx, |picker, cx| {
                 picker.set_discovery(
                     tuplebase_core::cloud::Discovery {
@@ -2723,7 +2724,6 @@ pub(crate) mod tests {
         let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
         cx.update(|cx| {
             let form = workspace.read(cx).form.clone().expect("form is open");
-            assert!(form.read(cx).start().is_none());
             let saved = saved.clone();
             cx.subscribe(&form, move |_, event, _| {
                 if let ConnFormEvent::Save {
