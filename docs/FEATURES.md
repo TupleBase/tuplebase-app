@@ -41,9 +41,17 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 
 ## SQL editor
 
-- Run with `Cmd+Enter` on macOS or `Ctrl+Enter` on Windows and Linux.
-- Run several statements at once.
-- Autocomplete SQL keywords and the connection's table and column names.
+- The statement under the cursor is marked by a bar beside its lines and a Run button at the
+  end of its first line. Click the button to run just that statement.
+- `Cmd+Enter` on macOS or `Ctrl+Enter` on Windows and Linux runs the selection, or the statement
+  under the cursor when nothing is selected. The toolbar's Run button does the same.
+- `Cmd+Shift+Enter` or `Ctrl+Shift+Enter` runs everything in the editor, several statements at
+  once.
+- Statements end at `;`, as the database reads them: a `;` in a string, a comment, a
+  PostgreSQL `$$` body or a MariaDB or MySQL `BEGIN … END` body doesn't end one.
+- Autocomplete SQL keywords and the connection's table and column names. Suggestions show after
+  two letters of a word, or at once with `Ctrl+Space`. `Tab` takes the highlighted one, `Enter`
+  always starts a new line, and `Esc` closes the list.
 - Reopen recent queries from each connection's history.
 - Unsaved SQL is kept for each connection between launches.
 

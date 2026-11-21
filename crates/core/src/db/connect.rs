@@ -12,7 +12,7 @@ use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
-use super::{Open, Pool};
+use super::{Open, Pool, SqlitePools};
 use crate::cloud::aws;
 use crate::config::{Adapter, Auth, Connection, TlsMode};
 use crate::credentials::{self, Expiry};
@@ -274,7 +274,10 @@ impl Pool {
         match (self, options) {
             (Pool::Pg(p), Options::Pg(o)) => p.set_connect_options(o),
             (Pool::My(p), Options::My(o)) => p.set_connect_options(o),
-            (Pool::Sqlite(p), Options::Sqlite(o)) => p.set_connect_options(o),
+            (Pool::Sqlite(p), Options::Sqlite(o)) => {
+                p.read_only.set_connect_options(o.clone().read_only(true));
+                p.main.set_connect_options(o);
+            }
             _ => {}
         }
     }
@@ -290,13 +293,17 @@ async fn open_pool(options: Options) -> Result<Pool> {
                 .connect_with(opts)
                 .await?,
         ),
-        Options::Sqlite(opts) => Pool::Sqlite(
-            SqlitePoolOptions::new()
-                .max_connections(4)
-                .acquire_timeout(timeout)
-                .connect_with(opts)
-                .await?,
-        ),
+        Options::Sqlite(opts) => {
+            let pool = || {
+                SqlitePoolOptions::new()
+                    .max_connections(4)
+                    .acquire_timeout(timeout)
+            };
+            Pool::Sqlite(SqlitePools {
+                read_only: pool().connect_lazy_with(opts.clone().read_only(true)),
+                main: pool().connect_with(opts).await?,
+            })
+        }
         Options::My(opts) => Pool::My(
             MySqlPoolOptions::new()
                 .max_connections(4)
@@ -451,5 +458,36 @@ mod tests {
         let renewal = Renewal::new(start, short);
         assert!(!renewal.due(at(4 * 60 - 1)));
         assert!(renewal.due(at(4 * 60)));
+    }
+
+    /// Part of the read-only guard (S2): whatever the statement check lets through, the
+    /// read-only pool's connections can't write, also after the options change.
+    #[tokio::test]
+    async fn sqlite_read_only_work_runs_on_connections_that_cannot_write() {
+        use sqlx::Executor;
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("app.sqlite"))
+            .create_if_missing(true);
+        let opened = open_pool(Options::Sqlite(options.clone())).await.unwrap();
+        let renewed = open_pool(Options::Sqlite(options.clone())).await.unwrap();
+        renewed.set_options(Options::Sqlite(options));
+        let (Pool::Sqlite(opened), Pool::Sqlite(renewed)) = (opened, renewed) else {
+            unreachable!()
+        };
+        opened
+            .main
+            .execute("CREATE TABLE t (a); INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+        for pools in [&opened, &renewed] {
+            let write = "PRAGMA query_only = OFF; DELETE FROM t";
+            assert!(pools.read_only.execute(write).await.is_err());
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+                .fetch_one(&pools.read_only)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
     }
 }

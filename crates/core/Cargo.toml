@@ -24,6 +24,9 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "json",
     "rust_decimal",
 ] }
+# The SQLite that sqlx compiles in, for its parser in the read-only guard (`db/sqlite.rs`).
+# Keep it on the version sqlx uses, so there is one SQLite.
+libsqlite3-sys = { version = "0.37.0", default-features = false }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 sha2 = "0.10.9"
 ureq = { version = "3.5.1", features = ["json"] }

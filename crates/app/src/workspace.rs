@@ -28,14 +28,16 @@ use tuplebase_core::config::{
 };
 use tuplebase_core::db::{Db, ExecOptions, ScriptResult};
 use tuplebase_core::state::SessionState;
-use tuplebase_core::{app_status, mcp_status, secrets, updates};
+use tuplebase_core::{app_status, mcp_status, safety, secrets, updates};
 
 use crate::chat::{ChatEvent, ChatPanel};
-use crate::completions::{SchemaNames, SqlCompletions};
+use crate::completions::{self, SchemaNames, SqlCompletions};
 use crate::conn_form::{ConnForm, ConnFormEvent};
+use crate::dialogs;
 use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::row_detail::{RowDetail, RowDetailEvent};
+use crate::run_button::{RunButton, RunStatement};
 use crate::runtime::{blocking, io};
 use crate::saving::{Save, Saves};
 use crate::schema::{SchemaEvent, SchemaPanel};
@@ -50,6 +52,7 @@ actions!(
     tuplebase,
     [
         RunQuery,
+        RunAll,
         OpenSettings,
         CheckForUpdates,
         About,
@@ -69,9 +72,19 @@ const SETTINGS_KEY: &str = "cmd-,";
 #[cfg(not(target_os = "macos"))]
 const SETTINGS_KEY: &str = "ctrl-,";
 #[cfg(target_os = "macos")]
-const RUN_HINT: &str = "Run query (⌘↵)";
+const RUN_ALL_KEY: &str = "cmd-shift-enter";
 #[cfg(not(target_os = "macos"))]
-const RUN_HINT: &str = "Run query (Ctrl+Enter)";
+const RUN_ALL_KEY: &str = "ctrl-shift-enter";
+#[cfg(target_os = "macos")]
+const RUN_HINT: &str = "Run the selection or the statement at the cursor (⌘↵). Run all: ⌘⇧↵";
+#[cfg(not(target_os = "macos"))]
+const RUN_HINT: &str =
+    "Run the selection or the statement at the cursor (Ctrl+Enter). Run all: Ctrl+Shift+Enter";
+#[cfg(target_os = "macos")]
+const NO_STATEMENT: &str = "No statement at the cursor. Select some SQL, or run all with ⌘⇧↵";
+#[cfg(not(target_os = "macos"))]
+const NO_STATEMENT: &str =
+    "No statement at the cursor. Select some SQL, or run all with Ctrl+Shift+Enter";
 
 /// A key held with Cmd on macOS and Ctrl elsewhere.
 #[cfg(target_os = "macos")]
@@ -93,6 +106,8 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(RUN_KEY, RunQuery, Some("Input")),
         KeyBinding::new(RUN_KEY, RunQuery, None),
+        KeyBinding::new(RUN_ALL_KEY, RunAll, Some("Input")),
+        KeyBinding::new(RUN_ALL_KEY, RunAll, None),
         KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
         KeyBinding::new(secondary!("="), IncreaseFontSize, None),
         // The same key with Shift held.
@@ -101,6 +116,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(secondary!("0"), ResetFontSize, None),
     ]);
     cx.bind_keys(tree_nav::key_bindings());
+    cx.bind_keys(completions::key_bindings());
 }
 
 /// Menu items must work whatever has focus, so their actions are global and go to the
@@ -315,6 +331,8 @@ pub struct Workspace {
     selected: Option<String>,
     form: Option<Entity<ConnForm>>,
     editor: Entity<EditorState>,
+    run_button: Entity<RunButton>,
+    _run_button_subscription: Subscription,
     results: Entity<TableState<ResultsDelegate>>,
     row_detail: Entity<RowDetail>,
     _row_detail_subscriptions: [Subscription; 2],
@@ -834,8 +852,7 @@ impl Workspace {
                 .title(format!("Delete folder “{}”?", folder_name(&folder)))
                 .description("What's inside moves up one level. No connections are deleted.")
                 .confirm()
-                .ok_text("Delete folder")
-                .ok_variant(ButtonVariant::Danger)
+                .footer(dialogs::confirm_footer("Delete folder"))
                 .on_ok(move |_, _, cx| {
                     this.update(cx, |this, cx| this.remove_folder(&name, cx))
                         .ok();
@@ -879,11 +896,14 @@ impl Workspace {
                 .language("sql")
                 .line_number(true)
                 .default_value("SELECT 1;");
-            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions {
-                names: names.clone(),
-            }));
+            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(names.clone())));
             state
         });
+        let run_button = cx.new(|cx| RunButton::new(editor.clone(), cx));
+        let _run_button_subscription =
+            cx.subscribe(&run_button, |this, _, RunStatement(sql), cx| {
+                this.run_sql(sql.clone(), cx);
+            });
         let _editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 this.remember_draft(cx);
@@ -902,7 +922,7 @@ impl Workspace {
                     this.editor
                         .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
                     this.remember_draft(cx);
-                    this.run_query(cx);
+                    this.run_sql(sql.clone(), cx);
                 }
                 // Not run: the user reads it, fills it in, and presses Run.
                 SchemaEvent::Insert(sql) => {
@@ -987,6 +1007,8 @@ impl Workspace {
             selected: None,
             form: None,
             editor,
+            run_button,
+            _run_button_subscription,
             session: SessionState::default(),
             pending_editor_text: None,
             _editor_subscription,
@@ -1033,6 +1055,11 @@ impl Workspace {
         self.pending_editor_text =
             Some(self.session.drafts.get(&name).cloned().unwrap_or_default());
         self.db.allow_connecting(&name);
+        if let Some(conn) = self.config.find(&name) {
+            let adapter = conn.adapter;
+            self.run_button
+                .update(cx, |button, cx| button.set_adapter(adapter, cx));
+        }
         self.selected = Some(name);
         self.close_row_detail(cx);
         self.results.update(cx, |table, cx| {
@@ -1211,11 +1238,13 @@ impl Workspace {
         window.open_alert_dialog(cx, move |alert, _, _| {
             let (this, target) = (this.clone(), name.clone());
             alert
-                .title(format!("Delete “{name}”?"))
-                .description("Its saved password is removed from the keychain.")
+                .title(format!("Delete the connection “{name}”?"))
+                .description(
+                    "Only the saved connection and its password in the keychain are removed. \
+                     The database and its data are not touched.",
+                )
                 .confirm()
-                .ok_text("Delete")
-                .ok_variant(ButtonVariant::Danger)
+                .footer(dialogs::confirm_footer("Delete connection"))
                 .on_ok(move |_, _, cx| {
                     this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
                         .ok();
@@ -1264,23 +1293,50 @@ impl Workspace {
         .detach();
     }
 
-    /// Runs the selected text, or the whole editor when nothing is selected.
+    /// Runs the selected text, or else the statement at the cursor, split as a script
+    /// would be.
     fn run_query(&mut self, cx: &mut Context<Self>) {
+        let Some(conn) = self.selected_connection() else {
+            return;
+        };
+        let editor = self.editor.read(cx);
+        let selected = editor.selected_value();
+        let sql = if selected.trim().is_empty() {
+            let text = editor.value();
+            safety::statement_at(conn.adapter, &text, editor.cursor())
+                .map(|statement| text[statement].to_owned())
+        } else {
+            Some(selected.to_string())
+        };
+        match sql {
+            Some(sql) => self.run_sql(sql, cx),
+            None if self.can_run() => {
+                self.status = Status::Done(NO_STATEMENT.into());
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    /// Runs everything in the editor.
+    fn run_all(&mut self, cx: &mut Context<Self>) {
+        let sql = self.editor.read(cx).value().to_string();
+        self.run_sql(sql, cx);
+    }
+
+    /// Whether a query may start: not while one runs or the connection form is open.
+    fn can_run(&self) -> bool {
+        self.form.is_none() && !matches!(self.status, Status::Busy(_))
+    }
+
+    /// Runs `sql` as a script on the selected connection and records it in its history.
+    fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
         let Some(conn) = self.selected_connection() else {
             return;
         };
         if !self.can_run() {
             return;
         }
-        let sql = {
-            let editor = self.editor.read(cx);
-            let selected = editor.selected_value();
-            if selected.trim().is_empty() {
-                editor.value().to_string()
-            } else {
-                selected.to_string()
-            }
-        };
         self.session.record(&conn.name, &sql);
         self.schedule_session_save(cx);
         self.status = Status::Busy("Running…".into());
@@ -1299,11 +1355,6 @@ impl Workspace {
                 .ok();
         })
         .detach();
-    }
-
-    /// Whether a query can start now: not while one runs or the form covers the editor.
-    fn can_run(&self) -> bool {
-        self.form.is_none() && !matches!(self.status, Status::Busy(_))
     }
 
     /// Shows the result of query run `run` on `conn`.
@@ -1819,27 +1870,32 @@ impl Workspace {
         }
         window.open_dialog(cx, |dialog, _, cx| {
             let muted = cx.theme().muted_foreground;
-            dialog.w(px(320.)).child(
-                v_flex()
-                    .id("about")
-                    .test_support()
-                    .items_center()
-                    .gap_2()
-                    .py_2()
-                    .child(logos::brand(72.))
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_semibold()
-                            .child(tuplebase_core::PRODUCT_NAME),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
-                    ),
-            )
+            dialog
+                .w(px(320.))
+                .p_0()
+                .close_button(false)
+                .child(dialogs::with_close_button(
+                    v_flex()
+                        .id("about")
+                        .test_support()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_6()
+                        .child(logos::brand(72.))
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_semibold()
+                                .child(tuplebase_core::PRODUCT_NAME),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(muted)
+                                .child(concat!("Version ", env!("CARGO_PKG_VERSION"))),
+                        ),
+                ))
         });
     }
 
@@ -2210,13 +2266,15 @@ impl Workspace {
                 menu
             };
             menu.item(
-                PopupMenuItem::new("Edit").on_click(menu_click(&this, move |this, window, cx| {
-                    this.edit_connection(edited.clone(), window, cx)
-                })),
+                PopupMenuItem::new("Edit connection")
+                    .on_click(menu_click(&this, move |this, window, cx| {
+                        this.edit_connection(edited.clone(), window, cx)
+                    })),
             )
             .separator()
             .item(
-                PopupMenuItem::new("Delete")
+                // "connection", so it's never mistaken for dropping the database.
+                PopupMenuItem::new("Delete connection")
                     .on_click(menu_click(&this, move |this, window, cx| {
                         this.confirm_delete(name.clone(), window, cx)
                     })),
@@ -2254,14 +2312,14 @@ impl Workspace {
                 )),
             )
             .separator()
-            .item(PopupMenuItem::new("Rename").on_click(menu_click(
+            .item(PopupMenuItem::new("Rename folder").on_click(menu_click(
                 &this,
                 move |this, window, cx| {
                     this.begin_folder_edit(String::new(), Some(rename.clone()), window, cx);
                 },
             )))
             .item(
-                PopupMenuItem::new("Delete")
+                PopupMenuItem::new("Delete folder")
                     .on_click(menu_click(&this, move |this, window, cx| {
                         this.confirm_remove_folder(remove.clone(), window, cx)
                     })),
@@ -2290,7 +2348,12 @@ impl Workspace {
             .child(text)
     }
 
-    fn render_query_view(&self, conn: &Connection, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_query_view(
+        &self,
+        conn: &Connection,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
         let (border, radius, muted, muted_bg) = (
             theme.border,
@@ -2317,11 +2380,11 @@ impl Workspace {
             .on_resize(self.remember_panel_sizes(&[Panel::Editor], cx))
             .child(
                 self.sized_panel(Panel::Editor).child(
-                    div()
-                        .id("sql-editor")
+                    completions::handle_keys(div().id("sql-editor"), &self.editor, window)
                         .test_support()
                         .size_full()
-                        .child(Editor::new(&self.editor).appearance(false).h_full()),
+                        .child(Editor::new(&self.editor).appearance(false).h_full())
+                        .child(self.run_button.clone()),
                 ),
             )
             .child(
@@ -2560,7 +2623,7 @@ impl Render for Workspace {
         let main = if let Some(form) = self.form.clone() {
             div().size_full().child(form).into_any_element()
         } else if let Some(conn) = self.selected_connection() {
-            self.render_query_view(&conn, cx).into_any_element()
+            self.render_query_view(&conn, window, cx).into_any_element()
         } else {
             self.render_empty(cx).into_any_element()
         };
@@ -2576,6 +2639,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_query(cx)))
+                    .on_action(cx.listener(|this, _: &RunAll, _, cx| this.run_all(cx)))
                     .child(
                         h_resizable("workspace-panels")
                             .on_resize(
@@ -3811,26 +3875,149 @@ mod tests {
         });
     }
 
-    #[gpui_kit::test]
-    fn autocomplete_finishes_a_keyword(cx: &mut TestAppContext) {
+    /// Opens the editor of a connection, holding `text`.
+    fn open_editor(text: &str, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                cx.notify();
-            });
-        });
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.press("secondary-a", cx);
-            window.input("SELE", cx);
+            window.input(text, cx);
         });
-        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        // Nothing listens at the test connection's port; don't wait for connecting to fail.
+        cx.update(|cx| workspace.update(cx, |this, _| this.status = Status::Idle));
+        (handle, workspace)
+    }
+
+    fn menu_open(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> bool {
         cx.update(|cx| {
-            assert_eq!(
-                workspace.read(cx).editor.read(cx).value().as_str(),
-                "SELECT"
-            );
+            let editor = workspace.read(cx).editor.read(cx);
+            editor.completion_menu_state().open
+        })
+    }
+
+    #[gpui_kit::test]
+    fn tab_takes_the_suggestion(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("SELE", cx);
+        assert!(menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        assert_eq!(editor_text(&workspace, cx), "SELECT");
+        assert!(!menu_open(&workspace, cx));
+        // With no menu, Tab indents as before.
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        let text = editor_text(&workspace, cx);
+        assert!(
+            text.starts_with("SELECT") && text.len() > "SELECT".len(),
+            "{text:?}"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn enter_starts_a_new_line_even_with_the_menu_open(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("SELE", cx);
+        assert!(menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        assert_eq!(editor_text(&workspace, cx), "SELE\n");
+        assert!(!menu_open(&workspace, cx));
+    }
+
+    #[gpui_kit::test]
+    fn the_menu_waits_for_a_second_letter_or_ctrl_space(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("S", cx);
+        assert!(!menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("ctrl-space", cx));
+        assert!(menu_open(&workspace, cx));
+        window_action(handle, cx, |window, cx| window.press("escape", cx));
+        assert!(!menu_open(&workspace, cx));
+        assert_eq!(editor_text(&workspace, cx), "S");
+    }
+
+    const SCRIPT: &str = "select 1;\nselect 2;\nselect 3;";
+
+    /// Puts the cursor at the first `at` in the editor, or selects it.
+    fn place(
+        handle: AnyWindowHandle,
+        workspace: &Entity<Workspace>,
+        at: &str,
+        select: bool,
+        cx: &mut TestAppContext,
+    ) {
+        window_action(handle, cx, |_, cx| {
+            let editor = workspace.read(cx).editor.clone();
+            editor.update(cx, |editor, cx| {
+                let start = editor.value().find(at).expect("text to place at");
+                let end = if select { start + at.len() } else { start };
+                editor.set_selected_range(start..end, cx);
+            });
+        });
+        // The button follows the editor's layout, which the next frame paints.
+        window_action(handle, cx, |_, _| ());
+    }
+
+    fn last_run(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> Option<String> {
+        cx.update(|cx| {
+            let session = &workspace.read(cx).session;
+            session.history_for("db").next().map(str::to_owned)
+        })
+    }
+
+    #[gpui_kit::test]
+    fn run_key_runs_the_statement_at_the_cursor(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "2", false, cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some("select 2"));
+        // The key runs; it never adds a line.
+        assert_eq!(editor_text(&workspace, cx), SCRIPT);
+    }
+
+    #[gpui_kit::test]
+    fn run_key_runs_the_selection(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "2;\nselect 3", true, cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some("2;\nselect 3"));
+    }
+
+    #[gpui_kit::test]
+    fn run_all_key_runs_everything(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "2", false, cx);
+        window_action(handle, cx, |window, cx| {
+            window.press("secondary-shift-enter", cx)
+        });
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some(SCRIPT));
+    }
+
+    #[gpui_kit::test]
+    fn run_key_with_no_statement_at_the_cursor_says_so(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("select 1;\n\n", cx);
+        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
+        assert_eq!(last_run(&workspace, cx), None);
+        cx.update(|cx| {
+            let status = &workspace.read(cx).status;
+            assert!(matches!(status, Status::Done(s) if s.starts_with("No statement")));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_run_button_runs_its_statement(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor(SCRIPT, cx);
+        place(handle, &workspace, "3", false, cx);
+        window_action(handle, cx, |window, cx| window.click("run-statement", cx));
+        assert_eq!(last_run(&workspace, cx).as_deref(), Some("select 3"));
+    }
+
+    #[gpui_kit::test]
+    fn the_run_button_shows_only_at_a_statement(cx: &mut TestAppContext) {
+        let (handle, workspace) = open_editor("select 1;\n\n-- the end", cx);
+        place(handle, &workspace, "1", false, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("run-statement").visible());
+        });
+        place(handle, &workspace, "the end", false, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("run-statement").is_none());
         });
     }
 
@@ -4021,8 +4208,19 @@ mod tests {
         window_action(handle, cx, |window, cx| {
             window.dispatch_action(Box::new(About), cx);
         });
-        window_action(handle, cx, |window, _| {
+        window_action(handle, cx, |window, cx| {
             assert!(window.find("about").visible());
+            // The app's close icon, in the dialog's top right corner like the library's.
+            let (close, surface) = (
+                window.within("surface").find("close").bounds(),
+                window.find("surface").bounds(),
+            );
+            assert!((close.top() - surface.top() - px(8.)).abs() <= px(1.));
+            assert!((surface.right() - close.right() - px(8.)).abs() <= px(1.));
+            window.within("surface").click("close", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
         });
     }
 
@@ -4243,6 +4441,61 @@ mod tests {
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Old", cx);
             window.click("remove-Old", cx);
+        });
+        cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
+    }
+
+    #[gpui_kit::test]
+    fn the_buttons_of_a_confirm_dialog_cancel_and_confirm(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        let ask = |cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, cx| {
+                window.hover("folder-Production", cx);
+                window.click("remove-Production", cx);
+            });
+        };
+        let folders = |cx: &mut TestAppContext| {
+            workspace.read_with(cx, |this, _| this.config.folders().len())
+        };
+        ask(cx);
+        window_action(handle, cx, |window, cx| {
+            assert!(window.has_active_dialog(cx));
+            // The app's own Cancel and OK, laid out as the library's: side by side, as
+            // wide as their labels, OK on the right.
+            let (cancel, ok) = (window.find("cancel").bounds(), window.find("ok").bounds());
+            assert_eq!(cancel.center().y, ok.center().y);
+            assert!(cancel.right() < ok.left());
+            assert!(cancel.size.width < px(100.) && ok.size.width < px(150.));
+            window.click("cancel", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        assert_eq!(folders(cx), 1);
+        ask(cx);
+        window_action(handle, cx, |window, cx| window.press("escape", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        assert_eq!(folders(cx), 1);
+        ask(cx);
+        window_action(handle, cx, |window, cx| window.click("ok", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        assert_eq!(folders(cx), 0);
+    }
+
+    #[gpui_kit::test]
+    fn enter_confirms_a_confirm_dialog(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.hover("folder-Production", cx);
+            window.click("remove-Production", cx);
+        });
+        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
         });
         cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
@@ -4771,7 +5024,7 @@ mod tests {
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
                 this.status = Status::Idle;
-                this.run_query(cx);
+                this.run_sql("select 1".into(), cx);
             });
         });
         window_action(handle, cx, |window, cx| window.click("conn-db", cx));
