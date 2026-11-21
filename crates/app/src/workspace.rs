@@ -424,6 +424,7 @@ impl Workspace {
     fn close_tab(&mut self, name: String, cx: &mut Context<Self>) {
         self.remove_tab(&name, cx);
         self.connected.remove(&name);
+        cx.notify();
         let db = self.db.clone();
         cx.spawn(async move |this, cx| {
             io(async move {
