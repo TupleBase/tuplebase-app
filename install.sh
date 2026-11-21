@@ -54,6 +54,12 @@ install_macos() {
   echo "Installed app: $app"
 }
 
+# A path for a desktop entry's Exec key: quoted, as the Desktop Entry spec asks, so a
+# folder with spaces in its name still starts.
+desktop_exec() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')"
+}
+
 install_linux() {
   share="${XDG_DATA_HOME:-$HOME/.local/share}"
   tar -xzf "$1"
@@ -71,7 +77,7 @@ install_linux() {
 Type=Application
 Name=TupleBase
 Comment=Database client
-Exec=$BIN_DIR/tuplebase-app
+Exec=$(desktop_exec "$BIN_DIR/tuplebase-app")
 Icon=tuplebase
 Categories=Development;Database;
 Terminal=false

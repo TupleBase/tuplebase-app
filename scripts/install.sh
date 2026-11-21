@@ -14,6 +14,12 @@ pkg_args=()
 for bin in $BINS; do pkg_args+=(-p "$bin"); done
 (cd "$ROOT" && cargo build --release "${pkg_args[@]}")
 
+# A path for a desktop entry's Exec key: quoted, as the Desktop Entry spec asks, so a
+# folder with spaces in its name still starts.
+desktop_exec() {
+  printf '"%s"' "$(printf '%s' "$1" | sed -e 's/[\\"`$]/\\&/g' -e 's/\\/\\\\/g' -e 's/%/%%/g')"
+}
+
 has_mcp=false
 [[ " $BINS " == *" tuplebase-mcp "* ]] && has_mcp=true
 
@@ -38,13 +44,13 @@ case "$(uname -s)" in
 Type=Application
 Name=TupleBase
 Comment=Database client
-Exec=$BIN_DIR/tuplebase-app
+Exec=$(desktop_exec "$BIN_DIR/tuplebase-app")
 Icon=tuplebase
 Categories=Development;Database;
 Terminal=false
 DESKTOP
     echo "Installed app: $BIN_DIR/tuplebase-app (menu entry: TupleBase)"
-    $has_mcp && echo "Installed MCP: $BIN_DIR/tuplebase-mcp"
+    if $has_mcp; then echo "Installed MCP: $BIN_DIR/tuplebase-mcp"; fi
     ;;
   *)
     echo "Unsupported OS for this script. On Windows run: cargo build --release" >&2

@@ -3145,11 +3145,13 @@ mod tests {
         window_action(handle, cx, |window, cx| {
             window.click("chat-suggestion-0", cx);
         });
+        let mut stop = None;
         window_action(handle, cx, |window, cx| {
             let chat = workspace.read(cx).chat.read(cx);
             assert_eq!(chat.asked(), ["Which connections can you see?"]);
             assert!(chat.is_busy());
             assert!(window.find("chat-busy").visible());
+            stop = chat.turn_stop();
             window.click("chat-clear", cx);
         });
         cx.update(|cx| {
@@ -3157,6 +3159,8 @@ mod tests {
             assert!(chat.asked().is_empty());
             assert!(!chat.is_busy());
         });
+        // Clearing also ends the agent still answering.
+        assert!(stop.expect("the turn has a stop").is_stopped());
     }
 
     #[gpui_kit::test]

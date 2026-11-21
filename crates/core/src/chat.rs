@@ -6,7 +6,8 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -51,13 +52,88 @@ struct Line {
     error: Option<String>,
 }
 
+/// Stops one turn's agent, and the MCP server it started, from any thread: when the chat
+/// is cleared, another message is sent, or the app closes. Never blocks.
+#[derive(Clone, Default)]
+pub struct Stop(Arc<Mutex<Running>>);
+
+#[derive(Default)]
+struct Running {
+    stopped: bool,
+    agent: Option<Child>,
+}
+
+impl Stop {
+    pub fn stop(&self) {
+        let mut running = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        running.stopped = true;
+        if let Some(agent) = running.agent.as_mut() {
+            kill(agent);
+        }
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stopped
+    }
+
+    /// Keeps the agent here while it runs, so `stop` can reach it; a turn stopped before
+    /// the agent started kills it at once.
+    fn hold(&self, mut agent: Child) {
+        let mut running = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if running.stopped {
+            kill(&mut agent);
+        }
+        running.agent = Some(agent);
+    }
+
+    fn release(&self) -> Option<Child> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .agent
+            .take()
+    }
+}
+
+/// Doesn't wait: the reader sees the agent's output end and reaps it.
+fn kill(agent: &mut Child) {
+    // On Windows the agent is often a batch file: cmd.exe running node, which runs the
+    // MCP server. Killing cmd.exe alone would leave the others running, so the whole tree
+    // goes. `taskkill` finds it by parent, so cmd.exe must still be alive when it looks.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let tree = Command::new("taskkill")
+            .args(["/T", "/F", "/PID"])
+            .arg(agent.id().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        if tree.is_ok() {
+            return;
+        }
+    }
+    // The agent's MCP server reads its requests from the agent, so it ends with it.
+    let _ = agent.kill();
+}
+
+/// The app is a GUI program on Windows: without this every agent run opens a console.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Sends `prompt` and reports what the agent does until it has answered. `session`
 /// continues an earlier conversation; the result is the session to pass next time.
-/// Blocks for the whole answer; call it off the UI thread.
+/// Blocks for the whole answer, or until `stop`; call it off the UI thread.
 pub fn ask(
     prompt: &str,
     session: Option<&str>,
-    mut on_event: impl FnMut(Event),
+    stop: &Stop,
+    on_event: impl FnMut(Event),
 ) -> Result<Option<String>> {
     let agent = find_agent().with_context(|| {
         format!("{AGENT_NAME} was not found. Install it and sign in, then try again.")
@@ -88,23 +164,47 @@ pub fn ask(
     if let Some(session) = session {
         command.args(["--resume", session]);
     }
-    let mut child = command
+    command
         // The server inherits our environment, and writes are never on here.
         .env_remove(ALLOW_WRITES_ENV)
-        .current_dir(std::env::temp_dir())
+        .current_dir(std::env::temp_dir());
+    run(command, prompt, session, stop, on_event)
+}
+
+/// Runs the prepared agent `command` for one turn.
+fn run(
+    mut command: Command,
+    prompt: &str,
+    session: Option<&str>,
+    stop: &Stop,
+    mut on_event: impl FnMut(Event),
+) -> Result<Option<String>> {
+    if stop.is_stopped() {
+        bail!("stopped");
+    }
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("starting {AGENT_NAME}"))?;
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take().context("no stdout")?;
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    stop.hold(child);
 
     // The prompt goes in by stdin, so one that starts with a dash is never read as a flag.
     // An agent that has already stopped can't take it; its own error says why, below.
-    if let Some(mut stdin) = child.stdin.take() {
+    if let Some(mut stdin) = stdin {
         let _ = stdin.write_all(prompt.as_bytes());
     }
     // Read on the side, so a chatty stderr can't fill its pipe and stall the agent.
-    let mut stderr = child.stderr.take().context("no stderr")?;
     let errors = std::thread::spawn(move || {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text);
@@ -113,15 +213,18 @@ pub fn ask(
 
     let mut session = session.map(str::to_owned);
     let mut failure = None;
-    let output = BufReader::new(child.stdout.take().context("no stdout")?);
-    for line in output.lines().map_while(Result::ok) {
+    // Ends when the agent does, also when it is stopped.
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         let line = parse_line(&line);
         line.events.into_iter().for_each(&mut on_event);
         session = line.session.or(session);
         failure = line.error.or(failure);
     }
-    let status = child.wait()?;
+    let status = stop.release().context("the agent was lost")?.wait()?;
     let errors = errors.join().unwrap_or_default();
+    if stop.is_stopped() {
+        bail!("stopped");
+    }
     if let Some(failure) = failure {
         bail!(failure);
     }
@@ -351,6 +454,51 @@ mod tests {
             Some(full.join("claude"))
         );
         assert_eq!(find_in(&[empty], &["claude"]), None);
+    }
+
+    /// Runs `script` as the agent on another thread: its result, or `None` if it hangs.
+    #[cfg(unix)]
+    fn run_script(script: &str, stop: &Stop) -> Option<Result<Option<String>>> {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        let stop = stop.clone();
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(run(command, "hi", None, &stop, |_| {}));
+        });
+        result.recv_timeout(std::time::Duration::from_secs(10)).ok()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_turn_kills_its_agent() {
+        let stop = Stop::default();
+        let stopper = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            stopper.stop();
+        });
+        let result = run_script("exec sleep 30", &stop).expect("the agent kept running");
+        assert!(result.is_err());
+        assert!(stop.release().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_turn_stopped_before_its_agent_starts_never_runs_it() {
+        let stop = Stop::default();
+        stop.stop();
+        let result = run_script("exec sleep 30", &stop).expect("the agent ran");
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_that_answers_names_the_session() {
+        let line = r#"{"type":"assistant","session_id":"s9","message":{"content":[]}}"#;
+        let script = format!("cat >/dev/null; echo '{line}'");
+        let result = run_script(&script, &Stop::default()).expect("the agent hung");
+        assert_eq!(result.unwrap().as_deref(), Some("s9"));
     }
 
     #[test]
