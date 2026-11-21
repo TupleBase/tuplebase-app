@@ -235,12 +235,13 @@ fn call_head(adapter: Adapter, kind: ObjectKind, schema: &str, name: &str) -> St
     format!("{verb} {schema}.{name}")
 }
 
-/// `/* a b */` from the non-empty parts. Nothing in them can end the comment early.
+/// `/* a b */` from the non-empty parts. Nothing in them can end the comment early, or
+/// open one inside it, which PostgreSQL would nest and so not end where this one does.
 fn sql_comment(parts: &[&str]) -> String {
     let text: Vec<String> = parts
         .iter()
         .filter(|part| !part.trim().is_empty())
-        .map(|part| part.trim().replace("*/", "* /"))
+        .map(|part| part.trim().replace("*/", "* /").replace("/*", "/ *"))
         .collect();
     format!("/* {} */", text.join(" "))
 }
@@ -274,7 +275,17 @@ pub struct ExecOptions {
 enum Pool {
     Pg(PgPool),
     My(MySqlPool),
-    Sqlite(SqlitePool),
+    Sqlite(SqlitePools),
+}
+
+/// A SQLite file's pools. SQLite has no read-only transaction, and a statement can turn
+/// `PRAGMA query_only` off again, so read-only work (S2) runs on connections SQLite
+/// opened read-only: they refuse to write, whatever the statement says.
+#[derive(Clone)]
+struct SqlitePools {
+    /// Everything else. Read-only too when the connection is.
+    main: SqlitePool,
+    read_only: SqlitePool,
 }
 
 impl Pool {
@@ -282,7 +293,10 @@ impl Pool {
         match self {
             Pool::Pg(p) => p.close().await,
             Pool::My(p) => p.close().await,
-            Pool::Sqlite(p) => p.close().await,
+            Pool::Sqlite(p) => {
+                p.main.close().await;
+                p.read_only.close().await;
+            }
         }
     }
 }
@@ -336,7 +350,7 @@ impl Db {
         match self.pool(conn).await? {
             Pool::Pg(p) => p.execute("SELECT 1").await.map(drop)?,
             Pool::My(p) => p.execute("SELECT 1").await.map(drop)?,
-            Pool::Sqlite(p) => p.execute("SELECT 1").await.map(drop)?,
+            Pool::Sqlite(p) => p.main.execute("SELECT 1").await.map(drop)?,
         }
         Ok(())
     }
@@ -446,7 +460,7 @@ impl Db {
         let read_only = opts.read_only || conn.readonly;
         if read_only {
             for statement in statements {
-                safety::check_read_only(statement).map_err(|e| anyhow!(e))?;
+                safety::check_read_only(conn.adapter, statement).map_err(|e| anyhow!(e))?;
             }
         }
         let total = statements.len();
@@ -466,7 +480,7 @@ impl Db {
                     if read_only {
                         c.execute(begin).await?;
                     }
-                    let mut out = run!(&mut *c, sql, opts.max_rows, $decode);
+                    let mut out = run!(&mut *c, conn.adapter, sql, opts.max_rows, $decode);
                     // The statement never ran, and its types are known now: run it again,
                     // in a new read-only transaction when it had one.
                     if out.as_ref().is_err_and(lost_unnamed_statement) {
@@ -474,7 +488,7 @@ impl Db {
                             c.execute(end).await?;
                             c.execute(begin).await?;
                         }
-                        out = run!(&mut *c, sql, opts.max_rows, $decode);
+                        out = run!(&mut *c, conn.adapter, sql, opts.max_rows, $decode);
                     }
                     if read_only && c.execute(end).await.is_err() {
                         c.close_on_drop();
@@ -494,7 +508,17 @@ impl Db {
         match self.pool(conn).await? {
             Pool::Pg(pool) => run_all!(pool, postgres::DIALECT, postgres::value),
             Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value),
-            Pool::Sqlite(pool) => run_all!(pool, sqlite::DIALECT, sqlite::value),
+            Pool::Sqlite(pools) => {
+                let pool = if read_only {
+                    for statement in statements {
+                        sqlite::check_one_statement(&pools.read_only, statement).await?;
+                    }
+                    pools.read_only
+                } else {
+                    pools.main
+                };
+                run_all!(pool, sqlite::DIALECT, sqlite::value)
+            }
         }
 
         let mut result = shown.expect("callers pass at least one statement");
@@ -511,7 +535,7 @@ impl Db {
         let rows = match self.pool(conn).await? {
             Pool::Pg(p) => postgres::column_names(&p).await?,
             Pool::My(p) => mysql::column_names(&p).await?,
-            Pool::Sqlite(p) => sqlite::column_names(&p).await?,
+            Pool::Sqlite(p) => sqlite::column_names(&p.main).await?,
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
@@ -520,7 +544,7 @@ impl Db {
         let rows = match self.pool(conn).await? {
             Pool::Pg(p) => postgres::tables(&p).await?,
             Pool::My(p) => mysql::tables(&p).await?,
-            Pool::Sqlite(p) => sqlite::tables(&p).await?,
+            Pool::Sqlite(p) => sqlite::tables(&p.main).await?,
         };
         Ok(rows
             .into_iter()
@@ -534,7 +558,7 @@ impl Db {
         Ok(match self.pool(conn).await? {
             Pool::Pg(p) => postgres::list_objects(&p).await,
             Pool::My(p) => mysql::list_objects(&p).await,
-            Pool::Sqlite(p) => sqlite::list_objects(&p).await,
+            Pool::Sqlite(p) => sqlite::list_objects(&p.main).await,
         })
     }
 
@@ -549,7 +573,7 @@ impl Db {
         let rows = match self.pool(conn).await? {
             Pool::Pg(p) => postgres::columns(&p, schema, table).await?,
             Pool::My(p) => mysql::columns(&p, schema, &conn.database, table).await?,
-            Pool::Sqlite(p) => sqlite::columns(&p, table).await?,
+            Pool::Sqlite(p) => sqlite::columns(&p.main, table).await?,
         };
         if rows.is_empty() {
             bail!("table \"{table}\" not found");
@@ -574,7 +598,7 @@ impl Db {
         let found = match self.pool(conn).await? {
             Pool::Pg(p) => postgres::object_definition(&p, object).await?,
             Pool::My(p) => mysql::object_definition(&p, object).await?,
-            Pool::Sqlite(p) => sqlite::object_definition(&p, object).await?,
+            Pool::Sqlite(p) => sqlite::object_definition(&p.main, object).await?,
         };
         let what = format!(
             "{} {}.{}",
@@ -667,10 +691,10 @@ fn lost_unnamed_statement(error: &anyhow::Error) -> bool {
 /// Runs one statement as a prepared statement on `$conn`: streams up to `$max` rows
 /// for row-returning statements, otherwise reports the affected row count.
 macro_rules! run {
-    ($conn:expr, $sql:expr, $max:expr, $decode:path) => {
+    ($conn:expr, $adapter:expr, $sql:expr, $max:expr, $decode:path) => {
         async {
             let query = sqlx::query(AssertSqlSafe($sql.to_owned())).persistent(false);
-            if !safety::returns_rows($sql) {
+            if !safety::returns_rows($adapter, $sql) {
                 let done = query.execute($conn).await?;
                 return Ok::<_, anyhow::Error>(QueryResult {
                     columns: Vec::new(),
@@ -790,6 +814,19 @@ pub(super) mod tests {
             // Views are listed with the tables.
             assert!(!kinds(adapter).contains(&View));
         }
+    }
+
+    #[test]
+    fn a_comment_holds_no_comment_marks() {
+        for name in ["a/*b", "a*/b", "/*/", "*/*", "/**/", "a/*/*b*/"] {
+            let comment = sql_comment(&[name, "int"]);
+            let inside = &comment[2..comment.len() - 2];
+            assert!(
+                !inside.contains("/*") && !inside.contains("*/"),
+                "{comment}"
+            );
+        }
+        assert_eq!(sql_comment(&["", " n ", "int"]), "/* n int */");
     }
 
     #[test]

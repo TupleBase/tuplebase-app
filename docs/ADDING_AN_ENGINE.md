@@ -31,9 +31,11 @@ Engines that work alike share a module, as MySQL and MariaDB share `db/mysql.rs`
   sending one statement at a time as a prepared statement, and a read-only mode that the server
   enforces. Find out how the engine provides each one before writing code. If it has no read-only
   transaction, find a switch that makes the session refuse writes, as `PRAGMA query_only` does on
-  SQLite. If the driver runs several statements in one call, as SQLite's does, `Db::execute`
-  already refuses those in read-only mode, because it counts the statements with
-  `split_statements`. Changing the guard needs the user's explicit agreement.
+  SQLite. A switch the statement itself can turn off isn't enough alone: SQLite's read-only work
+  also runs on a connection opened read-only. If the driver runs several statements in one call,
+  as SQLite's does, ask the engine's own parser that there is only one, as
+  `sqlite::check_one_statement` does; counting with `split_statements` is only a first check.
+  Changing the guard needs the user's explicit agreement.
 - **Saved name.** The variant's serde name, such as `"postgres"`, is written to every user's
   `connections.json`. It can never change.
 
@@ -56,8 +58,10 @@ That needs no change, unless the engine is neither a plain server nor a single f
 
 ## 2. Splitting scripts (`core/src/safety.rs`)
 
-Pick an existing `ScriptFlavor`, or add one and its arm in `split_statements`. Comments, quotes and
-routine bodies decide where a `;` ends a statement. A new flavor needs tests beside the existing
+Pick an existing `ScriptFlavor`, or add one and its rules in `safety::token`. Comments, quotes and
+routine bodies decide where a `;` ends a statement, and where the read-only guard finds the first
+keyword: the scanner must read them exactly as the engine does, or a comment or string it misreads
+can hide a write. A new flavor needs tests beside the existing
 ones, including one showing that a read-only script can't hide a write. Don't change
 `READ_KEYWORDS` or `check_read_only` without the user's agreement (S2).
 

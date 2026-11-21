@@ -1,7 +1,11 @@
 //! SQLite: its catalog queries, object sources and value decoding. SQLite has no
 //! functions or procedures to call.
 
-use anyhow::Result;
+use std::ffi::CStr;
+use std::ptr;
+
+use anyhow::{Context, Result, bail};
+use libsqlite3_sys::{SQLITE_OK, sqlite3_errmsg, sqlite3_finalize, sqlite3_prepare_v2};
 use serde_json::{Value, json};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Row, TypeInfo, ValueRef};
@@ -29,6 +33,45 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "PRAGMA query_only = OFF",
     objects: OBJECTS,
 };
+
+/// Refuses `sql` unless SQLite reads it as one statement (S2). Given several, sqlx runs
+/// them all, one after another, so a second statement that the guard's own splitter
+/// misread as part of the first, say inside what it took for a string, would run too,
+/// and even a read-only connection can write a file with `VACUUM INTO`. This asks
+/// SQLite's own parser, the one sqlx uses to find each statement. Nothing runs.
+pub(super) async fn check_one_statement(pool: &SqlitePool, sql: &str) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    let mut handle = conn.lock_handle().await?;
+    let db = handle.as_raw_handle().as_ptr();
+    let mut rest = sql.as_bytes();
+    let mut statements = 0;
+    while !rest.is_empty() {
+        let len = i32::try_from(rest.len()).context("the statement is too long")?;
+        let mut statement = ptr::null_mut();
+        let mut tail = ptr::null();
+        // SAFETY: the locked handle keeps sqlx off the connection until it's dropped, and
+        // SQLite reads at most `len` bytes of `rest`, which outlives the call.
+        let status =
+            unsafe { sqlite3_prepare_v2(db, rest.as_ptr().cast(), len, &mut statement, &mut tail) };
+        if status != SQLITE_OK {
+            // SAFETY: SQLite returns a message that stays valid until the next call on `db`.
+            let message = unsafe { CStr::from_ptr(sqlite3_errmsg(db)) };
+            bail!("{}", message.to_string_lossy());
+        }
+        if !statement.is_null() {
+            statements += 1;
+            // SAFETY: the statement was just prepared, and nothing else holds it.
+            unsafe { sqlite3_finalize(statement) };
+        }
+        // SQLite points `tail` just past the statement it read, inside `rest`.
+        let read = (tail as usize).wrapping_sub(rest.as_ptr() as usize);
+        if statements > 1 || read == 0 || read > rest.len() {
+            bail!("read-only: run one statement at a time");
+        }
+        rest = &rest[read..];
+    }
+    Ok(())
+}
 
 pub(super) async fn column_names(pool: &SqlitePool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(
@@ -111,4 +154,39 @@ pub(super) fn value(row: &SqliteRow, i: usize) -> Value {
         Vec<u8> => bytes,
     );
     fallback(row, i, &type_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    use super::*;
+
+    /// Part of the read-only guard (S2): SQLite's own parser decides how many statements
+    /// there are, whatever the guard's splitter made of them.
+    #[tokio::test]
+    async fn only_one_statement_passes() {
+        let pool =
+            SqlitePoolOptions::new().connect_lazy_with(SqliteConnectOptions::new().in_memory(true));
+        for sql in [
+            "SELECT 1",
+            "SELECT 1;",
+            "SELECT 1; -- note",
+            "SELECT 1 /* ; */ ; /* end */",
+            "SELECT 1 AS [a;b], 'c;d'",
+        ] {
+            assert!(check_one_statement(&pool, sql).await.is_ok(), "{sql}");
+        }
+        for sql in [
+            "SELECT 1; SELECT 2",
+            "SELECT 1; VACUUM INTO 'copy.sqlite'",
+            "SELECT 1 AS [x'] ; PRAGMA query_only = OFF; SELECT 2 AS ['y]",
+            "SELECT 1; SELECT * FROM missing",
+            "SELECT * FROM missing",
+        ] {
+            assert!(check_one_statement(&pool, sql).await.is_err(), "{sql}");
+        }
+        let missing = check_one_statement(&pool, "SELECT * FROM missing").await;
+        assert!(missing.unwrap_err().to_string().contains("missing"));
+    }
 }

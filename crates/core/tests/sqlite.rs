@@ -120,6 +120,61 @@ async fn read_only_cannot_be_escaped_with_extra_statements() {
 }
 
 #[tokio::test]
+async fn read_only_cannot_be_escaped_by_quotes_the_splitter_misreads() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    for sql in [
+        "SELECT 1 AS [x'] ; PRAGMA query_only = OFF; DELETE FROM users; SELECT 2 AS ['y]",
+        "SELECT 1 AS [x\"] ; PRAGMA query_only = OFF; DELETE FROM users; SELECT 2 AS [\"y]",
+        "SELECT 1 AS [x`] ; PRAGMA query_only = OFF; DELETE FROM users; SELECT 2 AS [`y]",
+        "SELECT 1 AS [x/*] ; PRAGMA query_only = OFF; DELETE FROM users; SELECT 2 AS [*/y]",
+        "SELECT 1 AS [x--] ; PRAGMA query_only = OFF; DELETE FROM users",
+    ] {
+        let result = db.execute(&conn, sql, READ).await;
+        assert_eq!(user_count(&db, &conn).await, 2, "{sql}");
+        assert!(result.is_err(), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn read_only_still_runs_one_statement_with_comments_and_quoted_names() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    for sql in [
+        "SELECT [name] FROM [users] WHERE id = 1; -- trailing note",
+        "SELECT \"name\", `name` AS [n;x] FROM users WHERE id = 1 /* ; */",
+        "SELECT name FROM users WHERE name = 'Ada' -- '\n",
+    ] {
+        let r = db.execute(&conn, sql, READ).await.unwrap();
+        assert_eq!(r.rows[0][0], json!("Ada"), "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn read_only_cannot_write_files_through_smuggled_statements() {
+    let (dir, conn) = database().await;
+    let db = Db::new();
+    let copy = dir.path().join("copy.sqlite");
+    let other = dir.path().join("other.sqlite");
+    for sql in [
+        format!(
+            "SELECT 1 AS [x'] ; VACUUM INTO '{}'; SELECT 2 AS ['y]",
+            copy.display()
+        ),
+        format!(
+            "SELECT 1 AS [x'] ; ATTACH 'file:{}?mode=rwc' AS o; \
+             CREATE TABLE o.t (a); SELECT 2 AS ['y]",
+            other.display()
+        ),
+    ] {
+        let result = db.execute(&conn, &sql, READ).await;
+        assert!(!copy.exists(), "{sql}");
+        assert!(!other.exists(), "{sql}");
+        assert!(result.is_err(), "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn read_only_mode_does_not_stick_to_the_connection() {
     let (_dir, conn) = database().await;
     let db = Db::new();
