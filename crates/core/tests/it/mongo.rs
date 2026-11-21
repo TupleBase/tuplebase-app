@@ -2,9 +2,6 @@
 //! MongoDB and once as DocumentDB (which can't run locally: the same server stands in,
 //! without TLS). Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
 
-// Db::run's Mongo runner is one more level of nested futures.
-#![recursion_limit = "256"]
-
 use serde_json::json;
 use tuplebase_core::config::{Adapter, Connection, MongoSettings};
 use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
@@ -36,7 +33,8 @@ fn connection(adapter: Adapter, user: &str) -> Connection {
                 let name = format!("it-mongo-{user}-{adapter:?}").to_lowercase();
                 for name in [name.clone(), format!("{name}-direct")] {
                     let var = tuplebase_core::secrets::env_var_name(&name);
-                    // SAFETY: runs once, before any connection reads the environment.
+                    // SAFETY: only std::env reads these variables, and it locks against this write;
+                    // no C code reads them. The tests share one process (see main.rs).
                     unsafe { std::env::set_var(var, user) };
                 }
             }

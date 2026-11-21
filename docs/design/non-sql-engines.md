@@ -257,7 +257,7 @@ A statement ends at `;`, or at a newline at depth 0 when the next non-blank line
   - The guard: allowed and refused tables; nested `$out`/`$merge` in `$facet`, `$lookup` and `$unionWith`; `runCommand` first-key handling; `$` escapes.
   - MongoShell and PartiQl splitting, including a comment or string that tries to hide a second statement.
   - `check_partiql`, AttributeValue and BSON to JSON, column flattening, config serde of the new adapters, `validate` rules, `adapter_for_engine("docdb")` with SDK builders as the existing tests use.
-- **Integration (`crates/core/tests/mongo.rs`, `dynamo.rs`, with `TUPLEBASE_IT=1`):**
+- **Integration (`crates/core/tests/it/mongo.rs`, `it/dynamo.rs`, with `TUPLEBASE_IT=1`):**
   - `reader` is refused a write by the server even when the guard is bypassed by calling the module directly.
   - `server_read_only` is detected.
   - Paging and truncation work.

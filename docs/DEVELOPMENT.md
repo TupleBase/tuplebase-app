@@ -50,15 +50,28 @@ A clean build compiles several hundred crates and takes a few minutes; after tha
   run B's code. Instead, reuse a worktree for the next task rather than making a new one, and
   delete its `target/` when you remove it. This applies to coding agents in parallel worktrees
   too.
-- **Debug info is line tables only** (`[profile.dev]` in `Cargo.toml`): backtraces and panics
-  still show file and line, but a debugger can't show local variables. When you need them,
+- **Debug info is line tables only, and none for dependencies** (`[profile.dev]` in
+  `Cargo.toml`): backtraces and panics in this repo's code still show file and line, but a
+  debugger can't show local variables, and a frame inside a dependency shows only its function. When you need them,
   build with full debug info (this rebuilds every crate):
 
   ```sh
   CARGO_PROFILE_DEV_DEBUG=full cargo run -p tuplebase-app
   ```
 
-- On x86_64 Linux, Rust already links with its own `rust-lld`; no linker setup is needed.
+- **Always build the whole workspace: `--workspace`, never `-p <crate>`.** Cargo picks the
+  features of shared dependencies from the packages selected, so `cargo test -p tuplebase-core`
+  builds a second copy of most dependencies (about 100 seconds and several GB the first time)
+  next to the one `--workspace` uses. To run some tests only, filter by name:
+  `cargo test --workspace mongo`.
+- **While iterating, check with `cargo clippy --workspace --all-targets`** (a few seconds after
+  a change) and run the tests you touched by name; run fmt, clippy and the whole test suite
+  once before committing.
+- **`core`'s integration tests are one test binary**, `crates/core/tests/it/`, so a change links
+  one binary instead of one per file. `aws_profile.rs` and `aws_role.rs` stay separate: each sets
+  AWS variables for its whole process. Add a new test file as a module of `it/main.rs`.
+- On x86_64 Linux, Rust already links with its own `rust-lld`; no linker setup is needed. mold
+  and `-Csplit-debuginfo=unpacked` were measured and made no difference here.
 
 ## Tests against real databases
 
@@ -90,7 +103,7 @@ MongoDB runs as a single-node replica set, `rs0`, with the root user `dev` (pass
 `authSource=admin`). `dev/seed-mongo.js` fills `app.users` and `app.orders`, adds the view
 `app.active_users`, and the user `reader` (password `reader`) with only the `read` role on
 `app`, whose writes the server refuses. The seed runs only when the database is first created.
-`crates/core/tests/mongo.rs` runs each test twice, as MongoDB and as DocumentDB, against this
+`crates/core/tests/it/mongo.rs` runs each test twice, as MongoDB and as DocumentDB, against this
 one server.
 
 DocumentDB can't run locally. Before a release that changes `db/mongo.rs`, try a real cluster
