@@ -5,7 +5,7 @@ use sqlx::Executor;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection as _};
 use tuplebase_core::config::{Adapter, Connection};
-use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
+use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind, ROLLED_BACK_NOTE};
 
 const READ: ExecOptions = ExecOptions {
     read_only: true,
@@ -104,6 +104,32 @@ async fn a_transaction_left_open_ends_with_its_run() {
         4,
         "no transaction swallowed it"
     );
+}
+
+/// Rolling back what a run left open is never silent: the result or the error says so.
+#[tokio::test]
+async fn a_transaction_rolled_back_at_the_end_of_a_run_is_reported() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    let run = db
+        .execute_script(&conn, "BEGIN; UPDATE users SET name = 'x'", WRITE)
+        .await
+        .unwrap();
+    assert!(run.rolled_back);
+    assert_eq!(user_count(&db, &conn).await, 2);
+    for script in ["BEGIN; SELECT 1; COMMIT", "SELECT 1"] {
+        let run = db.execute_script(&conn, script, WRITE).await.unwrap();
+        assert!(!run.rolled_back, "{script}");
+    }
+    let run = db.execute_script(&conn, "SELECT 1", READ).await.unwrap();
+    assert!(!run.rolled_back);
+    let error = db
+        .execute_script(&conn, "BEGIN; SELECT * FROM missing", WRITE)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains(ROLLED_BACK_NOTE), "{error:#}");
+    let r = db.execute(&conn, "BEGIN", WRITE).await.unwrap();
+    assert_eq!(r.note, Some(ROLLED_BACK_NOTE));
 }
 
 #[tokio::test]

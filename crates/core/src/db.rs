@@ -44,7 +44,17 @@ pub struct QueryResult {
     /// Set for statements that do not return rows.
     pub rows_affected: Option<u64>,
     pub elapsed_ms: u64,
+    /// Something the user must know about the run, such as [`ROLLED_BACK_NOTE`]. Set by
+    /// [`Db::execute`], whose result is all an agent sees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
 }
+
+/// Said when a run left a transaction open and it was rolled back, so nothing it
+/// changed in it was kept. The connection goes back to a pool, so a transaction can't
+/// span runs.
+pub const ROLLED_BACK_NOTE: &str =
+    "An open transaction was rolled back: run BEGIN … COMMIT in one go.";
 
 /// What running a script produced.
 #[derive(Debug, Clone)]
@@ -54,6 +64,9 @@ pub struct ScriptResult {
     pub statements: usize,
     /// At least one statement changed something rather than reading.
     pub changed: bool,
+    /// The run left a transaction open, and it was rolled back ([`ROLLED_BACK_NOTE`]).
+    /// Never set for read-only work, whose transactions are the guard's own.
+    pub rolled_back: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,7 +446,12 @@ impl Db {
         {
             bail!("read-only: run one statement at a time");
         }
-        Ok(self.run(conn, &[statement], opts).await?.result)
+        let run = self.run(conn, &[statement], opts).await?;
+        let mut result = run.result;
+        if run.rolled_back {
+            result.note = Some(ROLLED_BACK_NOTE);
+        }
+        Ok(result)
     }
 
     /// Runs `;`-separated statements in order, stopping at the first error.
@@ -468,6 +486,7 @@ impl Db {
         let started = Instant::now();
         let mut shown: Option<QueryResult> = None;
         let mut changed = false;
+        let mut rolled_back = false;
 
         macro_rules! run_all {
             ($pool:expr, $dialect:expr, $decode:path, $end_transaction:path) => {{
@@ -477,8 +496,11 @@ impl Db {
                     ..
                 } = $dialect;
                 let mut c = Lease::new($pool.acquire().await?);
-                let ran = async {
+                // The statements that were sent, up to the one that failed.
+                let mut sent = 0;
+                let mut ran = async {
                     for (index, sql) in statements.iter().copied().enumerate() {
+                        sent = index + 1;
                         if read_only {
                             c.execute(begin).await?;
                         }
@@ -512,9 +534,18 @@ impl Db {
                 .await;
                 // Whether the statements succeeded or not, none of them may leave a
                 // transaction open on a connection that later work, from another tab or
-                // the MCP server, would get from the pool.
-                if $end_transaction(&mut **c).await.is_ok() {
+                // the MCP server, would get from the pool. Ending one loses what it
+                // changed, so the user is told.
+                // Where the server can't say whether one is open, the statements tell.
+                let script_left_open =
+                    safety::leaves_transaction_open(conn.adapter, &statements[..sent]);
+                if let Ok(open) = $end_transaction(&mut **c, script_left_open).await {
                     c.reusable();
+                    // Read-only work's transactions are the guard's own.
+                    rolled_back = open && !read_only;
+                }
+                if rolled_back {
+                    ran = ran.map_err(|e| anyhow!("{e:#}. {ROLLED_BACK_NOTE}"));
                 }
                 ran?;
             }};
@@ -551,6 +582,7 @@ impl Db {
             result,
             statements: total,
             changed,
+            rolled_back,
         })
     }
 
@@ -770,6 +802,7 @@ macro_rules! run {
                     truncated: false,
                     rows_affected: Some(done.rows_affected()),
                     elapsed_ms: 0,
+                    note: None,
                 });
             }
             // One statement; its results and the end of each result set.
@@ -819,6 +852,7 @@ macro_rules! run {
                 truncated,
                 rows_affected: None,
                 elapsed_ms: 0,
+                note: None,
             })
         }
         .await

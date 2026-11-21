@@ -38,8 +38,12 @@ pub(super) const DIALECT: Dialect = Dialect {
 
 /// Ends any transaction a run left open, so the connection goes back to the pool
 /// without one, and without the lock that would keep everyone else from writing.
-/// SQLite says whether one is open; `ROLLBACK` without one is an error.
-pub(super) async fn end_transaction(conn: &mut SqliteConnection) -> Result<()> {
+/// SQLite says whether one is open; `ROLLBACK` without one is an error. Returns whether
+/// there was one.
+pub(super) async fn end_transaction(
+    conn: &mut SqliteConnection,
+    _script_left_open: bool,
+) -> Result<bool> {
     let open = {
         let mut handle = conn.lock_handle().await?;
         // SAFETY: the locked handle keeps sqlx off the connection until it's dropped.
@@ -48,7 +52,7 @@ pub(super) async fn end_transaction(conn: &mut SqliteConnection) -> Result<()> {
     if open {
         conn.execute("ROLLBACK").await?;
     }
-    Ok(())
+    Ok(open)
 }
 
 /// Refuses `sql` unless SQLite reads it as one statement (S2). Given several, sqlx runs

@@ -26,7 +26,7 @@ use tuplebase_core::config::{
     Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
     kept_unreadable_message, parent_of, rebase_folder,
 };
-use tuplebase_core::db::{Db, ExecOptions, ScriptResult};
+use tuplebase_core::db::{Db, ExecOptions, ROLLED_BACK_NOTE, ScriptResult};
 use tuplebase_core::secrets::{ConnectionSecrets, Secret};
 use tuplebase_core::state::SessionState;
 use tuplebase_core::{app_status, mcp_status, safety, secrets, updates};
@@ -1403,7 +1403,15 @@ impl Workspace {
             return;
         }
         self.status = match &result {
-            Ok(run) => Status::Done(summary(&run.result, run.statements).into()),
+            Ok(run) => {
+                let done = summary(&run.result, run.statements);
+                // What the run changed in its open transaction was not kept: say so.
+                Status::Done(if run.rolled_back {
+                    format!("{done} · {ROLLED_BACK_NOTE}").into()
+                } else {
+                    done.into()
+                })
+            }
             Err(e) => Status::Failed(format!("{e:#}").into()),
         };
         if let Ok(run) = &result {
@@ -2802,7 +2810,7 @@ mod tests {
     use serde_json::json;
     use std::rc::Rc;
     use tuplebase_core::config::{Adapter, Appearance, Auth, AwsIamAuth, AwsSecretRef, TlsMode};
-    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult};
+    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE};
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
         cx.update(|cx| {
@@ -2966,6 +2974,7 @@ mod tests {
                         truncated: false,
                         rows_affected: None,
                         elapsed_ms: 1,
+                        note: None,
                     });
                     table.refresh(cx);
                 });
@@ -3020,6 +3029,7 @@ mod tests {
                         truncated: false,
                         rows_affected: None,
                         elapsed_ms: 1,
+                        note: None,
                     });
                     table.refresh(cx);
                 });
@@ -3173,6 +3183,7 @@ mod tests {
                     truncated: false,
                     rows_affected: None,
                     elapsed_ms: 1,
+                    note: None,
                 };
                 this.results.update(cx, |table, cx| {
                     table.delegate_mut().show(&result);
@@ -3365,6 +3376,7 @@ mod tests {
             truncated,
             rows_affected: affected,
             elapsed_ms: 5,
+            note: None,
         };
         assert_eq!(super::summary(&result(1, None, false), 1), "1 row in 5 ms");
         assert_eq!(
@@ -3942,6 +3954,7 @@ mod tests {
             truncated: false,
             rows_affected: None,
             elapsed_ms: 5,
+            note: None,
         };
         assert_eq!(super::summary(&result, 3), "3 statements. 2 rows in 5 ms");
         assert_eq!(super::history_label("select\n  1"), "select 1");
@@ -4884,6 +4897,7 @@ mod tests {
                         truncated: false,
                         rows_affected: None,
                         elapsed_ms: 1,
+                        note: None,
                     });
                     table.refresh(cx);
                 });
@@ -5068,6 +5082,42 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn the_status_line_says_when_an_open_transaction_was_rolled_back(cx: &mut TestAppContext) {
+        let (_, workspace) = open(config_with_connection(), cx);
+        let run = |rolled_back| tuplebase_core::db::ScriptResult {
+            result: QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                truncated: false,
+                rows_affected: Some(1),
+                elapsed_ms: 1,
+                note: None,
+            },
+            statements: 2,
+            changed: true,
+            rolled_back,
+        };
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                let conn = this.config.find("db").unwrap().clone();
+                for rolled_back in [true, false] {
+                    this.run_query(cx);
+                    this.finish_query(this.run, conn.clone(), Ok(run(rolled_back)), cx);
+                    let Status::Done(text) = &this.status else {
+                        panic!("not done");
+                    };
+                    assert!(
+                        text.starts_with(&super::summary(&run(false).result, 2)),
+                        "{text}"
+                    );
+                    assert_eq!(text.contains(ROLLED_BACK_NOTE), rolled_back, "{text}");
+                }
+            });
+        });
+    }
+
+    #[gpui_kit::test]
     fn an_earlier_query_finishing_late_does_not_replace_a_later_one(cx: &mut TestAppContext) {
         let (_, workspace) = open(config_with_connection(), cx);
         let result = |rows: usize| tuplebase_core::db::ScriptResult {
@@ -5077,9 +5127,11 @@ mod tests {
                 truncated: false,
                 rows_affected: None,
                 elapsed_ms: 1,
+                note: None,
             },
             statements: 1,
             changed: false,
+            rolled_back: false,
         };
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {

@@ -108,11 +108,35 @@ pub(super) const DIALECT: Dialect = Dialect {
 };
 
 /// Ends any transaction a run left open, such as one it began, or one a failed
-/// statement aborted, so the connection goes back to the pool without one. With none
-/// open, PostgreSQL only warns.
-pub(super) async fn end_transaction(conn: &mut PgConnection) -> Result<()> {
-    conn.execute("ROLLBACK").await?;
-    Ok(())
+/// statement aborted, so the connection goes back to the pool without one. Returns
+/// whether there was one.
+///
+/// The driver doesn't expose the server's transaction status, so this asks: sent as a
+/// simple query outside a transaction, a statement starts its own, at the same moment;
+/// inside one, the transaction started earlier. In one a failed statement aborted, any
+/// query is refused with `in_failed_sql_transaction`.
+pub(super) async fn end_transaction(
+    conn: &mut PgConnection,
+    _script_left_open: bool,
+) -> Result<bool> {
+    const IN_FAILED_TRANSACTION: &str = "25P02";
+    let open = match sqlx::raw_sql("SELECT now() <> statement_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(row) => row.try_get::<bool, _>(0)?,
+        Err(e)
+            if e.as_database_error().and_then(|e| e.code()).as_deref()
+                == Some(IN_FAILED_TRANSACTION) =>
+        {
+            true
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if open {
+        conn.execute("ROLLBACK").await?;
+    }
+    Ok(open)
 }
 
 pub(super) async fn column_names(pool: &PgPool) -> Result<Vec<(String,)>> {

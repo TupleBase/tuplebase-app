@@ -376,6 +376,36 @@ fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
     }
 }
 
+/// Whether these statements, run in order, leave a transaction open: one begun and not
+/// ended, or autocommit turned off and something run after it. Read from their first
+/// words, for a server that can't say itself (MySQL). Not part of the read-only guard.
+pub fn leaves_transaction_open(adapter: Adapter, statements: &[&str]) -> bool {
+    let (mut open, mut manual) = (false, false);
+    for statement in statements {
+        let words: Vec<String> = tokens(adapter, statement)
+            .filter(|&(kind, _)| kind == Token::Word)
+            .map(|(_, word)| word.to_ascii_lowercase())
+            .filter(|word| !matches!(word.as_str(), "session" | "local"))
+            .take(3)
+            .collect();
+        let word = |i: usize| words.get(i).map_or("", String::as_str);
+        match (word(0), word(1), word(2)) {
+            ("set", "autocommit", value) => {
+                manual = matches!(value, "0" | "off");
+                // Turning it back on commits.
+                open &= manual;
+            }
+            ("begin", ..) | ("start", "transaction", _) => open = true,
+            ("rollback", "to", _) => {}
+            ("commit" | "rollback", ..) => open = false,
+            // MySQL commits before each of these.
+            ("create" | "alter" | "drop" | "rename" | "truncate", ..) => open = false,
+            _ => open |= manual,
+        }
+    }
+    open
+}
+
 /// Whether the statement starts with a read keyword (SELECT, WITH, SHOW, ...).
 pub fn starts_with_read(adapter: Adapter, sql: &str) -> bool {
     first_keyword(adapter, sql).is_some_and(|k| READ_KEYWORDS.contains(&k.as_str()))
@@ -609,6 +639,33 @@ mod tests {
             ));
             assert!(!returns_rows(adapter, "update t set a = 1"));
         }
+    }
+
+    #[test]
+    fn a_script_that_leaves_a_transaction_open_is_told_from_its_statements() {
+        let open = |statements: &[&str]| leaves_transaction_open(Adapter::Mysql, statements);
+        assert!(open(&["BEGIN", "UPDATE t SET a = 1"]));
+        assert!(open(&["start transaction"]));
+        assert!(open(&["SET autocommit = 0", "insert into t values (1)"]));
+        assert!(open(&["SET SESSION autocommit=OFF", "delete from t"]));
+        assert!(open(&["BEGIN", "SAVEPOINT a", "ROLLBACK TO a"]));
+        assert!(!open(&["BEGIN", "UPDATE t SET a = 1", "COMMIT"]));
+        assert!(!open(&["START TRANSACTION", "ROLLBACK"]));
+        assert!(!open(&["select 1", "update t set a = 1"]));
+        assert!(!open(&["SET autocommit = 0"]), "nothing ran in it");
+        assert!(!open(&[
+            "SET autocommit = 0",
+            "insert into t values (1)",
+            "SET autocommit = 1"
+        ]));
+        // DDL commits first on MySQL.
+        assert!(!open(&[
+            "BEGIN",
+            "insert into t values (1)",
+            "CREATE TABLE u (a int)"
+        ]));
+        // In a comment or a string, it's not a statement.
+        assert!(!open(&["/* BEGIN */ select 'start transaction'"]));
     }
 
     #[test]
