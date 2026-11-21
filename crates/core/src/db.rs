@@ -1,17 +1,20 @@
-//! Database access for PostgreSQL, MariaDB/MySQL, SQLite and Redshift.
+//! Database access for PostgreSQL, MariaDB/MySQL, SQLite, Redshift, and MongoDB and
+//! Amazon DocumentDB.
 //!
 //! Async API; callers provide a Tokio runtime. One pool per connection, cached by
 //! name and rebuilt when the connection's settings change.
 //!
 //! This file holds the public API and what all engines share. Each [`Db`] method that
 //! needs engine-specific SQL picks the engine module by the pool and calls it:
-//! [`postgres`], [`mysql`] (MySQL and MariaDB), [`sqlite`] and [`redshift`]. A feature only one engine
+//! [`postgres`], [`mysql`] (MySQL and MariaDB), [`sqlite`], [`redshift`] and [`mongo`]
+//! (MongoDB and DocumentDB, which run shell commands rather than SQL). A feature only one engine
 //! has, such as MySQL events, lives only in that engine's module. So does connecting:
 //! [`Pool::open`] and [`Pool::renew`] call the engine module's `connect` and `renew`,
 //! and [`connect`] holds what every engine shares (credentials, tunnel, token renewal).
 
 mod connect;
 mod decode;
+mod mongo;
 mod mysql;
 mod postgres;
 mod redshift;
@@ -32,8 +35,8 @@ use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
 use tokio::sync::Mutex;
 
 use crate::config::{Adapter, Connection, Family};
-use crate::safety;
 use crate::ssh::Tunnel;
+use crate::{mongo_shell, safety};
 
 use connect::{Refresher, connect};
 use sqlite::SqlitePools;
@@ -55,6 +58,12 @@ pub struct QueryResult {
     /// `columns` and `rows` then hold them flattened for the table. Never set for SQL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documents: Option<Vec<Value>>,
+    /// Whether the server itself refuses writes from this connection, on engines with no
+    /// read-only transaction (MongoDB, DocumentDB): `Some(true)` only when it was shown,
+    /// `None` when it couldn't be told. Never set for SQL, where the guard's own
+    /// read-only transaction makes the server refuse writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_read_only: Option<bool>,
 }
 
 impl QueryResult {
@@ -320,6 +329,8 @@ enum Pool {
     /// Redshift speaks PostgreSQL's protocol, so the pool is sqlx's PostgreSQL one; its
     /// own variant sends every method to [`redshift`], whose catalog is not PostgreSQL's.
     Redshift(PgPool),
+    /// MongoDB and DocumentDB: the driver's client, which keeps its own pool.
+    Mongo(mongo::MongoPool),
 }
 
 impl Pool {
@@ -340,6 +351,9 @@ impl Pool {
             Adapter::Redshift => {
                 Pool::Redshift(redshift::connect(conn, host, port, password).await?)
             }
+            Adapter::Mongodb | Adapter::Documentdb => {
+                Pool::Mongo(mongo::connect(conn, host, port, password).await?)
+            }
         })
     }
 
@@ -351,6 +365,8 @@ impl Pool {
             Pool::My(p) => mysql::renew(p, conn, host, port, password),
             Pool::Sqlite(p) => sqlite::renew(p, conn),
             Pool::Redshift(p) => redshift::renew(p, conn, host, port, password),
+            // Nothing renews a password on these: IAM sign-in isn't supported yet.
+            Pool::Mongo(_) => {}
         }
     }
 
@@ -360,6 +376,7 @@ impl Pool {
             Pool::My(p) => p.close().await,
             Pool::Sqlite(p) => p.close().await,
             Pool::Redshift(p) => p.close().await,
+            Pool::Mongo(p) => mongo::close(p).await,
         }
     }
 }
@@ -415,8 +432,21 @@ impl Db {
             Pool::My(p) => p.execute("SELECT 1").await.map(drop)?,
             Pool::Sqlite(p) => p.main.execute("SELECT 1").await.map(drop)?,
             Pool::Redshift(p) => p.execute("SELECT 1").await.map(drop)?,
+            Pool::Mongo(p) => mongo::test(&p).await?,
         }
         Ok(())
+    }
+
+    /// Whether the server itself refuses writes from `conn`, on an engine with no
+    /// read-only transaction (MongoDB, DocumentDB): `Some(true)` only when the server
+    /// showed it, through the user's privileges or a direct connection to a secondary;
+    /// `None` when it couldn't be told. Always `None` for SQL engines, whose read-only
+    /// work runs in a transaction the server keeps read-only (S2).
+    pub async fn server_read_only(&self, conn: &Connection) -> Result<Option<bool>> {
+        Ok(match self.pool(conn).await? {
+            Pool::Pg(_) | Pool::My(_) | Pool::Sqlite(_) | Pool::Redshift(_) => None,
+            Pool::Mongo(p) => p.server_read_only,
+        })
     }
 
     /// Like [`Db::test`], but closes a connection that no longer works.
@@ -531,9 +561,8 @@ impl Db {
         // depth limit in callers such as the integration tests.
         match conn.adapter.family() {
             Family::Sql => {}
-            Family::Document | Family::KeyValue => {
-                bail!("{} can't run queries yet", conn.adapter.label())
-            }
+            Family::Document => return self.run_mongo(conn, statements, opts).await,
+            Family::KeyValue => bail!("{} can't run queries yet", conn.adapter.label()),
         }
         let read_only = opts.read_only || conn.readonly;
         if read_only {
@@ -655,6 +684,7 @@ impl Db {
                 redshift::end_transaction
             )
             .map_err(redshift::explain)?,
+            Pool::Mongo(_) => bail!("MongoDB commands run in run_mongo"),
         }
 
         let mut result = shown.expect("callers pass at least one statement");
@@ -667,6 +697,48 @@ impl Db {
         })
     }
 
+    /// Runs Mongo shell commands, one per statement. Read-only work is checked by the
+    /// guard (S2) before the connection is opened, and runs only as [`ReadOp`]s
+    /// (`mongo_shell::ReadOp`): typed reads, with no way to express a write.
+    async fn run_mongo(
+        &self,
+        conn: &Connection,
+        statements: &[&str],
+        opts: ExecOptions,
+    ) -> Result<ScriptResult> {
+        let total = statements.len();
+        let numbered = |index: usize, e: String| {
+            if total > 1 {
+                anyhow!("statement {} of {total}: {e}", index + 1)
+            } else {
+                anyhow!(e)
+            }
+        };
+        let commands = statements
+            .iter()
+            .enumerate()
+            .map(|(i, s)| mongo_shell::parse_command(s).map_err(|e| numbered(i, e.to_string())))
+            .collect::<Result<Vec<_>>>()?;
+        let reads = if opts.read_only || conn.readonly {
+            let reads = commands.iter().enumerate().map(|(i, command)| {
+                safety::check_mongo(command).map_err(|e| numbered(i, e))?;
+                command
+                    .as_read()
+                    .ok_or_else(|| numbered(i, "read-only: this command may write".into()))
+            });
+            Some(reads.collect::<Result<Vec<_>>>()?)
+        } else {
+            None
+        };
+        let Pool::Mongo(pool) = self.pool(conn).await? else {
+            bail!("\"{}\" is not a MongoDB connection", conn.name);
+        };
+        match reads {
+            Some(reads) => mongo::run_reads(&pool, reads, opts.max_rows).await,
+            None => mongo::run(&pool, commands, opts.max_rows).await,
+        }
+    }
+
     /// Column names across the connection's tables, for autocomplete.
     pub async fn list_column_names(&self, conn: &Connection) -> Result<Vec<String>> {
         let rows = match self.pool(conn).await? {
@@ -674,6 +746,8 @@ impl Db {
             Pool::My(p) => mysql::column_names(&p).await?,
             Pool::Sqlite(p) => sqlite::column_names(&p.main).await?,
             Pool::Redshift(p) => redshift::column_names(&p).await?,
+            // Fields are only known from samples, taken per collection.
+            Pool::Mongo(_) => Vec::new(),
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
@@ -684,6 +758,7 @@ impl Db {
             Pool::My(p) => mysql::tables(&p).await?,
             Pool::Sqlite(p) => sqlite::tables(&p.main).await?,
             Pool::Redshift(p) => redshift::tables(&p).await?,
+            Pool::Mongo(p) => return mongo::tables(&p).await,
         };
         Ok(rows
             .into_iter()
@@ -699,11 +774,13 @@ impl Db {
             Pool::My(p) => mysql::list_objects(&p).await,
             Pool::Sqlite(p) => sqlite::list_objects(&p.main).await,
             Pool::Redshift(p) => redshift::list_objects(&p).await,
+            Pool::Mongo(p) => mongo::list_objects(&p).await,
         })
     }
 
     /// Columns of `table`; `schema` defaults to `public` (PostgreSQL, Redshift) or the
-    /// connection's database (MariaDB/MySQL).
+    /// connection's database (MariaDB/MySQL, MongoDB). On MongoDB and DocumentDB, the
+    /// fields of a sample of the collection's documents.
     pub async fn describe_table(
         &self,
         conn: &Connection,
@@ -715,6 +792,8 @@ impl Db {
             Pool::My(p) => mysql::columns(&p, schema, &conn.database, table).await?,
             Pool::Sqlite(p) => sqlite::columns(&p.main, table).await?,
             Pool::Redshift(p) => redshift::columns(&p, schema, table).await?,
+            // An empty collection has no fields to show, and is still there.
+            Pool::Mongo(p) => return mongo::fields(&p, schema, table).await,
         };
         if rows.is_empty() {
             bail!("table \"{table}\" not found");
@@ -741,6 +820,7 @@ impl Db {
             Pool::My(p) => mysql::object_definition(&p, object).await?,
             Pool::Sqlite(p) => sqlite::object_definition(&p.main, object).await?,
             Pool::Redshift(p) => redshift::object_definition(&p, object).await?,
+            Pool::Mongo(p) => mongo::object_definition(&p, object).await?,
         };
         let what = format!(
             "{} {}.{}",
@@ -764,6 +844,7 @@ impl Db {
             Pool::My(p) => mysql::call_template(&p, object).await,
             Pool::Sqlite(_) => bail!("SQLite has no functions or procedures"),
             Pool::Redshift(p) => redshift::call_template(&p, object).await,
+            Pool::Mongo(_) => bail!("MongoDB has no functions or procedures to call"),
         }
     }
 
@@ -891,6 +972,7 @@ macro_rules! run {
                     elapsed_ms: 0,
                     note: None,
                     documents: None,
+                    server_read_only: None,
                 });
             }
             // One statement; its results and the end of each result set.
@@ -942,6 +1024,7 @@ macro_rules! run {
                 elapsed_ms: 0,
                 note: None,
                 documents: None,
+                server_read_only: None,
             })
         }
         .await
@@ -962,6 +1045,7 @@ pub(super) mod tests {
             elapsed_ms: 3,
             note: Some(ROLLED_BACK_NOTE),
             documents: None,
+            server_read_only: None,
         }
     }
 
@@ -1016,6 +1100,9 @@ pub(super) mod tests {
             Adapter::Mariadb | Adapter::Mysql => &mysql::DIALECT,
             Adapter::Sqlite => &sqlite::DIALECT,
             Adapter::Redshift => &redshift::DIALECT,
+            Adapter::Mongodb | Adapter::Documentdb => {
+                unreachable!("no SQL, so no SQL dialect: the guard is safety::check_mongo")
+            }
         }
     }
 
@@ -1058,7 +1145,10 @@ pub(super) mod tests {
         assert_eq!(kinds(Adapter::Sqlite), [Trigger, Index]);
         // No sequences, types, extensions or triggers on Redshift.
         assert_eq!(kinds(Adapter::Redshift), [Function, Procedure]);
-        for adapter in Adapter::ALL {
+        let sql = Adapter::ALL
+            .into_iter()
+            .filter(|a| a.family() == Family::Sql);
+        for adapter in sql {
             // Views are listed with the tables.
             assert!(!kinds(adapter).contains(&View));
         }

@@ -1791,6 +1791,7 @@ mod tests {
             ssh: None,
             auth: Auth::Password,
             source: None,
+            mongo: None,
         }
     }
 

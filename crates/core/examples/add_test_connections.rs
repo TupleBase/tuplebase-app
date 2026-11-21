@@ -1,5 +1,6 @@
 //! Adds the docker-compose databases to your saved connections, in their own folder.
-//! They need no passwords, so nothing is written to the OS credential store.
+//! They need no passwords, so nothing is written to the OS credential store. MongoDB's
+//! (`dev`) comes from `TUPLEBASE_SECRET_TEST_MONGODB_PASSWORD`, which `make dev` sets.
 //! Safe to run again: anything already there is left alone.
 //!
 //! With `AWS_ENDPOINT_URL` set, as `make dev` does, it also stores a secret in that
@@ -8,7 +9,9 @@
 
 use serde_json::json;
 use tuplebase_core::cloud::aws;
-use tuplebase_core::config::{self, Adapter, Auth, AwsSecretRef, Config, Connection, TlsMode};
+use tuplebase_core::config::{
+    self, Adapter, Auth, AwsSecretRef, Config, Connection, MongoSettings, TlsMode,
+};
 
 const FOLDER: &str = "Local test databases";
 const AWS_REGION: &str = "eu-west-1";
@@ -29,6 +32,7 @@ fn connection(name: &str, adapter: Adapter, port: u16, user: &str) -> Connection
         ssh: None,
         auth: Default::default(),
         source: None,
+        mongo: None,
     }
 }
 
@@ -75,6 +79,13 @@ async fn main() -> anyhow::Result<()> {
     let mut connections = vec![
         connection("test-postgres", Adapter::Postgres, 55432, "dev"),
         connection("test-mariadb", Adapter::Mariadb, 53306, "test"),
+        Connection {
+            mongo: Some(MongoSettings {
+                srv: false,
+                options: "authSource=admin".into(),
+            }),
+            ..connection("test-mongodb", Adapter::Mongodb, 57017, "dev")
+        },
     ];
     if std::env::var("AWS_ENDPOINT_URL").is_ok() {
         put_secret().await?;

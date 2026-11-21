@@ -1,6 +1,10 @@
 //! SSH tunnels against the `sshd` service in `docker-compose.yml`.
 //! Skipped unless `TUPLEBASE_IT=1` (see docs/DEVELOPMENT.md).
 
+// Db::run dispatches to each family's runner, one more level of nested futures than
+// the compiler's default query depth allows here.
+#![recursion_limit = "256"]
+
 use std::process::Command;
 use std::sync::Once;
 
@@ -63,6 +67,7 @@ async fn tunneled(name: &str, adapter: Adapter, db_host: &str, port: u16) -> Con
         }),
         auth: Default::default(),
         source: None,
+        mongo: None,
     }
 }
 

@@ -42,6 +42,10 @@ aws-types = "1.7.0"
 toml_edit = "0.25.19"
 aws-sdk-redshift = { version = "1.131.0", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-redshiftserverless = { version = "1.132.0", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# MongoDB and Amazon DocumentDB. Default features off: they pull bson 2. `rustls-tls` is
+# rustls with ring and `dns-resolver` is hickory (for mongodb+srv), both pure Rust (D2).
+# Not `aws-auth`: it pulls aws-lc, a C library.
+mongodb = { version = "3.10", default-features = false, features = ["rustls-tls", "dns-resolver", "bson-3", "compat-3-3-0"] }
 
 # Windows only: a job object ends the chat agent with the app, even when the app
 # crashes. Pure Rust bindings, already in the tree through other crates.

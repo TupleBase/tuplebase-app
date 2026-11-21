@@ -1726,6 +1726,7 @@ pub(crate) mod tests {
             ssh: None,
             auth: Default::default(),
             source: None,
+            mongo: None,
         };
         config.upsert(conn, None).unwrap();
         config

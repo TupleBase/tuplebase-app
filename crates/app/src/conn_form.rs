@@ -12,7 +12,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::cloud::Discovered;
 use tuplebase_core::config::{
-    self, Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Source, SshConfig, TlsMode,
+    self, Adapter, Auth, AuthKind, AwsIamAuth, AwsSecretRef, Connection, Family, MongoSettings,
+    Source, SshConfig, TlsMode,
 };
 use tuplebase_core::ssh;
 use tuplebase_core::state::CloudSearch;
@@ -88,6 +89,10 @@ pub struct ConnForm {
     aws_region: Entity<InputState>,
     aws_name: Entity<InputState>,
     use_secret_host: bool,
+    /// MongoDB and DocumentDB: find the servers through DNS (`mongodb+srv://`).
+    mongo_srv: bool,
+    /// MongoDB and DocumentDB: connection string options, never a password.
+    mongo_options: Entity<InputState>,
     readonly: bool,
     pub(crate) color: String,
     tls: TlsMode,
@@ -147,6 +152,8 @@ impl ConnForm {
             secret.map(|s| s.name.clone()).unwrap_or_default(),
         );
         let use_secret_host = secret.is_some_and(|s| s.use_secret_host);
+        let mongo = existing.and_then(|c| c.mongo.clone()).unwrap_or_default();
+        let mongo_options = input("authSource=admin&replicaSet=rs0", mongo.options);
         let ssh = existing.and_then(|c| c.ssh.as_ref());
         let ssh_field = |f: fn(&SshConfig) -> String| ssh.map(f).unwrap_or_default();
         let ssh_host = input("bastion.example.com", ssh_field(|s| s.host.clone()));
@@ -203,6 +210,8 @@ impl ConnForm {
             aws_region,
             aws_name,
             use_secret_host,
+            mongo_srv: mongo.srv,
+            mongo_options,
             readonly: existing.is_some_and(|c| c.readonly),
             color: existing.map(|c| c.color.clone()).unwrap_or_default(),
             tls: existing.map_or(TlsMode::default(), |c| c.tls),
@@ -310,6 +319,9 @@ impl ConnForm {
             secret.map(|s| s.name.clone()).unwrap_or_default(),
         );
         self.use_secret_host = secret.is_some_and(|s| s.use_secret_host);
+        let mongo = conn.mongo.clone().unwrap_or_default();
+        set(&self.mongo_options, mongo.options);
+        self.mongo_srv = mongo.srv;
         self.set_adapter(conn.adapter, window, cx);
         self.chosen = true;
         self.auth_kind = conn.auth.kind();
@@ -427,11 +439,23 @@ impl ConnForm {
                 source: self.source.clone().filter(|_| {
                     !self.host_from_secret() && text(&self.host, cx) == self.source_host
                 }),
+                mongo: self.mongo_settings(cx),
             },
             password: (!password.is_empty()).then_some(password),
             ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),
             previous: self.previous.clone(),
         });
+    }
+
+    /// What a MongoDB or DocumentDB connection saves besides the common fields; `None`
+    /// for other engines, or when nothing is set.
+    fn mongo_settings(&self, cx: &App) -> Option<MongoSettings> {
+        let settings = MongoSettings {
+            srv: self.mongo_srv,
+            options: self.mongo_options.read(cx).value().trim().to_string(),
+        };
+        (self.adapter.family() == Family::Document && settings != MongoSettings::default())
+            .then_some(settings)
     }
 
     /// The SSH port, defaulting to 22; `None` if it isn't a number.
@@ -482,6 +506,11 @@ impl ConnForm {
 
     /// The engine, and the user its servers usually have as the User field's example.
     fn set_adapter(&mut self, adapter: Adapter, window: &mut Window, cx: &mut Context<Self>) {
+        // DocumentDB accepts only encrypted connections unless its cluster was changed.
+        if adapter == Adapter::Documentdb && self.adapter != adapter && self.tls == TlsMode::Prefer
+        {
+            self.tls = TlsMode::Verify;
+        }
         self.adapter = adapter;
         self.user.update(cx, |input, cx| {
             input.set_placeholder(adapter.user_hint(), window, cx);
@@ -500,6 +529,7 @@ impl ConnForm {
             .id(SharedString::from(format!("adapter-{}", adapter.label())))
             .test_support()
             .flex_1()
+            .min_w_0()
             .gap_2()
             .p_2()
             .rounded(theme.radius)
@@ -507,7 +537,7 @@ impl ConnForm {
             .border_color(border)
             .cursor_pointer()
             .child(logos::icon(adapter, 18.))
-            .child(div().text_sm().child(adapter.label()))
+            .child(div().min_w_0().truncate().text_sm().child(adapter.label()))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.set_adapter(adapter, window, cx);
                 // The first choice reveals the rest of the form, so move on to it.
@@ -725,8 +755,11 @@ impl ConnForm {
             .when(self.chosen, |el| el.child(self.render_name(cx)))
     }
 
-    fn render_server(&self, cx: &App) -> Div {
+    fn render_server(&self, cx: &mut Context<Self>) -> Div {
         let from_secret = self.host_from_secret();
+        let document = self.adapter.family() == Family::Document;
+        // An SRV address has no port: DNS gives each server's.
+        let port_shown = !(document && self.mongo_srv);
         v_flex()
             .gap_3()
             .when(from_secret, |el| {
@@ -737,11 +770,13 @@ impl ConnForm {
                     .gap_3()
                     .when(!from_secret, |el| {
                         el.child(field("Host", Input::new(&self.host).id("conn-host"), cx))
-                            .child(div().w(px(90.)).child(field(
-                                "Port",
-                                Input::new(&self.port).id("conn-port"),
-                                cx,
-                            )))
+                            .when(port_shown, |el| {
+                                el.child(div().w(px(90.)).child(field(
+                                    "Port",
+                                    Input::new(&self.port).id("conn-port"),
+                                    cx,
+                                )))
+                            })
                     })
                     .child(field(
                         "Database",
@@ -749,6 +784,30 @@ impl ConnForm {
                         cx,
                     )),
             )
+            .when(document, |el| {
+                el.child(
+                    Checkbox::new("conn-mongo-srv")
+                        .cursor_pointer()
+                        .label("SRV address (mongodb+srv): DNS names the servers")
+                        .checked(self.mongo_srv)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.mongo_srv = *checked;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    field(
+                        "Options",
+                        Input::new(&self.mongo_options).id("conn-mongo-options"),
+                        cx,
+                    )
+                    .child(hint(
+                        "Connection string options, such as authSource or replicaSet. \
+                         The password goes in its own field, never here.",
+                        cx,
+                    )),
+                )
+            })
     }
 
     fn render_credentials(&self, cx: &mut Context<Self>) -> Div {
@@ -1178,7 +1237,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use tuplebase_core::cloud::Discovery;
-    use tuplebase_core::config::{Adapter, Auth, Connection};
+    use tuplebase_core::config::{Adapter, Auth, Connection, MongoSettings};
     use tuplebase_core::state::CloudSearch;
 
     /// A new connection's form in a window of a laptop's size.
@@ -1429,6 +1488,43 @@ mod tests {
         act(handle, cx, |window, _| {
             assert!(window.try_find("conn-user").is_none());
         });
+    }
+
+    #[gpui_kit::test]
+    fn a_mongodb_connection_has_srv_and_options(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        let saved = saved(&form, cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        act(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-mongo-options").is_none());
+            window.click("adapter-MongoDB", cx)
+        });
+        act(handle, cx, |window, cx| {
+            assert_eq!(window.find("conn-user").placeholder(), Some("admin"));
+            window.click("conn-name", cx);
+            window.input("docs", cx);
+            window.click("conn-host", cx);
+            window.input("cluster0.example.net", cx);
+            window.click("conn-mongo-options", cx);
+            window.input("authSource=admin", cx);
+            window.click("conn-mongo-srv", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-port").is_none(), "SRV has no port");
+            window.click("save", cx);
+        });
+        let saved = saved.borrow();
+        let connection = saved.first().expect("saved");
+        assert_eq!(connection.adapter, Adapter::Mongodb);
+        assert_eq!(
+            connection.mongo,
+            Some(MongoSettings {
+                srv: true,
+                options: "authSource=admin".into()
+            })
+        );
+        let mut config = tuplebase_core::config::Config::default();
+        config.upsert(connection.clone(), None).unwrap();
     }
 
     #[gpui_kit::test]

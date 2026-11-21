@@ -12,6 +12,9 @@ export AWS_SECRET_ACCESS_KEY := test
 unexport AWS_PROFILE AWS_SESSION_TOKEN
 endif
 
+# The local MongoDB's password, for the test-mongodb connection; the others need none.
+export TUPLEBASE_SECRET_TEST_MONGODB_PASSWORD := dev
+
 .PHONY: dev up down
 
 # Starts the local databases, adds them to the dev config and runs the app.

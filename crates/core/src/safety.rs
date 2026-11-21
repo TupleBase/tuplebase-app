@@ -12,10 +12,17 @@
 //! differently can be fooled: what it takes for a comment or a string the database may
 //! run. So everything here reads SQL through one scanner, [`token`], that follows the
 //! engine's rules ([`ScriptFlavor`]).
+//!
+//! MongoDB and DocumentDB have no SQL and no read-only transaction. Their guard,
+//! [`check_mongo`], reads the command the shell parser built (`mongo_shell`) and allows
+//! only reads on a fixed list; `db` then runs it as one typed read call.
 
 use std::ops::Range;
 
+use mongodb::bson::{Bson, Document};
+
 use crate::config::{Adapter, ScriptFlavor};
+use crate::mongo_shell::{self, Command, Op};
 
 const READ_KEYWORDS: [&str; 8] = [
     "select", "with", "show", "explain", "values", "table", "describe", "desc",
@@ -210,8 +217,18 @@ impl Piece {
     }
 }
 
-/// The statements of a script, read by [`token`]; see [`split_statements`].
+/// The statements of a script, read by [`token`]; see [`split_statements`]. Mongo shell
+/// scripts are cut by the shell parser's own scanner.
 fn pieces(adapter: Adapter, sql: &str) -> Vec<Piece> {
+    if adapter.info().script == ScriptFlavor::MongoShell {
+        return mongo_shell::split(sql)
+            .into_iter()
+            .map(|piece| Piece {
+                text: piece.text,
+                end: piece.end,
+            })
+            .collect();
+    }
     let mysql = adapter.info().script == ScriptFlavor::Mysql;
     let mut statements = Vec::new();
     let (mut start, mut i, mut has_content) = (0, 0, false);
@@ -378,6 +395,8 @@ fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
         Adapter::Sqlite => &["pragma"],
         // A procedure's INOUT and OUT values come back as a row; FETCH reads a cursor.
         Adapter::Redshift => &["call", "fetch"],
+        // No SQL: `db` never asks.
+        Adapter::Mongodb | Adapter::Documentdb => &[],
     }
 }
 
@@ -454,6 +473,176 @@ pub fn check_read_only(adapter: Adapter, sql: &str) -> Result<(), String> {
         return Err("read-only: SELECT ... INTO OUTFILE/DUMPFILE is not allowed".into());
     }
     Ok(())
+}
+
+/// The aggregation stages a read-only pipeline may use. None of them writes: `$out` and
+/// `$merge` do, and are refused for not being here. An allowlist, so a stage added to
+/// the server later is refused until it is added here.
+const MONGO_READ_STAGES: [&str; 27] = [
+    "$match",
+    "$project",
+    "$addFields",
+    "$set",
+    "$unset",
+    "$group",
+    "$sort",
+    "$limit",
+    "$skip",
+    "$unwind",
+    "$count",
+    "$lookup",
+    "$graphLookup",
+    "$facet",
+    "$unionWith",
+    "$bucket",
+    "$bucketAuto",
+    "$sortByCount",
+    "$replaceRoot",
+    "$replaceWith",
+    "$sample",
+    "$geoNear",
+    "$densify",
+    "$fill",
+    "$setWindowFields",
+    "$redact",
+    "$documents",
+];
+
+/// Operators that run JavaScript on the server, refused anywhere in a read-only command.
+const MONGO_JAVASCRIPT: [&str; 3] = ["$where", "$function", "$accumulator"];
+
+/// Rejects any Mongo shell command that is not a plain read: only `find`, `findOne`,
+/// `aggregate` with stages from [`MONGO_READ_STAGES`] (sub-pipelines of `$lookup`,
+/// `$facet` and `$unionWith` included), `countDocuments`, `estimatedDocumentCount`,
+/// `distinct`, `getIndexes`, listing databases and collections, and `.explain()` of a
+/// find or an aggregate. `db.runCommand` is refused, whatever the command. JavaScript
+/// is refused anywhere. The keys checked are those of the documents sent, after the
+/// parser decoded any escapes in them.
+pub fn check_mongo(command: &Command) -> Result<(), String> {
+    match command {
+        Command::ShowDatabases | Command::ShowCollections { .. } => Ok(()),
+        Command::RunCommand { .. } => Err("read-only: db.runCommand is not allowed; use find, \
+             aggregate, countDocuments or distinct"
+            .into()),
+        Command::Collection { op, .. } => check_mongo_op(op),
+    }
+}
+
+fn check_mongo_op(op: &Op) -> Result<(), String> {
+    match op {
+        Op::Find {
+            filter,
+            projection,
+            sort,
+            ..
+        } => {
+            check_mongo_values(filter)?;
+            projection.iter().try_for_each(check_mongo_values)?;
+            sort.iter().try_for_each(check_mongo_values)
+        }
+        Op::FindOne { filter, projection } => {
+            check_mongo_values(filter)?;
+            projection.iter().try_for_each(check_mongo_values)
+        }
+        Op::Aggregate { pipeline, .. } => check_mongo_pipeline(pipeline),
+        Op::CountDocuments { filter } | Op::Distinct { filter, .. } => check_mongo_values(filter),
+        Op::EstimatedDocumentCount | Op::GetIndexes => Ok(()),
+        Op::Explain(inner) => match **inner {
+            Op::Find { .. } | Op::Aggregate { .. } => check_mongo_op(inner),
+            _ => Err("read-only: only a find or an aggregate can be explained".into()),
+        },
+        Op::InsertOne { .. }
+        | Op::InsertMany { .. }
+        | Op::Update { .. }
+        | Op::ReplaceOne { .. }
+        | Op::Delete { .. }
+        | Op::CreateIndex { .. }
+        | Op::DropIndex { .. }
+        | Op::Drop => Err("read-only: only find, findOne, aggregate, countDocuments, \
+             estimatedDocumentCount, distinct and getIndexes are allowed"
+            .into()),
+    }
+}
+
+fn check_mongo_pipeline(stages: &[Document]) -> Result<(), String> {
+    for stage in stages {
+        let mut keys = stage.iter();
+        let (Some((name, body)), None) = (keys.next(), keys.next()) else {
+            return Err("read-only: each pipeline stage must have exactly one key".into());
+        };
+        if !MONGO_READ_STAGES.contains(&name.as_str()) {
+            return Err(format!(
+                "read-only: the pipeline stage \"{name}\" is not allowed"
+            ));
+        }
+        match (name.as_str(), body) {
+            ("$lookup", Bson::Document(lookup)) => {
+                if let Some(pipeline) = lookup.get("pipeline") {
+                    check_mongo_sub_pipeline(pipeline)?;
+                }
+            }
+            ("$facet", Bson::Document(facets)) => {
+                for (_, pipeline) in facets {
+                    check_mongo_sub_pipeline(pipeline)?;
+                }
+            }
+            ("$facet", _) => return Err("read-only: $facet takes a document".into()),
+            ("$unionWith", Bson::Document(union)) => {
+                if let Some(pipeline) = union.get("pipeline") {
+                    check_mongo_sub_pipeline(pipeline)?;
+                }
+            }
+            ("$unionWith", Bson::String(_)) => {}
+            ("$unionWith", _) => {
+                return Err("read-only: $unionWith takes a collection name or a document".into());
+            }
+            _ => {}
+        }
+        check_mongo_value(body)?;
+    }
+    Ok(())
+}
+
+/// A pipeline inside a stage: an array of stage documents, checked like the outer one.
+fn check_mongo_sub_pipeline(value: &Bson) -> Result<(), String> {
+    let Bson::Array(items) = value else {
+        return Err("read-only: a sub-pipeline must be an array of stages".into());
+    };
+    let stages = items
+        .iter()
+        .map(|item| match item {
+            Bson::Document(stage) => Ok(stage.clone()),
+            _ => Err("read-only: each pipeline stage must be a document".to_owned()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    check_mongo_pipeline(&stages)
+}
+
+fn check_mongo_values(doc: &Document) -> Result<(), String> {
+    doc.iter().try_for_each(|(key, value)| {
+        check_mongo_key(key)?;
+        check_mongo_value(value)
+    })
+}
+
+fn check_mongo_key(key: &str) -> Result<(), String> {
+    if MONGO_JAVASCRIPT.contains(&key) {
+        return Err(format!(
+            "read-only: \"{key}\" runs JavaScript on the server and is not allowed"
+        ));
+    }
+    Ok(())
+}
+
+fn check_mongo_value(value: &Bson) -> Result<(), String> {
+    match value {
+        Bson::Document(doc) => check_mongo_values(doc),
+        Bson::Array(items) => items.iter().try_for_each(check_mongo_value),
+        Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => {
+            Err("read-only: JavaScript code is not allowed".into())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Whether MySQL or MariaDB might run part of a comment. Looked for in the raw text as
@@ -1092,6 +1281,165 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn mongo(src: &str) -> Result<(), String> {
+        let command = mongo_shell::parse_command(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        check_mongo(&command)
+    }
+
+    #[test]
+    fn mongo_read_only_allows_reads() {
+        for src in [
+            "show dbs",
+            "show collections",
+            "db.getCollectionNames()",
+            "db.users.find({active: true}, {name: 1}).sort({name: 1}).limit(5).skip(1)",
+            "db.users.findOne({_id: 1})",
+            "db.users.countDocuments({})",
+            "db.users.estimatedDocumentCount()",
+            "db.users.distinct('name', {active: true})",
+            "db.users.getIndexes()",
+            "db.users.find({}).explain()",
+            "db.users.aggregate([{$match: {a: 1}}, {$group: {_id: '$a', n: {$sum: 1}}}]).explain()",
+            "db.getSiblingDB('shop').orders.aggregate([\
+                {$lookup: {from: 'users', localField: 'u', foreignField: '_id', as: 'u'}},\
+                {$lookup: {from: 'items', pipeline: [{$match: {}}, {$project: {a: 1}}], as: 'i'}},\
+                {$facet: {a: [{$count: 'n'}], b: [{$sortByCount: '$x'}]}},\
+                {$unionWith: {coll: 'archive', pipeline: [{$limit: 1}]}},\
+                {$unionWith: 'more'}, {$set: {out: '$merge'}}, {$unset: 'x'}])",
+            // Field names and values that only look like what is refused.
+            "db.users.find({where: 1, out: '$out', merge: '$merge', function: 1})",
+        ] {
+            assert_eq!(mongo(src), Ok(()), "{src}");
+        }
+    }
+
+    #[test]
+    fn mongo_read_only_refuses_writes_and_commands() {
+        for src in [
+            "db.users.insertOne({a: 1})",
+            "db.users.insertMany([{a: 1}])",
+            "db.users.updateOne({}, {$set: {a: 1}})",
+            "db.users.updateMany({}, [{$set: {a: 1}}])",
+            "db.users.replaceOne({}, {a: 1})",
+            "db.users.deleteOne({})",
+            "db.users.deleteMany({})",
+            "db.users.createIndex({a: 1})",
+            "db.users.dropIndex('a_1')",
+            "db.users.drop()",
+            // Raw commands are refused whatever they are, reads included.
+            "db.runCommand({ping: 1})",
+            "db.runCommand({find: 'users'})",
+            "db.runCommand({insert: 'users', documents: [{}]})",
+            "db.adminCommand({listDatabases: 1})",
+        ] {
+            assert!(mongo(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn mongo_read_only_refuses_writing_stages_wherever_they_hide() {
+        for src in [
+            "db.users.aggregate([{$out: 'copy'}])",
+            "db.users.aggregate([{$match: {}}, {$merge: {into: 'copy'}}])",
+            "db.users.aggregate([{$facet: {a: [{$match: {}}], b: [{$out: 'copy'}]}}])",
+            "db.users.aggregate([{$facet: {a: [{$facet: {b: [{$merge: 'copy'}]}}]}}])",
+            "db.users.aggregate([{$lookup: {from: 'o', pipeline: [{$out: 'copy'}], as: 'o'}}])",
+            "db.users.aggregate([{$unionWith: {coll: 'o', pipeline: [{$merge: 'copy'}]}}])",
+            "db.users.aggregate([{$lookup: {from: 'o', as: 'o', pipeline: \
+                [{$unionWith: {coll: 'p', pipeline: [{$facet: {x: [{$out: 'c'}]}}]}}]}}])",
+            "db.users.aggregate([{$out: 'copy'}]).explain()",
+            // A stage with a second key, which may be what the server runs.
+            "db.users.aggregate([{$match: {}, $out: 'copy'}])",
+            "db.users.aggregate([{$out: 'copy', $match: {}}])",
+            "db.users.aggregate([{}])",
+            "db.users.aggregate([{$facet: {a: [{$match: {}, $merge: 'c'}]}}])",
+            // Stages off the list, and malformed sub-pipelines.
+            "db.users.aggregate([{$changeStream: {}}])",
+            "db.users.aggregate([{$currentOp: {}}])",
+            "db.users.aggregate([{$listSessions: {}}])",
+            "db.users.aggregate([{$facet: 'x'}])",
+            "db.users.aggregate([{$facet: {a: {$out: 'c'}}}])",
+            "db.users.aggregate([{$lookup: {from: 'o', pipeline: {$out: 'c'}, as: 'o'}}])",
+            "db.users.aggregate([{$unionWith: 1}])",
+            "db.users.aggregate([{match: {}}])",
+        ] {
+            assert!(mongo(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn mongo_read_only_refuses_javascript_anywhere() {
+        for src in [
+            "db.users.find({$where: 'this.a == 1'})",
+            "db.users.find({a: {$elemMatch: {$where: '1'}}})",
+            "db.users.find({}, {x: {$function: {body: 'f', args: [], lang: 'js'}}})",
+            "db.users.find().sort({x: {$where: 1}})",
+            "db.users.findOne({$where: '1'})",
+            "db.users.countDocuments({$or: [{$where: '1'}]})",
+            "db.users.distinct('a', {$where: '1'})",
+            "db.users.aggregate([{$match: {$expr: {$function: {body: 'f', args: [], lang: 'js'}}}}])",
+            "db.users.aggregate([{$group: {_id: 1, x: {$accumulator: {}}}}])",
+            "db.users.aggregate([{$facet: {a: [{$match: {$where: '1'}}]}}])",
+        ] {
+            assert!(mongo(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn mongo_read_only_reads_keys_after_their_escapes() {
+        for src in [
+            r#"db.users.aggregate([{"\u0024out": "copy"}])"#,
+            r#"db.users.aggregate([{'\x24merge': 'copy'}])"#,
+            r#"db.users.aggregate([{"\u{24}out": "copy"}])"#,
+            r#"db.users.find({"\u0024where": "1"})"#,
+            r#"db.users.aggregate([{"$\u006fut": "copy"}])"#,
+        ] {
+            assert!(mongo(src).is_err(), "{src}");
+        }
+        // A key that differs, such as one with a space, is a field, not the stage, and
+        // the server refuses an unknown stage.
+        assert!(mongo(r#"db.users.aggregate([{" $out": "copy"}])"#).is_err());
+    }
+
+    #[test]
+    fn mongo_scripts_split_where_the_shell_does() {
+        let adapter = Adapter::Mongodb;
+        assert_eq!(
+            split(
+                adapter,
+                "db.a.find()\ndb.b\n  .find({x: ';'})\n  .limit(1); show dbs"
+            ),
+            [
+                "db.a.find()",
+                "db.b\n  .find({x: ';'})\n  .limit(1)",
+                "show dbs"
+            ]
+        );
+        // A comment, string or regex can't hide a second statement from the guard: the
+        // pieces are what the parser reads, and each must be exactly one command.
+        for script in [
+            "db.a.find({x: '\\'; db.a.drop()'})",
+            "db.a.find({x: /;db.a.drop()/})",
+            "db.a.find({x: 1 /* */ }) // ; db.a.drop()",
+            "db.a.find({x: \"*/; db.a.drop(); /*\"})",
+        ] {
+            let pieces = split_statements(adapter, script);
+            assert_eq!(pieces.len(), 1, "{script}: {pieces:?}");
+            assert_eq!(mongo(pieces[0]), Ok(()), "{script}");
+        }
+        // Here the write is code, and so a statement of its own, which the guard refuses.
+        let script = "db.a.find({x: 1}) /* x */ db.a.drop()";
+        assert!(mongo_shell::parse_command(script).is_err());
+        let script = "db.a.find({x: 1})\n// note\ndb.a.drop()";
+        let pieces = split_statements(adapter, script);
+        assert_eq!(pieces, ["db.a.find({x: 1})", "// note\ndb.a.drop()"]);
+        assert!(mongo(pieces[1]).is_err());
+        let text = "db.a.find()\n\ndb.b.find()";
+        let second = statement_at(adapter, text, text.len()).unwrap();
+        assert_eq!(&text[second], "db.b.find()");
+        assert_eq!(statement_at(adapter, text, 12), None);
     }
 
     #[test]
