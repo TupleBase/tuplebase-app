@@ -508,6 +508,11 @@ const MONGO_READ_STAGES: [&str; 27] = [
     "$documents",
 ];
 
+/// The aggregation stages a read-only pipeline may use, for the editor's completions.
+pub fn mongo_read_stages() -> &'static [&'static str] {
+    &MONGO_READ_STAGES
+}
+
 /// Operators that run JavaScript on the server, refused anywhere in a read-only command,
 /// as is any key starting with `$_` (the server's internal operators). A view's own
 /// stored pipeline is not checked: it runs as the server stores it.

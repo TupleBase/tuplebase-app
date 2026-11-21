@@ -21,7 +21,7 @@ use tuplebase_core::config::{Connection, Family};
 use tuplebase_core::db::{Db, ExecOptions, ROLLED_BACK_NOTE, ScriptResult};
 use tuplebase_core::safety;
 
-use crate::completions::{self, SchemaNames, SqlCompletions};
+use crate::completions::{self, MongoCompletions, MongoScope, SchemaNames, SqlCompletions};
 use crate::results::ResultsDelegate;
 use crate::row_detail::{RowDetail, RowDetailEvent};
 use crate::run_button::{RunButton, RunStatement};
@@ -39,6 +39,15 @@ const NO_STATEMENT: &str = "No statement at the cursor. Select some SQL, or run 
 #[cfg(not(target_os = "macos"))]
 const NO_STATEMENT: &str =
     "No statement at the cursor. Select some SQL, or run all with Ctrl+Shift+Enter";
+#[cfg(target_os = "macos")]
+const NO_COMMAND: &str = "No command at the cursor. Select one, or run all with ⌘⇧↵";
+#[cfg(not(target_os = "macos"))]
+const NO_COMMAND: &str = "No command at the cursor. Select one, or run all with Ctrl+Shift+Enter";
+
+/// Why a read-only document connection says only TupleBase guards it.
+const SERVER_GUARD_HINT: &str = "TupleBase lets only reads through. The server didn't show \
+     that it refuses this user's writes: sign in as a read-only user, such as one with only \
+     the read role, for the server to refuse them too.";
 
 const EDIT_ICON: &[u8] = include_bytes!("../../../assets/icons/square-pen.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
@@ -143,7 +152,8 @@ impl ConnectionTab {
             let mut state = EditorState::new(window, cx)
                 .line_number(true)
                 .default_value(draft);
-            Self::configure_editor(&mut state, conn.adapter.family(), &names, cx);
+            Self::set_language(&mut state, conn.adapter.family(), cx);
+            Self::configure_completions(&mut state, &conn, &names);
             state
         });
         let run_button = cx.new(|cx| {
@@ -171,9 +181,15 @@ impl ConnectionTab {
                 &results,
                 window,
                 |this, results, event: &TableEvent, window, cx| {
-                    if let TableEvent::SelectRow(row_ix) = event
-                        && let Some(row) = results.read(cx).delegate().row(*row_ix)
-                    {
+                    let TableEvent::SelectRow(row_ix) = event else {
+                        return;
+                    };
+                    let delegate = results.read(cx).delegate();
+                    if let Some(document) = delegate.document(*row_ix).cloned() {
+                        this.row_detail
+                            .update(cx, |detail, cx| detail.show_document(&document, window, cx));
+                        cx.notify();
+                    } else if let Some(row) = delegate.row(*row_ix) {
                         this.row_detail
                             .update(cx, |detail, cx| detail.show(row, window, cx));
                         cx.notify();
@@ -208,30 +224,32 @@ impl ConnectionTab {
         }
     }
 
-    /// Sets the editor's language and completions for an engine of `family`.
-    fn configure_editor(
-        editor: &mut EditorState,
-        family: Family,
-        names: &SchemaNames,
-        cx: &mut Context<EditorState>,
-    ) {
-        match family {
-            Family::Sql => {
-                editor.set_highlighter("sql", cx);
-                editor.lsp_mut().completion_provider =
-                    Some(Rc::new(SqlCompletions::new(names.clone())));
-            }
-            // Mongo shell commands read as JavaScript. Completions come later.
-            Family::Document => {
-                editor.set_highlighter("javascript", cx);
-                editor.lsp_mut().completion_provider = None;
-            }
-            // No engine of this family yet: plain text, with no completions.
-            Family::KeyValue => {
-                editor.set_highlighter("text", cx);
-                editor.lsp_mut().completion_provider = None;
-            }
-        }
+    /// Sets the editor's language for an engine of `family`.
+    fn set_language(editor: &mut EditorState, family: Family, cx: &mut Context<EditorState>) {
+        let language = match family {
+            Family::Sql => "sql",
+            // Mongo shell commands read as JavaScript.
+            Family::Document => "javascript",
+            // No engine of this family yet: plain text.
+            Family::KeyValue => "text",
+        };
+        editor.set_highlighter(language, cx);
+    }
+
+    /// Sets the editor's completions for `conn`: SQL keywords and names, or for a
+    /// document engine its collections, methods and operators, narrowed to what the
+    /// read-only guard allows on a read-only connection.
+    fn configure_completions(editor: &mut EditorState, conn: &Connection, names: &SchemaNames) {
+        let provider: Option<Rc<dyn gpui_kit::component::input::CompletionProvider>> =
+            match conn.adapter.family() {
+                Family::Sql => Some(Rc::new(SqlCompletions::new(names.clone()))),
+                Family::Document => Some(Rc::new(MongoCompletions::new(
+                    names.clone(),
+                    mongo_scope(conn),
+                ))),
+                Family::KeyValue => None,
+            };
+        editor.lsp_mut().completion_provider = provider;
     }
 
     fn on_schema_event(
@@ -249,6 +267,16 @@ impl ConnectionTab {
                     .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
                 self.remember_draft(cx);
                 self.run_sql(sql.clone(), cx);
+            }
+            // To read beside the results; the editor keeps what was typed.
+            SchemaEvent::Show { title, text } => {
+                let (title, text) = (title.clone(), text.clone());
+                self.results
+                    .update(cx, |table, cx| table.clear_selection(cx));
+                self.row_detail.update(cx, |detail, cx| {
+                    detail.show_definition(title, text, window, cx)
+                });
+                cx.notify();
             }
             // Not run: the user reads it, fills it in, and presses Run.
             SchemaEvent::Insert(sql) => {
@@ -288,9 +316,16 @@ impl ConnectionTab {
         // An edit can change the engine's family, and with it the editor's language.
         let family = adapter.family();
         if family != self.conn.adapter.family() {
+            self.editor
+                .update(cx, |editor, cx| Self::set_language(editor, family, cx));
+        }
+        // Read-only and the default database narrow what a document engine offers.
+        if family != self.conn.adapter.family()
+            || (family == Family::Document && mongo_scope(&conn) != mongo_scope(&self.conn))
+        {
             let names = self.names.clone();
-            self.editor.update(cx, |editor, cx| {
-                Self::configure_editor(editor, family, &names, cx)
+            self.editor.update(cx, |editor, _| {
+                Self::configure_completions(editor, &conn, &names)
             });
         }
         if !same_server(&self.conn, &conn) {
@@ -397,7 +432,11 @@ impl ConnectionTab {
         match sql {
             Some(sql) => self.run_sql(sql, cx),
             None if self.can_run() => {
-                self.status = Status::Done(NO_STATEMENT.into());
+                let text = match self.conn.adapter.family() {
+                    Family::Document => NO_COMMAND,
+                    Family::Sql | Family::KeyValue => NO_STATEMENT,
+                };
+                self.status = Status::Done(text.into());
                 cx.notify();
             }
             None => {}
@@ -460,11 +499,17 @@ impl ConnectionTab {
         if self.run != run {
             return;
         }
+        let sql = self.conn.adapter.family() == Family::Sql;
         self.status = match &result {
             Ok(run) => {
-                let done = summary(&run.result, run.statements);
+                let done = if sql {
+                    summary(&run.result, run.statements)
+                } else {
+                    document_summary(&run.result, run.statements)
+                };
                 // What the run changed in its open transaction was not kept: say so.
-                Status::Done(if run.rolled_back {
+                // Only SQL engines have transactions.
+                Status::Done(if sql && run.rolled_back {
                     format!("{done} · {ROLLED_BACK_NOTE}").into()
                 } else {
                     done.into()
@@ -689,7 +734,19 @@ impl Render for ConnectionTab {
                         conn.readonly
                             && conn.adapter.family() != Family::Sql
                             && self.server_read_only != Some(true),
-                        |el| el.child(chip("Guarded by TupleBase only".into(), muted, muted_bg)),
+                        |el| {
+                            el.child(
+                                chip("Guarded by TupleBase only".into(), muted, muted_bg)
+                                    .id("server-guard-chip")
+                                    .test_support()
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            SERVER_GUARD_HINT,
+                                        )
+                                        .build(window, cx)
+                                    }),
+                            )
+                        },
                     )
                     .child(div().flex_1())
                     .child(
@@ -796,6 +853,40 @@ pub(crate) fn summary(r: &tuplebase_core::db::QueryResult, statements: usize) ->
         format!("{statements} statements. {outcome}")
     } else {
         outcome
+    }
+}
+
+/// [`summary`] for a document engine: documents, not rows, and commands, not statements.
+pub(crate) fn document_summary(r: &tuplebase_core::db::QueryResult, commands: usize) -> String {
+    let ms = r.elapsed_ms;
+    let count = |n: usize| {
+        if n == 1 {
+            "1 document".to_owned()
+        } else {
+            format!("{n} documents")
+        }
+    };
+    let outcome = match r.rows_affected {
+        Some(n) => format!("{} changed in {ms} ms", count(n as usize)),
+        None if r.truncated => format!("First {} in {ms} ms", count(r.rows.len())),
+        None => format!("{} in {ms} ms", count(r.rows.len())),
+    };
+    if commands > 1 {
+        format!("{commands} commands. {outcome}")
+    } else {
+        outcome
+    }
+}
+
+/// What a document engine's completions may offer on `conn`.
+fn mongo_scope(conn: &Connection) -> MongoScope {
+    let database = match conn.database.trim() {
+        "" => "test".to_owned(),
+        name => name.to_owned(),
+    };
+    MongoScope {
+        database,
+        read_only: conn.readonly,
     }
 }
 
@@ -1084,12 +1175,13 @@ mod tests {
         assert!(sql_with_completions(cx));
         // Configuring it again for the same family changes nothing.
         cx.update(|cx| {
-            let (editor, names) = {
+            let (editor, names, conn) = {
                 let this = tab.read(cx);
-                (this.editor.clone(), this.names.clone())
+                (this.editor.clone(), this.names.clone(), this.conn.clone())
             };
             editor.update(cx, |editor, cx| {
-                ConnectionTab::configure_editor(editor, Family::Sql, &names, cx)
+                ConnectionTab::set_language(editor, Family::Sql, cx);
+                ConnectionTab::configure_completions(editor, &conn, &names);
             });
         });
         assert!(sql_with_completions(cx));
@@ -1722,5 +1814,304 @@ mod tests {
         assert!(typed.contains("select 42"), "{typed}");
         wait_for_slow_lookups(cx);
         assert_eq!(editor_text(&tab, cx), typed);
+    }
+
+    // MongoDB tabs.
+
+    /// A MongoDB connection's tab, with `app.users`, `app.orders` and the view
+    /// `app.active_users` in its schema, and an index on each collection plus `email_1`.
+    fn open_mongo(
+        readonly: bool,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<Workspace>, Entity<ConnectionTab>) {
+        let mut config = config_with_connection();
+        let mut conn = config.connections[0].clone();
+        conn.name = "mongo".into();
+        conn.adapter = Adapter::Mongodb;
+        conn.port = 1;
+        conn.readonly = readonly;
+        config.upsert(conn, None).unwrap();
+        let (handle, workspace) = open(config, cx);
+        let tab = open_tab(handle, &workspace, "mongo", cx);
+        let table = |name: &str, kind: &str| tuplebase_core::db::TableInfo {
+            schema: "app".into(),
+            name: name.into(),
+            kind: kind.into(),
+        };
+        let index = |collection: &str, name: &str| ObjectInfo {
+            schema: "app".into(),
+            kind: ObjectKind::Index,
+            name: name.into(),
+            detail: format!("on {collection}"),
+        };
+        cx.update(|cx| {
+            tab.update(cx, |this, cx| {
+                let conn = this.connection().clone();
+                this.schema.update(cx, |schema, cx| {
+                    schema.set_connection(Some(conn), cx);
+                    let tables = vec![
+                        table("users", "COLLECTION"),
+                        table("orders", "COLLECTION"),
+                        table("active_users", "VIEW"),
+                    ];
+                    let objects = vec![
+                        index("users", "_id_"),
+                        index("users", "email_1"),
+                        index("orders", "_id_"),
+                    ];
+                    let load = schema.loading;
+                    schema.finish_loading(load, Ok((tables, Vec::new(), objects)), cx);
+                    schema.fetch = Rc::new(|_, object, _| {
+                        Box::pin(async move {
+                            Ok(format!("createIndex for {} {}", object.name, object.detail))
+                        })
+                    });
+                });
+            });
+        });
+        (handle, workspace, tab)
+    }
+
+    fn type_in_editor(handle: AnyWindowHandle, text: &str, cx: &mut TestAppContext) {
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.press("secondary-a", cx);
+            window.input(text, cx);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn mongo_completions_offer_collections_then_methods_then_stages(cx: &mut TestAppContext) {
+        let (handle, _, tab) = open_mongo(false, cx);
+        cx.update(|cx| {
+            let editor = tab.read(cx).editor.read(cx);
+            assert_eq!(editor.language_name(), "javascript");
+        });
+        // Right after `db.`, without a letter typed.
+        type_in_editor(handle, "db.", cx);
+        assert!(menu_open(&tab, cx));
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        assert_eq!(editor_text(&tab, cx), "db.users");
+        window_action(handle, cx, |window, cx| window.input(".fi", cx));
+        assert!(menu_open(&tab, cx));
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        assert_eq!(editor_text(&tab, cx), "db.users.find");
+        // A stage replaces the `$` typed, rather than adding a second one. The editor
+        // closed the brackets as they were typed.
+        type_in_editor(handle, "db.users.aggregate([{$ma", cx);
+        assert!(menu_open(&tab, cx));
+        window_action(handle, cx, |window, cx| window.press("tab", cx));
+        assert_eq!(editor_text(&tab, cx), "db.users.aggregate([{$match}])");
+    }
+
+    #[gpui_kit::test]
+    fn mongo_indexes_sit_under_their_collection_and_show_as_text(cx: &mut TestAppContext) {
+        let (handle, _, tab) = open_mongo(false, cx);
+        type_in_editor(handle, "db.users.find()", cx);
+        window_action(handle, cx, |window, cx| {
+            // No database-wide group of indexes: they are under each collection.
+            assert!(window.try_find("group-app-Indexes").is_none());
+            assert!(window.try_find("indexes-app-users").is_none());
+            window.click("table-app-users", cx);
+        });
+        // The fields load on expand; a test's runtime never answers, so fill them in.
+        cx.update(|cx| {
+            tab.update(cx, |this, cx| {
+                this.schema.update(cx, |schema, cx| {
+                    let key = schema.expanded.keys().next().unwrap().clone();
+                    let field = tuplebase_core::db::ColumnInfo {
+                        name: "email".into(),
+                        data_type: "string|null".into(),
+                        nullable: true,
+                    };
+                    schema
+                        .expanded
+                        .insert(key, crate::schema::Columns::Loaded(vec![field]));
+                    cx.notify();
+                });
+            });
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("indexes-app-users", cx)
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(
+                window
+                    .try_find("object-app-Indexes-_id_(on users)")
+                    .is_some()
+            );
+            assert!(
+                window
+                    .try_find("object-app-Indexes-_id_(on orders)")
+                    .is_none()
+            );
+            window.click("object-app-Indexes-email_1(on users)", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("row-detail").visible());
+            let detail = tab.read(cx).row_detail.read(cx);
+            assert_eq!(detail.title(), "Index email_1 on users");
+            assert_eq!(detail.shown(cx), "createIndex for email_1 on users");
+        });
+        // The definition is shown to read: the editor keeps what was typed.
+        assert_eq!(editor_text(&tab, cx), "db.users.find()");
+    }
+
+    #[gpui_kit::test]
+    fn resampling_a_collection_samples_its_fields_again(cx: &mut TestAppContext) {
+        let (handle, _, tab) = open_mongo(false, cx);
+        let state = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let schema = tab.read(cx).schema.read(cx);
+                schema
+                    .expanded
+                    .values()
+                    .next()
+                    .map(|columns| match columns {
+                        crate::schema::Columns::Loading => "loading",
+                        crate::schema::Columns::Loaded(_) => "loaded",
+                        crate::schema::Columns::Failed => "failed",
+                    })
+            })
+        };
+        window_action(handle, cx, |window, cx| window.click("table-app-users", cx));
+        assert_eq!(state(cx), Some("loading"));
+        cx.update(|cx| {
+            tab.update(cx, |this, cx| {
+                this.schema.update(cx, |schema, _| {
+                    for columns in schema.expanded.values_mut() {
+                        *columns = crate::schema::Columns::Loaded(Vec::new());
+                    }
+                });
+            });
+        });
+        assert_eq!(state(cx), Some("loaded"));
+        // Right click: "Show first 100 documents", then "Resample fields".
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-app-users", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(1usize, cx));
+        assert_eq!(state(cx), Some("loading"));
+        // A view's menu also shows its definition.
+        window_action(handle, cx, |window, cx| {
+            window.right_click("table-app-active_users", cx)
+        });
+        window_action(handle, cx, |window, cx| window.click(2usize, cx));
+        cx.update(|cx| {
+            let detail = tab.read(cx).row_detail.read(cx);
+            assert_eq!(detail.title(), "View active_users");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn documents_show_absent_fields_empty_and_open_as_json(cx: &mut TestAppContext) {
+        let (handle, _, tab) = open_mongo(false, cx);
+        let ada = json!({
+            "_id": {"$oid": "65f0c0ffee0000000000abcd"},
+            "name": "Ada",
+            "address": {"city": "London", "tags": [1, 2]},
+            "total": {"$numberDecimal": "19.99"},
+        });
+        let grace = json!({"_id": {"$oid": "65f0c0ffee0000000000abce"}, "name": null});
+        let result = QueryResult {
+            columns: vec![
+                "_id".into(),
+                "name".into(),
+                "address".into(),
+                "total".into(),
+            ],
+            rows: vec![
+                vec![
+                    ada["_id"].clone(),
+                    json!("Ada"),
+                    ada["address"].clone(),
+                    ada["total"].clone(),
+                ],
+                vec![grace["_id"].clone(), json!(null), json!(null), json!(null)],
+            ],
+            truncated: false,
+            rows_affected: None,
+            elapsed_ms: 1,
+            note: None,
+            documents: Some(vec![ada.clone(), grace]),
+            server_read_only: None,
+        };
+        cx.update(|cx| {
+            tab.update(cx, |this, cx| {
+                this.results.update(cx, |table, cx| {
+                    table.delegate_mut().show(&result);
+                    table.refresh(cx);
+                });
+                cx.notify();
+            });
+        });
+        cx.update(|cx| {
+            let results = tab.read(cx).results.read(cx);
+            let cell = |r, c| results.delegate().cell(r, c).to_owned();
+            assert_eq!(cell(0, 0), "ObjectId(\"65f0c0ffee0000000000abcd\")");
+            assert_eq!(cell(0, 2), "{\"city\":\"London\",\"tags\":[1,2]}");
+            assert_eq!(cell(0, 3), "19.99");
+            // Grace's name is null; she has no address or total at all.
+            assert_eq!(cell(1, 1), "NULL");
+            assert_eq!(cell(1, 2), "");
+            assert_eq!(cell(1, 3), "");
+        });
+        window_action(handle, cx, |_, cx| {
+            tab.update(cx, |this, cx| {
+                this.results
+                    .update(cx, |table, cx| table.set_selected_row(0, cx));
+            });
+        });
+        let pretty = serde_json::to_string_pretty(&ada).unwrap();
+        window_action(handle, cx, |window, cx| {
+            assert!(window.find("row-detail").visible());
+            let detail = tab.read(cx).row_detail.read(cx);
+            assert_eq!(detail.title(), "Document");
+            assert_eq!(detail.shown(cx), pretty);
+            assert!(pretty.contains("\n  \"address\": {\n    \"city\": \"London\""));
+            let text = detail.text().read(cx);
+            assert_eq!(text.language_name(), "json");
+            // The document and its nested object each fold.
+            assert!(text.display_map().is_fold_candidate(0));
+            let address = pretty
+                .lines()
+                .position(|l| l.contains("\"address\""))
+                .unwrap();
+            assert!(text.display_map().is_fold_candidate(address));
+        });
+        window_action(handle, cx, |window, cx| window.click("row-detail-copy", cx));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(pretty)
+        );
+        // A row shown next goes back to the row's own text, with no grammar.
+        window_action(handle, cx, |window, cx| {
+            tab.update(cx, |this, cx| {
+                let row = vec![("id".to_owned(), json!(1))];
+                this.row_detail
+                    .update(cx, |detail, cx| detail.show(row, window, cx));
+            });
+        });
+        cx.update(|cx| {
+            let detail = tab.read(cx).row_detail.read(cx);
+            assert_eq!(detail.title(), "Row");
+            assert_eq!(detail.shown(cx), "{\n  id: 1\n}");
+            assert_eq!(detail.text().read(cx).language_name(), "text");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_read_only_mongo_tab_says_only_tuplebase_guards_it(cx: &mut TestAppContext) {
+        let (handle, _, tab) = open_mongo(true, cx);
+        let chip = |handle, cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, _| {
+                window.try_find("server-guard-chip").is_some()
+            })
+        };
+        assert!(chip(handle, cx));
+        cx.update(|cx| tab.update(cx, |this, _| this.server_read_only = Some(true)));
+        assert!(!chip(handle, cx));
+        cx.update(|cx| tab.update(cx, |this, _| this.server_read_only = Some(false)));
+        assert!(chip(handle, cx));
     }
 }

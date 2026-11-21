@@ -93,6 +93,8 @@ pub struct ConnForm {
     mongo_srv: bool,
     /// MongoDB and DocumentDB: connection string options, never a password.
     mongo_options: Entity<InputState>,
+    /// What filling in the form from a pasted connection string left out, if anything.
+    paste_note: Option<SharedString>,
     readonly: bool,
     pub(crate) color: String,
     tls: TlsMode,
@@ -212,6 +214,7 @@ impl ConnForm {
             use_secret_host,
             mongo_srv: mongo.srv,
             mongo_options,
+            paste_note: None,
             readonly: existing.is_some_and(|c| c.readonly),
             color: existing.map(|c| c.color.clone()).unwrap_or_default(),
             tls: existing.map_or(TlsMode::default(), |c| c.tls),
@@ -445,6 +448,69 @@ impl ConnForm {
             ssh_password: (uses_ssh && !ssh_password.is_empty()).then_some(ssh_password),
             previous: self.previous.clone(),
         });
+    }
+
+    /// Fills in the server and sign-in fields from the connection string on the clipboard.
+    /// The string itself is kept nowhere: its password goes to the password field, saved
+    /// to the credential store like a typed one, and the rest to plain fields (S1).
+    fn paste_connection_string(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        self.fill_from_connection_string(&text, window, cx);
+    }
+
+    pub(crate) fn fill_from_connection_string(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let uri = match config::parse_mongo_uri(text) {
+            Ok(uri) => uri,
+            Err(e) => {
+                // The error never quotes the string, which may hold a password.
+                self.error = Some(format!("Couldn't read the connection string: {e:#}").into());
+                self.paste_note = None;
+                cx.notify();
+                return;
+            }
+        };
+        let mut set = |input: &Entity<InputState>, value: String| {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        };
+        set(&self.host, uri.host);
+        set(
+            &self.port,
+            uri.port.map(|p| p.to_string()).unwrap_or_default(),
+        );
+        set(&self.database, uri.database);
+        set(&self.user, uri.user);
+        set(&self.mongo_options, uri.options);
+        if let Some(password) = uri.password {
+            set(&self.password, password);
+            // Only a password sign-in saves what the password field holds.
+            self.auth_kind = AuthKind::Password;
+        }
+        self.mongo_srv = uri.srv;
+        let mut notes = Vec::new();
+        if uri.other_hosts > 0 {
+            notes.push(format!(
+                "Kept the first of {} hosts. With replicaSet in the options, the driver \
+                 finds the others from it.",
+                uri.other_hosts + 1
+            ));
+        }
+        if !uri.dropped.is_empty() {
+            notes.push(format!(
+                "Left out {}: options can't hold a secret.",
+                uri.dropped.join(", ")
+            ));
+        }
+        self.paste_note = (!notes.is_empty()).then(|| notes.join(" ").into());
+        self.error = None;
+        cx.notify();
     }
 
     /// What a MongoDB or DocumentDB connection saves besides the common fields; `None`
@@ -787,15 +853,45 @@ impl ConnForm {
             )
             .when(document, |el| {
                 el.child(
-                    Checkbox::new("conn-mongo-srv")
-                        .cursor_pointer()
-                        .label("SRV address (mongodb+srv): DNS names the servers")
-                        .checked(self.mongo_srv)
-                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                            this.mongo_srv = *checked;
-                            cx.notify();
-                        })),
+                    h_flex()
+                        .gap_3()
+                        .justify_between()
+                        .child(
+                            Checkbox::new("conn-mongo-srv")
+                                .cursor_pointer()
+                                .label("SRV address (mongodb+srv): DNS names the servers")
+                                .checked(self.mongo_srv)
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.mongo_srv = *checked;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("conn-mongo-paste")
+                                .cursor_pointer()
+                                .small()
+                                .icon(IconName::Copy)
+                                .label("Paste connection string")
+                                .tooltip(
+                                    "Fill in these fields from a mongodb:// or mongodb+srv:// \
+                                     string on the clipboard. The string isn't saved; its \
+                                     password goes to the password field.",
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.paste_connection_string(window, cx);
+                                })),
+                        ),
                 )
+                .when_some(self.paste_note.clone(), |el, note| {
+                    el.child(
+                        div()
+                            .id("conn-paste-note")
+                            .test_support()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(note),
+                    )
+                })
                 .child(
                     field(
                         "Options",
@@ -1526,6 +1622,106 @@ mod tests {
         );
         let mut config = tuplebase_core::config::Config::default();
         config.upsert(connection.clone(), None).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn pasting_a_connection_string_fills_the_fields_and_keeps_only_the_password(
+        cx: &mut TestAppContext,
+    ) {
+        let (handle, form) = open(cx);
+        let saved = Rc::new(RefCell::new(None));
+        cx.update(|cx| {
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save {
+                    connection,
+                    password,
+                    ..
+                } = event
+                {
+                    *saved.borrow_mut() = Some((connection.clone(), password.clone()));
+                }
+            })
+            .detach();
+        });
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        act(handle, cx, |window, cx| window.click("adapter-MongoDB", cx));
+        // The secret in an option is left out, and only the first of two hosts kept.
+        let uri = "mongodb://ada:s3cr%2Ft@db1.example.com:27018,db2.example.com/app\
+                   ?replicaSet=rs0&authSource=admin&password=s3cr%2Ft";
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(uri.to_owned()));
+        act(handle, cx, |window, cx| {
+            window.click("conn-mongo-paste", cx)
+        });
+        act(handle, cx, |window, cx| {
+            let note = window.find("conn-paste-note");
+            assert!(note.visible());
+            let read = |input: &Entity<gpui_kit::component::input::InputState>| {
+                input.read(cx).value().to_string()
+            };
+            let form = form.read(cx);
+            assert_eq!(read(&form.host), "db1.example.com");
+            assert_eq!(read(&form.port), "27018");
+            assert_eq!(read(&form.database), "app");
+            assert_eq!(read(&form.user), "ada");
+            assert_eq!(read(&form.password), "s3cr/t");
+            assert_eq!(read(&form.mongo_options), "replicaSet=rs0&authSource=admin");
+            assert!(!form.mongo_srv);
+            let note = form.paste_note.clone().unwrap_or_default();
+            assert!(note.contains("first of 2 hosts"), "{note}");
+            assert!(note.contains("Left out password"), "{note}");
+            assert!(!note.contains("s3cr"), "{note}");
+        });
+        act(handle, cx, |window, cx| {
+            window.click("conn-name", cx);
+            window.input("docs", cx);
+            window.click("save", cx);
+        });
+        let (connection, password) = saved.borrow_mut().take().expect("saved");
+        assert_eq!(password.as_deref(), Some("s3cr/t"));
+        assert_eq!(connection.port, 27018);
+        assert_eq!(
+            connection.mongo,
+            Some(MongoSettings {
+                srv: false,
+                options: "replicaSet=rs0&authSource=admin".into()
+            })
+        );
+        // What is saved to the file holds neither the password nor the string.
+        let file = serde_json::to_string(&connection).unwrap();
+        assert!(!file.contains("s3cr"), "{file}");
+        assert!(!file.contains("mongodb://"), "{file}");
+
+        // An SRV string turns SRV on and leaves the port to DNS.
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "mongodb+srv://cluster0.example.net/?retryWrites=true".to_owned(),
+        ));
+        act(handle, cx, |window, cx| {
+            window.click("conn-mongo-paste", cx)
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.try_find("conn-port").is_none());
+            assert!(window.try_find("conn-paste-note").is_none());
+            let form = form.read(cx);
+            assert!(form.mongo_srv);
+            assert_eq!(form.mongo_options.read(cx).value(), "retryWrites=true");
+            assert_eq!(form.host.read(cx).value(), "cluster0.example.net");
+        });
+
+        // Something else on the clipboard says so, and changes nothing.
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+            "postgres://u:hidden@h/db".to_owned(),
+        ));
+        act(handle, cx, |window, cx| {
+            window.click("conn-mongo-paste", cx)
+        });
+        cx.update(|cx| {
+            let form = form.read(cx);
+            let error = form.error.clone().unwrap_or_default();
+            assert!(error.contains("mongodb://"), "{error}");
+            assert!(!error.contains("hidden"), "{error}");
+            assert_eq!(form.host.read(cx).value(), "cluster0.example.net");
+        });
     }
 
     #[gpui_kit::test]
