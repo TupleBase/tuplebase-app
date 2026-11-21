@@ -229,6 +229,10 @@ pub struct SchemaPanel {
     names: SchemaNames,
     connection: Option<Connection>,
     pub(crate) load: Load,
+    /// The table list load whose result is still to show; an earlier one's is dropped.
+    pub(crate) loading: u64,
+    /// Likewise for the definition or call a click asked for.
+    looking_up: u64,
     pub(crate) tables: Vec<TableInfo>,
     pub(crate) objects: Vec<ObjectInfo>,
     collapsed: HashSet<String>,
@@ -271,6 +275,8 @@ impl SchemaPanel {
             names,
             connection: None,
             load: Load::Idle,
+            loading: 0,
+            looking_up: 0,
             tables: Vec::new(),
             objects: Vec::new(),
             collapsed: HashSet::new(),
@@ -301,13 +307,14 @@ impl SchemaPanel {
     /// Reloads the table list and forgets any loaded columns.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.expanded.clear();
+        self.loading += 1;
+        let load = self.loading;
         cx.notify();
         let Some(conn) = self.connection.clone() else {
             return;
         };
         self.load = Load::Loading;
         let db = self.db.clone();
-        let name = conn.name.clone();
         cx.spawn(async move |this, cx| {
             let result = io(async move {
                 let tables = db.list_tables(&conn).await?;
@@ -317,33 +324,46 @@ impl SchemaPanel {
                 Ok((tables, columns, objects))
             })
             .await;
-            this.update(cx, |this, cx| {
-                if !this.is_showing(&name) {
-                    return;
-                }
-                match result {
-                    Ok((tables, columns, objects)) => {
-                        let mut names: Vec<String> =
-                            tables.iter().map(|t| t.name.clone()).collect();
-                        names.extend(columns);
-                        names.sort();
-                        names.dedup();
-                        *this.names.borrow_mut() = names;
-                        this.tables = tables;
-                        this.objects = objects;
-                        this.load = Load::Ready;
-                    }
-                    Err(_) => {
-                        this.tables.clear();
-                        this.objects.clear();
-                        this.load = Load::Failed;
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.finish_loading(load, result, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Shows what load `load` found. Each connection change or refresh starts a new load,
+    /// so an earlier one, even of the same connection, must not replace its result.
+    pub(crate) fn finish_loading(
+        &mut self,
+        load: u64,
+        result: anyhow::Result<(Vec<TableInfo>, Vec<String>, Vec<ObjectInfo>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if load != self.loading {
+            return;
+        }
+        match result {
+            Ok((tables, columns, objects)) => {
+                let mut names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
+                names.extend(columns);
+                names.sort();
+                names.dedup();
+                *self.names.borrow_mut() = names;
+                self.tables = tables;
+                self.objects = objects;
+                self.load = Load::Ready;
+            }
+            Err(_) => {
+                self.tables.clear();
+                self.objects.clear();
+                self.load = Load::Failed;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Drops the definition or call still loading, as when the editor has changed.
+    pub fn forget_lookup(&mut self) {
+        self.looking_up += 1;
     }
 
     /// Results can arrive after the user has moved to another connection.
@@ -427,10 +447,13 @@ impl SchemaPanel {
             Lookup::Call => format!("Could not write a call of {}", object.name),
         };
         let fetch = (self.fetch)(conn, object, lookup);
+        self.looking_up += 1;
+        let id = self.looking_up;
         cx.spawn(async move |this, cx| {
             let result = fetch.await;
             this.update(cx, |this, cx| {
-                if !this.is_showing(&name) {
+                // The user may have clicked something else, or typed, since.
+                if !this.is_showing(&name) || this.looking_up != id {
                     return;
                 }
                 cx.emit(match result {
