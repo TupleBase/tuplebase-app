@@ -16,6 +16,7 @@ use tuplebase_core::app_status;
 use tuplebase_core::config::{self, Config, Connection};
 use tuplebase_core::db::{Db, ExecOptions};
 use tuplebase_core::mcp_status::Heartbeat;
+use tuplebase_core::mongo_shell::{AggregateRequest, FindRequest};
 
 const DEFAULT_MAX_ROWS: usize = 200;
 
@@ -29,9 +30,11 @@ struct ConnectionArgs {
 struct DescribeArgs {
     /// Connection name, as returned by list_connections.
     connection: String,
-    /// Table name.
+    /// Table name; on MongoDB and DocumentDB, the collection.
     table: String,
-    /// Schema; defaults to `public` (PostgreSQL, Redshift) or the connection's database.
+    /// Schema; defaults to `public` (PostgreSQL, Redshift) or the connection's database
+    /// (MySQL, MariaDB, and MongoDB/DocumentDB, where it is the database). Unused on
+    /// SQLite and DynamoDB.
     schema: Option<String>,
 }
 
@@ -39,8 +42,44 @@ struct DescribeArgs {
 struct QueryArgs {
     /// Connection name, as returned by list_connections.
     connection: String,
-    /// One SQL statement.
+    /// One statement in the connection's query_language (see list_connections): SQL,
+    /// a Mongo shell command such as `db.users.find({active: true})`, or PartiQL such
+    /// as `SELECT * FROM "Orders" WHERE pk = 'a'`.
     sql: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct FindArgs {
+    /// Connection name, as returned by list_connections (MongoDB or DocumentDB).
+    connection: String,
+    /// Database; defaults to the connection's own.
+    database: Option<String>,
+    /// Collection name.
+    collection: String,
+    /// Query filter as a JSON object, e.g. {"age": {"$gte": 30}}. Use {"$oid": "..."}
+    /// for an ObjectId, {"$date": "2024-01-31T00:00:00Z"} for a date, and
+    /// {"$numberLong": "..."} / {"$numberDecimal": "..."} for those numbers.
+    filter: Option<serde_json::Value>,
+    /// Fields to return as a JSON object, e.g. {"name": 1, "_id": 0}.
+    projection: Option<serde_json::Value>,
+    /// Sort order as a JSON object, e.g. {"created_at": -1}.
+    sort: Option<serde_json::Value>,
+    /// Most documents to return, from 1 up; the server's row cap also applies.
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct AggregateArgs {
+    /// Connection name, as returned by list_connections (MongoDB or DocumentDB).
+    connection: String,
+    /// Database; defaults to the connection's own.
+    database: Option<String>,
+    /// Collection name.
+    collection: String,
+    /// Aggregation pipeline: a JSON array of stage objects with one key each, e.g.
+    /// [{"$match": {"active": true}}, {"$group": {"_id": "$country", "n": {"$sum": 1}}}].
+    /// Stages that write ($out, $merge) or run JavaScript are refused.
+    pipeline: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -58,6 +97,28 @@ fn reply(result: anyhow::Result<serde_json::Value>) -> ToolResult {
     Ok(match result {
         Ok(value) => CallToolResult::success(vec![ContentBlock::json(value)?]),
         Err(e) => CallToolResult::error(vec![ContentBlock::text(format!("{e:#}"))]),
+    })
+}
+
+/// What list_connections says about one connection. `server_read_only` is what an open
+/// connection found; `None` (null) when unknown, such as before the first query.
+fn connection_entry(
+    c: &Connection,
+    allow_writes: bool,
+    server_read_only: Option<bool>,
+) -> serde_json::Value {
+    json!({
+        "name": c.name,
+        "folder": c.folder,
+        "adapter": c.adapter,
+        "family": c.adapter.family().name(),
+        "query_language": c.adapter.query_language(),
+        "host": c.host,
+        "port": c.port,
+        "database": c.database,
+        "via_ssh": c.ssh.is_some(),
+        "writable": allow_writes && !c.readonly,
+        "server_read_only": server_read_only,
     })
 }
 
@@ -81,28 +142,25 @@ impl Server {
     }
 
     #[tool(
-        description = "List the saved database connections and whether agents may write to each."
+        description = "List the saved database connections: each one's family (sql, document \
+                       or key-value), query_language (sql, mongo-shell or partiql), whether \
+                       agents may write to it, and server_read_only: whether the server \
+                       itself refuses writes from it (true/false once a MongoDB or DocumentDB \
+                       connection has been used, null when unknown)."
     )]
     async fn list_connections(&self) -> ToolResult {
-        reply(Config::load().map(|config| {
-            let list: Vec<_> = config
-                .connections
-                .iter()
-                .map(|c| {
-                    json!({
-                        "name": c.name,
-                        "folder": c.folder,
-                        "adapter": c.adapter,
-                        "host": c.host,
-                        "port": c.port,
-                        "database": c.database,
-                        "via_ssh": c.ssh.is_some(),
-                        "writable": self.allow_writes && !c.readonly,
-                    })
-                })
-                .collect();
-            json!(list)
-        }))
+        reply(
+            async {
+                let config = Config::load()?;
+                let mut list = Vec::with_capacity(config.connections.len());
+                for c in &config.connections {
+                    let server_read_only = self.db.known_server_read_only(c).await;
+                    list.push(connection_entry(c, self.allow_writes, server_read_only));
+                }
+                Ok(json!(list))
+            }
+            .await,
+        )
     }
 
     #[tool(
@@ -118,7 +176,11 @@ impl Server {
         }))
     }
 
-    #[tool(description = "List the tables and views of a connection.")]
+    #[tool(
+        description = "List the tables and views of a connection: tables and views (SQL), \
+                       collections and views per database (MongoDB, DocumentDB), or tables \
+                       and their indexes (DynamoDB)."
+    )]
     async fn list_tables(&self, Parameters(args): Parameters<ConnectionArgs>) -> ToolResult {
         reply(
             async {
@@ -129,7 +191,11 @@ impl Server {
         )
     }
 
-    #[tool(description = "Describe the columns of a table: name, data type, nullable.")]
+    #[tool(
+        description = "Describe the columns of a table: name, data type, nullable. On MongoDB \
+                       and DocumentDB, the fields seen in a sample of the collection's \
+                       documents; on DynamoDB, the keys and the attributes of a sample of items."
+    )]
     async fn describe_table(&self, Parameters(args): Parameters<DescribeArgs>) -> ToolResult {
         reply(
             async {
@@ -145,7 +211,9 @@ impl Server {
     }
 
     #[tool(
-        description = "Run one SQL statement and return columns and rows (row count capped). \
+        description = "Run one statement in the connection's query_language: SQL (columns and \
+                       rows), a Mongo shell command such as db.users.find({...}) on MongoDB \
+                       and DocumentDB, or PartiQL on DynamoDB (documents). Row count capped. \
                        Read-only unless the connection is writable (see list_connections)."
     )]
     async fn run_query(&self, Parameters(args): Parameters<QueryArgs>) -> ToolResult {
@@ -163,6 +231,54 @@ impl Server {
             .await,
         )
     }
+
+    #[tool(
+        description = "MongoDB and DocumentDB only: find documents in a collection, with the \
+                       filter, projection and sort as JSON objects instead of shell syntax. \
+                       Always read-only, even on a writable connection."
+    )]
+    async fn find(&self, Parameters(args): Parameters<FindArgs>) -> ToolResult {
+        reply(
+            async {
+                let conn = find_connection(&args.connection)?;
+                let request = FindRequest {
+                    database: args.database,
+                    collection: args.collection,
+                    filter: args.filter,
+                    projection: args.projection,
+                    sort: args.sort,
+                    limit: args.limit,
+                };
+                let result = self.db.mongo_find(&conn, &request, self.max_rows).await?;
+                Ok(json!(result.for_agent()))
+            }
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "MongoDB and DocumentDB only: run an aggregation pipeline, given as a \
+                       JSON array of stages, on a collection. Always read-only, even on a \
+                       writable connection: $out, $merge and JavaScript are refused."
+    )]
+    async fn aggregate(&self, Parameters(args): Parameters<AggregateArgs>) -> ToolResult {
+        reply(
+            async {
+                let conn = find_connection(&args.connection)?;
+                let request = AggregateRequest {
+                    database: args.database,
+                    collection: args.collection,
+                    pipeline: args.pipeline,
+                };
+                let result = self
+                    .db
+                    .mongo_aggregate(&conn, &request, self.max_rows)
+                    .await?;
+                Ok(json!(result.for_agent()))
+            }
+            .await,
+        )
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -170,14 +286,18 @@ impl ServerHandler for Server {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("tuplebase", env!("CARGO_PKG_VERSION")))
-            .with_instructions(
-                "Query the user's databases saved in TupleBase. Start with list_connections, \
-                 then list_tables / describe_table, then run_query. When the user means the \
-                 database they are working on, list_open_connections says which ones are \
-                 open in the app.",
-            )
+            .with_instructions(INSTRUCTIONS)
     }
 }
+
+const INSTRUCTIONS: &str = "Query the user's databases saved in TupleBase. Start with \
+    list_connections, then list_tables / describe_table, then run_query. When the user means \
+    the database they are working on, list_open_connections says which ones are open in the \
+    app. Write run_query in the connection's query_language: SQL for SQL engines, a Mongo \
+    shell command (db.<collection>.find(...), .aggregate([...]), countDocuments, distinct) for \
+    MongoDB and DocumentDB, PartiQL (one SELECT) for DynamoDB. On MongoDB and DocumentDB, \
+    find and aggregate take JSON arguments instead of shell syntax and are always read-only. \
+    Connections are read-only unless list_connections says writable.";
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -210,4 +330,187 @@ async fn main() -> anyhow::Result<()> {
     }
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tuplebase_core::config::Adapter;
+
+    fn connection(name: &str, adapter: Adapter) -> Connection {
+        serde_json::from_value(json!({
+            "name": name,
+            "adapter": adapter,
+            // Nothing listens here: a tool that tried to connect would fail differently.
+            "host": "127.0.0.1",
+            "port": 9,
+            "user": "u",
+        }))
+        .unwrap()
+    }
+
+    /// Points the config at a file of one connection per engine, once per test binary.
+    fn use_test_config() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir =
+                std::env::temp_dir().join(format!("tuplebase-mcp-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            // SAFETY: set once, before any test reads it; only std::env reads it, and no C
+            // code does.
+            unsafe { std::env::set_var(config::CONFIG_DIR_ENV, &dir) };
+            let config = Config {
+                connections: Adapter::ALL
+                    .iter()
+                    .map(|&adapter| connection(&format!("{adapter:?}"), adapter))
+                    .collect(),
+                ..Default::default()
+            };
+            config.save().unwrap();
+        });
+    }
+
+    fn json_of(result: &CallToolResult) -> serde_json::Value {
+        serde_json::to_value(result).unwrap()
+    }
+
+    fn error_text(result: &CallToolResult) -> String {
+        let value = json_of(result);
+        assert_eq!(value["isError"], json!(true), "{value}");
+        value["content"][0]["text"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn list_connections_names_each_family_and_language() {
+        let expected = [
+            (Adapter::Postgres, "sql", "sql"),
+            (Adapter::Mysql, "sql", "sql"),
+            (Adapter::Mariadb, "sql", "sql"),
+            (Adapter::Sqlite, "sql", "sql"),
+            (Adapter::Redshift, "sql", "sql"),
+            (Adapter::Mongodb, "document", "mongo-shell"),
+            (Adapter::Documentdb, "document", "mongo-shell"),
+            (Adapter::Dynamodb, "key-value", "partiql"),
+        ];
+        assert_eq!(expected.len(), Adapter::ALL.len());
+        for (adapter, family, language) in expected {
+            let entry = connection_entry(&connection("c", adapter), false, None);
+            assert_eq!(entry["family"], json!(family), "{adapter:?}");
+            assert_eq!(entry["query_language"], json!(language), "{adapter:?}");
+            assert_eq!(entry["server_read_only"], json!(null));
+            assert_eq!(entry["writable"], json!(false));
+        }
+        let mut readonly = connection("c", Adapter::Mongodb);
+        let entry = connection_entry(&readonly, true, Some(true));
+        assert_eq!(entry["writable"], json!(true));
+        assert_eq!(entry["server_read_only"], json!(true));
+        readonly.readonly = true;
+        assert_eq!(
+            connection_entry(&readonly, true, Some(false))["writable"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_connections_reports_unknown_server_read_only_without_connecting() {
+        use_test_config();
+        let server = Server::new(false, 10);
+        let value = json_of(&server.list_connections().await.unwrap());
+        let list = &value["structuredContent"];
+        let list = if list.is_array() {
+            list.clone()
+        } else {
+            serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap()
+        };
+        let mongo = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Mongodb")
+            .unwrap();
+        assert_eq!(mongo["family"], json!("document"));
+        assert_eq!(mongo["server_read_only"], json!(null));
+        assert!(server.db.open_connections().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_and_aggregate_are_errors_on_other_engines() {
+        use_test_config();
+        let server = Server::new(true, 10);
+        for adapter in Adapter::ALL {
+            if adapter.family() == tuplebase_core::config::Family::Document {
+                continue;
+            }
+            let find = server
+                .find(Parameters(FindArgs {
+                    connection: format!("{adapter:?}"),
+                    database: None,
+                    collection: "users".into(),
+                    filter: None,
+                    projection: None,
+                    sort: None,
+                    limit: None,
+                }))
+                .await
+                .unwrap();
+            let text = error_text(&find);
+            assert!(text.contains("only on MongoDB and DocumentDB"), "{text}");
+            assert!(text.contains("run_query"), "{text}");
+            let aggregate = server
+                .aggregate(Parameters(AggregateArgs {
+                    connection: format!("{adapter:?}"),
+                    database: None,
+                    collection: "users".into(),
+                    pipeline: json!([]),
+                }))
+                .await
+                .unwrap();
+            assert!(error_text(&aggregate).contains("only on MongoDB and DocumentDB"));
+        }
+        assert!(server.db.open_connections().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn find_and_aggregate_refuse_writes_even_when_writes_are_allowed() {
+        use_test_config();
+        let server = Server::new(true, 10);
+        let aggregate = server
+            .aggregate(Parameters(AggregateArgs {
+                connection: "Mongodb".into(),
+                database: None,
+                collection: "users".into(),
+                pipeline: json!([{"$out": "copy"}]),
+            }))
+            .await
+            .unwrap();
+        assert!(error_text(&aggregate).starts_with("read-only"));
+        let find = server
+            .find(Parameters(FindArgs {
+                connection: "Documentdb".into(),
+                database: None,
+                collection: "users".into(),
+                filter: Some(json!({"$where": "true"})),
+                projection: None,
+                sort: None,
+                limit: None,
+            }))
+            .await
+            .unwrap();
+        assert!(error_text(&find).starts_with("read-only"));
+        assert!(server.db.open_connections().await.is_empty());
+    }
+
+    #[test]
+    fn the_instructions_name_each_language() {
+        for word in [
+            "SQL",
+            "Mongo shell",
+            "PartiQL",
+            "find",
+            "aggregate",
+            "read-only",
+        ] {
+            assert!(INSTRUCTIONS.contains(word), "{word}");
+        }
+    }
 }

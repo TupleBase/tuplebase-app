@@ -5,6 +5,7 @@
 use serde_json::json;
 use tuplebase_core::config::{Adapter, Connection, MongoSettings};
 use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
+use tuplebase_core::mongo_shell::{AggregateRequest, FindRequest};
 
 const READ: ExecOptions = ExecOptions {
     read_only: true,
@@ -327,11 +328,14 @@ async fn mongo_server_refuses_the_read_users_writes_even_past_the_guard() {
 async fn mongo_server_read_only_is_detected_and_fails_closed() {
     each_adapter(async |db, adapter| {
         let reader = connection(adapter, "reader");
+        // Unknown until connected: asking without connecting opens nothing.
+        assert_eq!(db.known_server_read_only(&reader).await, None);
         assert_eq!(
             db.server_read_only(&reader).await.unwrap(),
             Some(true),
             "{adapter:?}"
         );
+        assert_eq!(db.known_server_read_only(&reader).await, Some(true));
         let dev = connection(adapter, "dev");
         assert_eq!(db.server_read_only(&dev).await.unwrap(), Some(false));
         let r = db.execute(&dev, "db.users.find()", READ).await.unwrap();
@@ -430,6 +434,131 @@ async fn mongo_parse_errors_say_where() {
             .unwrap_err();
         assert!(e.to_string().contains("statement 2 of 2"), "{e}");
         assert!(e.to_string().contains("JavaScript"), "{e}");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mongo_structured_find_and_aggregate_read() {
+    each_adapter(async |db, adapter| {
+        let conn = connection(adapter, "dev");
+        let find = FindRequest {
+            database: Some("app".into()),
+            collection: "users".into(),
+            filter: Some(json!({"active": true})),
+            projection: Some(json!({"name": 1})),
+            sort: Some(json!({"_id": 1})),
+            limit: Some(10),
+        };
+        let r = db.mongo_find(&conn, &find, 100).await.unwrap();
+        let docs = r.clone().for_agent().documents.unwrap();
+        assert_eq!(docs.len(), 2, "{adapter:?}");
+        assert_eq!(docs[0], json!({"_id": 1, "name": "Ada Lovelace"}));
+        assert!(!r.truncated);
+        // The row cap still applies above the request's limit.
+        let capped = db.mongo_find(&conn, &find, 1).await.unwrap();
+        assert!(capped.truncated);
+        assert_eq!(capped.documents.unwrap().len(), 1);
+        // Extended JSON for the shell's helpers.
+        let dated = FindRequest {
+            collection: "users".into(),
+            filter: Some(json!({"created_at": {"$date": "2024-01-02T03:04:05Z"}})),
+            ..Default::default()
+        };
+        let r = db.mongo_find(&conn, &dated, 100).await.unwrap();
+        assert_eq!(r.documents.unwrap().len(), 1);
+
+        let aggregate = AggregateRequest {
+            database: None,
+            collection: "users".into(),
+            pipeline: json!([
+                {"$match": {"_id": 1}},
+                {"$lookup": {"from": "orders", "localField": "_id", "foreignField": "user_id", "as": "orders"}},
+                {"$project": {"n": {"$size": "$orders"}}}
+            ]),
+        };
+        let r = db.mongo_aggregate(&conn, &aggregate, 100).await.unwrap();
+        assert_eq!(r.documents.unwrap(), [json!({"_id": 1, "n": 2})]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mongo_structured_requests_are_read_only_even_when_writes_are_allowed() {
+    each_adapter(async |db, adapter| {
+        // A connection that may write: the structured requests are read-only anyway.
+        let conn = connection(adapter, "dev");
+        let coll = format!("it_structured_{adapter:?}").to_lowercase();
+        db.execute(&conn, &format!("db.{coll}.drop()"), WRITE)
+            .await
+            .unwrap();
+        db.execute(&conn, &format!("db.{coll}.insertOne({{_id: 1}})"), WRITE)
+            .await
+            .unwrap();
+        let copy = format!("{coll}_copy");
+        for pipeline in [
+            json!([{"$out": copy}]),
+            json!([{"$merge": {"into": copy}}]),
+            json!([{"$match": {}}, {"$facet": {"a": [{"$out": copy}]}}]),
+            json!([{"$lookup": {"from": coll, "as": "x", "pipeline": [{"$merge": {"into": copy}}]}}]),
+            json!([{"$match": {"$where": "true"}}]),
+            json!([{"$project": {"x": {"$function": {"body": "function() { return 1 }", "args": [], "lang": "js"}}}}]),
+            json!([{"$group": {"_id": null, "x": {"$accumulator": {}}}}]),
+            json!([{"$project": {"x": {"$_internalJsEmit": {"eval": "function() {}", "this": "$$ROOT"}}}}]),
+            json!([{"$match": {}, "$out": copy}]),
+            json!([{"$match": {"a\u{0}": 1}}]),
+        ] {
+            let request = AggregateRequest {
+                database: None,
+                collection: coll.clone(),
+                pipeline: pipeline.clone(),
+            };
+            let e = db
+                .mongo_aggregate(&conn, &request, 100)
+                .await
+                .expect_err(&format!("{adapter:?}: {pipeline}"));
+            let e = format!("{e:#}");
+            assert!(e.contains("read-only") || e.contains("NUL"), "{pipeline}: {e}");
+        }
+        for filter in [
+            json!({"$where": "true"}),
+            json!({"$expr": {"$function": {"body": "function() { return true }", "args": [], "lang": "js"}}}),
+            json!({"$expr": {"$_internalJsEmit": {"eval": "function() {}", "this": "$$ROOT"}}}),
+            json!({"$or": [{"a": 1}, {"$where": "true"}]}),
+        ] {
+            let request = FindRequest {
+                collection: coll.clone(),
+                filter: Some(filter.clone()),
+                ..Default::default()
+            };
+            let e = db
+                .mongo_find(&conn, &request, 100)
+                .await
+                .expect_err(&format!("{adapter:?}: {filter}"));
+            assert!(format!("{e:#}").contains("read-only"), "{filter}: {e:#}");
+        }
+        for (database, collection) in [(None, "$cmd"), (Some("app$"), coll.as_str()), (None, "")] {
+            let request = FindRequest {
+                database: database.map(str::to_owned),
+                collection: collection.into(),
+                ..Default::default()
+            };
+            assert!(db.mongo_find(&conn, &request, 100).await.is_err());
+        }
+        let count = db
+            .execute(&conn, &format!("db.{coll}.countDocuments()"), READ)
+            .await
+            .unwrap();
+        assert_eq!(count.rows, [vec![json!(1)]], "nothing was written");
+        let names = db
+            .execute(&conn, "db.getCollectionNames()", READ)
+            .await
+            .unwrap();
+        let copied = json!({"name": copy, "type": "collection"});
+        assert!(!names.documents.unwrap().contains(&copied));
+        db.execute(&conn, &format!("db.{coll}.drop()"), WRITE)
+            .await
+            .unwrap();
     })
     .await;
 }

@@ -35,6 +35,10 @@ pub(super) struct MongoPool {
     default_db: String,
     /// Whether the server refuses this connection's writes; see [`server_read_only`].
     pub(super) server_read_only: Option<bool>,
+    /// Whether read-only reads say `allowDiskUse: false`. MongoDB 6.0 and later spill
+    /// to disk by default unless told not to; DocumentDB isn't sent the option, which
+    /// it isn't known to accept.
+    no_disk_for_reads: bool,
 }
 
 /// Databases the server keeps for itself, left out of the schema.
@@ -196,6 +200,7 @@ pub(super) async fn connect(
         client,
         default_db: default_db(conn),
         server_read_only,
+        no_disk_for_reads: conn.adapter == Adapter::Mongodb,
     })
 }
 
@@ -396,6 +401,9 @@ async fn read(
     max_rows: usize,
     max_time: Option<Duration>,
 ) -> Result<QueryResult> {
+    // Read-only work (with `max_time`) may not spill to the server's disk, which would
+    // let one read use it without bound. The guard already refuses `allowDiskUse: true`.
+    let no_disk = (max_time.is_some() && pool.no_disk_for_reads).then_some(false);
     let docs = match op {
         ReadOp::ListDatabases => {
             let databases = pool
@@ -440,6 +448,7 @@ async fn read(
             options.skip = skip;
             options.limit = Some(limit.map_or(cap, |n| n.min(cap)));
             options.max_time = max_time;
+            options.allow_disk_use = no_disk;
             let cursor = pool
                 .collection(&target)
                 .find(filter)
@@ -473,7 +482,7 @@ async fn read(
                 batch_size,
             } = options;
             let mut options = AggregateOptionsDriver::default();
-            options.allow_disk_use = allow_disk_use;
+            options.allow_disk_use = no_disk.or(allow_disk_use);
             options.max_time = shorter(max_time_ms.map(Duration::from_millis), max_time);
             options.batch_size = batch_size;
             let cursor = pool

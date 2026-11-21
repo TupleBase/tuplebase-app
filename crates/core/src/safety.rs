@@ -712,6 +712,10 @@ fn check_mongo_values(doc: &Document) -> Result<(), String> {
 }
 
 fn check_mongo_key(key: &str) -> Result<(), String> {
+    // BSON ends a key at a NUL, so the server could read a shorter key than this check.
+    if key.contains('\0') {
+        return Err("read-only: a key can't hold a NUL".into());
+    }
     if MONGO_JAVASCRIPT.contains(&key) {
         return Err(format!(
             "read-only: \"{key}\" runs JavaScript on the server and is not allowed"
