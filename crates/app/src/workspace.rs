@@ -1,4 +1,4 @@
-//! Main window: connection sidebar and the open connections, one tab each.
+//! Main window: a top bar of open connections, one tab each, above the open one.
 
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use gpui_kit::component::button::*;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{
     ResizablePanel, ResizableState, h_resizable, resizable_panel,
@@ -19,8 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use tuplebase_core::agents::{self, AgentState, AgentStatus};
 use tuplebase_core::config::{
-    Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
-    kept_unreadable_message, parent_of, rebase_folder,
+    Appearance, Config, Connection, DEFAULT_FONT_SIZE, kept_unreadable_message,
 };
 use tuplebase_core::db::Db;
 use tuplebase_core::secrets::{ConnectionSecrets, Secret};
@@ -36,10 +35,13 @@ use crate::logos;
 use crate::runtime::{blocking, io};
 use crate::saving::{Save, Saves};
 use crate::theme;
-use crate::tree_nav::{self, TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeUp};
+use crate::tree_nav;
 
+mod connections;
 mod settings;
+mod top_bar;
 
+use connections::ConnectionsDialog;
 use settings::SettingsPage;
 
 actions!(
@@ -48,6 +50,7 @@ actions!(
         RunQuery,
         RunAll,
         OpenSettings,
+        OpenConnections,
         CheckForUpdates,
         About,
         AddMcpToAgents,
@@ -84,6 +87,9 @@ macro_rules! secondary {
     };
 }
 
+/// Opens and closes the Connections dialog.
+pub(crate) const CONNECTIONS_KEY: &str = secondary!("k");
+
 /// Call after `gpui_kit::init`, so the `Input` binding overrides the editor's own
 /// one, which would insert a newline.
 pub fn bind_keys(cx: &mut App) {
@@ -93,6 +99,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(RUN_ALL_KEY, RunAll, Some("Input")),
         KeyBinding::new(RUN_ALL_KEY, RunAll, None),
         KeyBinding::new(SETTINGS_KEY, OpenSettings, None),
+        KeyBinding::new(CONNECTIONS_KEY, OpenConnections, None),
         KeyBinding::new(secondary!("="), IncreaseFontSize, None),
         // The same key with Shift held.
         KeyBinding::new(secondary!("+"), IncreaseFontSize, None),
@@ -100,6 +107,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(secondary!("0"), ResetFontSize, None),
     ]);
     cx.bind_keys(tree_nav::key_bindings());
+    cx.bind_keys(connections::key_bindings());
     cx.bind_keys(completions::key_bindings());
 }
 
@@ -128,6 +136,9 @@ pub fn register_menu_actions(workspace: &Entity<Workspace>, window: AnyWindowHan
     on::<OpenSettings>(workspace, window, cx, |this, window, cx| {
         this.open_settings(SettingsPage::General, window, cx);
     });
+    on::<OpenConnections>(workspace, window, cx, |this, window, cx| {
+        this.toggle_connections(window, cx);
+    });
     on::<About>(workspace, window, cx, |this, window, cx| {
         this.open_about(window, cx);
     });
@@ -150,81 +161,9 @@ pub fn register_menu_actions(workspace: &Entity<Workspace>, window: AnyWindowHan
 
 const STATUS_POLL: Duration = Duration::from_secs(5);
 
-const UNPLUG_ICON: &[u8] = include_bytes!("../../../assets/icons/unplug.svg");
-const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
-const NEW_FOLDER_ICON: &[u8] = include_bytes!("../../../assets/icons/folder-plus.svg");
-const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
-
-/// The least room the sidebar leaves beside it. It fits the schema panel at its widest
+/// The least room the chat leaves beside it. It fits the schema panel at its widest
 /// next to an editor that is still usable.
 const MAIN_MIN_WIDTH: f32 = 480.;
-/// Sidebar indent per folder level.
-const TREE_INDENT: f32 = 16.;
-/// Empty space at the top of the window, where the traffic lights sit on macOS.
-const WINDOW_TOP_STRIP: f32 = 40.;
-
-/// One visible line of the connection tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TreeRow {
-    Folder(String),
-    Connection(String),
-}
-
-/// Inline name field in the sidebar, for creating or renaming a folder.
-struct FolderEdit {
-    /// Where a new folder goes; unused when renaming.
-    parent: String,
-    /// The folder being renamed; `None` when creating one.
-    renaming: Option<String>,
-    input: Entity<InputState>,
-}
-
-/// A connection being dragged to another folder; also draws itself under the pointer.
-#[derive(Clone)]
-struct DraggedConnection {
-    name: String,
-    adapter: Adapter,
-}
-
-/// A folder being dragged into another one.
-#[derive(Clone)]
-struct DraggedFolder {
-    path: String,
-}
-
-impl Render for DraggedFolder {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        div()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .text_color(theme.popover_foreground)
-            .text_sm()
-            .child(folder_name(&self.path).to_owned())
-    }
-}
-
-impl Render for DraggedConnection {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        h_flex()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .text_color(theme.popover_foreground)
-            .text_sm()
-            .child(logos::icon(self.adapter, 16.))
-            .child(self.name.clone())
-    }
-}
 
 /// How far along a newer version is.
 enum UpdateState {
@@ -246,7 +185,6 @@ enum UpdateState {
 /// A panel whose edge can be dragged. Its size is kept between launches.
 #[derive(Clone, Copy)]
 pub(crate) enum Panel {
-    Sidebar,
     Schema,
     Editor,
     Chat,
@@ -256,7 +194,6 @@ pub(crate) enum Panel {
 impl Panel {
     fn default_size(self) -> f32 {
         match self {
-            Panel::Sidebar => 300.,
             Panel::Schema => 270.,
             Panel::Editor => 220.,
             Panel::Chat => 380.,
@@ -266,7 +203,6 @@ impl Panel {
 
     fn size_range(self) -> Range<Pixels> {
         match self {
-            Panel::Sidebar => px(200.)..px(520.),
             Panel::Schema => px(180.)..px(380.),
             Panel::Editor => px(80.)..px(900.),
             Panel::Chat => px(280.)..px(720.),
@@ -277,7 +213,6 @@ impl Panel {
     /// The name its size is saved under.
     fn key(self) -> &'static str {
         match self {
-            Panel::Sidebar => "sidebar",
             Panel::Schema => "schema",
             Panel::Editor => "editor",
             Panel::Chat => "chat",
@@ -285,13 +220,12 @@ impl Panel {
         }
     }
 
-    /// Where it sits in its group: the chat is third, after the sidebar and the main
-    /// area, and the row detail second, after the results; the others come first.
+    /// Where it sits in its group: the chat is second, after the main area, and the row
+    /// detail second, after the results; the others come first.
     fn index(self) -> usize {
         match self {
-            Panel::Chat => 2,
-            Panel::RowDetail => 1,
-            _ => 0,
+            Panel::Chat | Panel::RowDetail => 1,
+            Panel::Schema | Panel::Editor => 0,
         }
     }
 
@@ -366,15 +300,11 @@ pub struct Workspace {
     mcp_servers: Vec<Option<String>>,
     /// `None` until Settings has looked for them.
     agents: Option<Vec<AgentStatus>>,
-    tree_focus: FocusHandle,
-    tree_scroll: ScrollHandle,
-    /// The row arrow keys act on.
-    cursor: Option<TreeRow>,
-    tree_focused: bool,
-    folder_edit: Option<FolderEdit>,
-    _folder_edit_subscription: Option<Subscription>,
-    /// Folders closed in the sidebar.
-    collapsed: HashSet<String>,
+    /// The Connections dialog's view, kept while it is closed so that the folders it
+    /// shows open stay open.
+    connections: Entity<ConnectionsDialog>,
+    /// Whether the Connections dialog is open.
+    connections_open: bool,
     /// A newer version found by the update check, and how far along it is.
     update_state: Option<UpdateState>,
     _form_subscription: Option<Subscription>,
@@ -623,18 +553,18 @@ impl Workspace {
         .detach();
     }
 
-    /// What the sidebar is already showing about an update, if anything.
+    /// What the top bar is already showing about an update, if anything.
     fn update_in_progress(&self) -> Option<String> {
         Some(match self.update_state.as_ref()? {
             UpdateState::Available { version, .. } => {
-                format!("TupleBase {version} is available. Update from the sidebar.")
+                format!("TupleBase {version} is available. Update from the top bar.")
             }
             UpdateState::Downloading { version, .. } => {
                 format!("Downloading TupleBase {version}…")
             }
             UpdateState::Ready { download, .. } => {
                 format!(
-                    "TupleBase {} is ready. Restart from the sidebar.",
+                    "TupleBase {} is ready. Restart from the top bar.",
                     download.version
                 )
             }
@@ -649,7 +579,7 @@ impl Workspace {
     ) {
         let note = match result {
             Ok(Some(version)) => {
-                let note = format!("TupleBase {version} is available. Update from the sidebar.");
+                let note = format!("TupleBase {version} is available. Update from the top bar.");
                 if self.update_state.is_none() {
                     self.update_state = Some(UpdateState::Available {
                         version,
@@ -751,151 +681,75 @@ impl Workspace {
         }
     }
 
-    fn begin_folder_edit(
+    /// Creates a folder named `name` in `parent`, or gives the folder `renaming` that
+    /// name. A rename gives back the folder's old and new path.
+    fn name_folder(
         &mut self,
-        parent: String,
-        renaming: Option<String>,
-        window: &mut Window,
+        parent: &str,
+        renaming: Option<&str>,
+        name: &str,
         cx: &mut Context<Self>,
-    ) {
-        self.collapsed.remove(&parent);
-        let value = renaming
-            .as_deref()
-            .map(folder_name)
-            .unwrap_or_default()
-            .to_owned();
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Folder name")
-                .default_value(value)
-        });
-        input.update(cx, |state, cx| state.focus(window, cx));
-        self._folder_edit_subscription =
-            Some(
-                cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                        this.commit_folder_edit(cx);
-                    }
-                }),
-            );
-        self.folder_edit = Some(FolderEdit {
-            parent,
-            renaming,
-            input,
-        });
-        cx.notify();
-    }
-
-    fn cancel_folder_edit(&mut self, cx: &mut Context<Self>) {
-        self.folder_edit = None;
-        self._folder_edit_subscription = None;
-        cx.notify();
-    }
-
-    fn commit_folder_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.folder_edit.take() else {
-            return;
-        };
-        cx.notify();
-        let name = edit.input.read(cx).value().trim().to_string();
-        let unchanged = edit
-            .renaming
-            .as_deref()
-            .is_some_and(|old| folder_name(old) == name);
-        if name.is_empty() || unchanged {
-            return;
-        }
-        let result = match &edit.renaming {
+    ) -> Option<(String, String)> {
+        let result = match renaming {
             Some(old) => self
                 .config
-                .rename_folder(old, &name)
-                .map(|new| Some((old.clone(), new))),
-            None => self.config.add_folder(&edit.parent, &name).map(|_| None),
+                .rename_folder(old, name)
+                .map(|new| Some((old.to_owned(), new))),
+            None => self.config.add_folder(parent, name).map(|_| None),
         };
         match result {
             Ok(renamed) => {
-                if let Some((old, new)) = renamed {
-                    self.rebase_collapsed(&old, &new);
-                }
                 self.save_config(cx);
+                self.sync_tabs(cx);
+                cx.notify();
+                renamed
             }
-            Err(e) => self.report(Status::Failed(format!("{e:#}").into()), cx),
+            Err(e) => {
+                self.report(Status::Failed(format!("{e:#}").into()), cx);
+                None
+            }
         }
-        self.sync_tabs(cx);
-    }
-
-    /// Keeps folders closed after they, or a folder above them, get a new path.
-    fn rebase_collapsed(&mut self, old: &str, new: &str) {
-        self.collapsed = self
-            .collapsed
-            .drain()
-            .map(|path| rebase_folder(&path, old, new).unwrap_or(path))
-            .collect();
     }
 
     fn remove_folder(&mut self, folder: &str, cx: &mut Context<Self>) {
         self.config.remove_folder(folder);
-        self.collapsed.remove(folder);
         self.save_config(cx);
         self.sync_tabs(cx);
         cx.notify();
     }
 
-    fn confirm_remove_folder(
+    /// Moves the folder at `path` into `new_parent`; gives back its new path.
+    fn move_folder(
         &mut self,
-        folder: String,
-        window: &mut Window,
+        path: &str,
+        new_parent: &str,
         cx: &mut Context<Self>,
-    ) {
-        let is_inside = |path: &str| path != folder && rebase_folder(path, &folder, "").is_some();
-        let has_contents = self.config.folders().iter().any(|f| is_inside(f))
-            || self
-                .config
-                .connections
-                .iter()
-                .any(|c| c.folder == folder || is_inside(&c.folder));
-        if !has_contents {
-            self.remove_folder(&folder, cx);
-            return;
-        }
-        let this = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let this = this.clone();
-            let name = folder.clone();
-            alert
-                .title(format!("Delete folder “{}”?", folder_name(&folder)))
-                .description("What's inside moves up one level. No connections are deleted.")
-                .confirm()
-                .footer(dialogs::confirm_footer("Delete folder"))
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.remove_folder(&name, cx))
-                        .ok();
-                    true
-                })
-        });
-    }
-
-    fn move_folder(&mut self, path: &str, new_parent: &str, cx: &mut Context<Self>) {
-        match self.config.move_folder(path, new_parent) {
-            Ok(None) => return,
+    ) -> Option<String> {
+        let moved = match self.config.move_folder(path, new_parent) {
+            Ok(None) => return None,
             Ok(Some(new_path)) => {
-                self.rebase_collapsed(path, &new_path);
-                self.collapsed.remove(new_parent);
                 self.save_config(cx);
                 self.sync_tabs(cx);
+                Some(new_path)
             }
-            Err(e) => self.report(Status::Failed(format!("{e:#}").into()), cx),
-        }
+            Err(e) => {
+                self.report(Status::Failed(format!("{e:#}").into()), cx);
+                None
+            }
+        };
         cx.notify();
+        moved
     }
 
-    fn move_connection(&mut self, name: &str, folder: &str, cx: &mut Context<Self>) {
-        if self.config.move_connection(name, folder) {
-            self.collapsed.remove(folder);
+    /// Whether the connection moved.
+    fn move_connection(&mut self, name: &str, folder: &str, cx: &mut Context<Self>) -> bool {
+        let moved = self.config.move_connection(name, folder);
+        if moved {
             self.save_config(cx);
             self.sync_tabs(cx);
             cx.notify();
         }
+        moved
     }
 
     fn with_config(
@@ -906,6 +760,7 @@ impl Workspace {
     ) -> Self {
         theme::set_font_size(config.font_size, cx);
         let db = Arc::new(Db::new());
+        let workspace = cx.weak_entity();
         let chat = cx.new(|cx| ChatPanel::new(window, cx));
         let _chat_subscription =
             cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
@@ -948,13 +803,8 @@ impl Workspace {
             session_saves: Saves::default(),
             config_saves: Saves::default(),
             status,
-            tree_focus: cx.focus_handle(),
-            tree_scroll: ScrollHandle::new(),
-            cursor: None,
-            tree_focused: false,
-            folder_edit: None,
-            _folder_edit_subscription: None,
-            collapsed: HashSet::new(),
+            connections: cx.new(|cx| ConnectionsDialog::new(workspace, cx)),
+            connections_open: false,
             update_state: None,
             _form_subscription: None,
             kept_note: None,
@@ -972,6 +822,24 @@ impl Workspace {
     /// The tab on screen.
     fn active_tab(&self) -> Option<&Entity<ConnectionTab>> {
         self.tab(self.active.as_deref()?)
+    }
+
+    /// Shows `name`'s tab.
+    fn activate_tab(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_index(name).is_some() {
+            self.form = None;
+            self.active = Some(name.to_owned());
+            self.focus_active_editor(window, cx);
+            cx.notify();
+        }
+    }
+
+    /// Gives the keys to the SQL editor of the tab on screen, ready to type in.
+    fn focus_active_editor(&self, window: &mut Window, cx: &mut App) {
+        if let Some(tab) = self.active_tab() {
+            let editor = tab.read(cx).editor.clone();
+            editor.update(cx, |editor, cx| editor.focus(window, cx));
+        }
     }
 
     /// A click on a connection, or Enter on it in the tree: shows its tab, opening one
@@ -1051,7 +919,6 @@ impl Workspace {
                 self.edit_connection(conn, window, cx);
             }
             TabEvent::Delete => self.confirm_delete(name, window, cx),
-            TabEvent::Close => self.close_tab(name, cx),
             TabEvent::Connected(result) => {
                 self.refresh_connected(cx);
                 let status = self.connected_status(&name, result);
@@ -1236,7 +1103,8 @@ impl Workspace {
             }
         }
         self.sync_tabs(cx);
-        self.collapsed.remove(&folder);
+        self.connections
+            .update(cx, |connections, _| connections.reveal(&folder));
         match self.tab(&name).cloned() {
             // Its new settings take effect: it connects again.
             Some(tab) => {
@@ -1423,78 +1291,6 @@ impl Workspace {
         }
     }
 
-    /// Every row currently showing in the tree, top to bottom.
-    fn visible_rows(&self) -> Vec<TreeRow> {
-        fn walk(node: &FolderNode<'_>, collapsed: &HashSet<String>, rows: &mut Vec<TreeRow>) {
-            for folder in &node.folders {
-                rows.push(TreeRow::Folder(folder.path.clone()));
-                if !collapsed.contains(&folder.path) {
-                    walk(folder, collapsed, rows);
-                }
-            }
-            for conn in &node.connections {
-                rows.push(TreeRow::Connection(conn.name.clone()));
-            }
-        }
-        let mut rows = Vec::new();
-        walk(&self.config.tree(), &self.collapsed, &mut rows);
-        rows
-    }
-
-    fn move_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let rows = self.visible_rows();
-        let current = self
-            .cursor
-            .as_ref()
-            .and_then(|cursor| rows.iter().position(|row| row == cursor));
-        let Some(next) = tree_nav::step(rows.len(), current, delta) else {
-            return;
-        };
-        self.tree_scroll.scroll_to_item(next);
-        self.cursor = Some(rows[next].clone());
-        cx.notify();
-    }
-
-    /// Left arrow: closes an open folder, otherwise jumps to the folder above.
-    fn tree_collapse(&mut self, cx: &mut Context<Self>) {
-        let parent = match self.cursor.clone() {
-            Some(TreeRow::Folder(path)) if !self.collapsed.contains(&path) => {
-                self.collapsed.insert(path);
-                cx.notify();
-                return;
-            }
-            Some(TreeRow::Folder(path)) => parent_of(&path).to_owned(),
-            Some(TreeRow::Connection(name)) => self
-                .config
-                .find(&name)
-                .map(|c| c.folder.clone())
-                .unwrap_or_default(),
-            None => return,
-        };
-        if !parent.is_empty() {
-            self.cursor = Some(TreeRow::Folder(parent));
-            cx.notify();
-        }
-    }
-
-    /// Right arrow: opens a closed folder, otherwise moves into it or opens the connection.
-    fn tree_expand(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.cursor.clone() {
-            Some(TreeRow::Folder(path)) if self.collapsed.remove(&path) => cx.notify(),
-            Some(TreeRow::Folder(_)) => self.move_cursor(1, cx),
-            Some(TreeRow::Connection(name)) => self.open_connection(name, window, cx),
-            None => {}
-        }
-    }
-
-    fn tree_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.cursor.clone() {
-            Some(TreeRow::Folder(path)) => self.toggle_folder(path, cx),
-            Some(TreeRow::Connection(name)) => self.open_connection(name, window, cx),
-            None => {}
-        }
-    }
-
     /// Downloads an update while the app stays open. Development builds go to the
     /// download page instead, so a release can't overwrite them.
     fn download_update(&mut self, version: String, cx: &mut Context<Self>) {
@@ -1589,203 +1385,6 @@ impl Workspace {
         }
     }
 
-    fn render_update(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (danger, muted, track, fill) = {
-            let theme = cx.theme();
-            (
-                theme.danger,
-                theme.muted_foreground,
-                theme.border,
-                theme.primary,
-            )
-        };
-        Some(match self.update_state.as_ref()? {
-            UpdateState::Available { version, error } => {
-                let label = format!("Update to {version}");
-                let version = version.clone();
-                v_flex()
-                    .gap_1()
-                    .when_some(error.clone(), |el, error| {
-                        el.child(div().text_sm().text_color(danger).child(error))
-                    })
-                    .child(
-                        Button::new("download-update")
-                            .cursor_pointer()
-                            .primary()
-                            .small()
-                            .label(label)
-                            .tooltip("Downloads in the background while you keep working")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.download_update(version.clone(), cx);
-                            })),
-                    )
-                    .into_any_element()
-            }
-            UpdateState::Downloading { version, percent } => {
-                let percent = percent.load(Ordering::Relaxed);
-                let label = if percent == 0 {
-                    format!("Downloading {version}…")
-                } else {
-                    format!("Downloading {version}… {percent}%")
-                };
-                v_flex()
-                    .id("update-progress")
-                    .test_support()
-                    .gap_1()
-                    .child(div().text_sm().text_color(muted).child(label))
-                    .child(
-                        div().h(px(4.)).w_full().rounded_full().bg(track).child(
-                            div()
-                                .h_full()
-                                .rounded_full()
-                                .bg(fill)
-                                .w(relative(f32::from(percent) / 100.)),
-                        ),
-                    )
-                    .into_any_element()
-            }
-            UpdateState::Ready { download, .. } => Button::new("restart-to-update")
-                .cursor_pointer()
-                .primary()
-                .small()
-                .label("Restart to update")
-                .tooltip(format!(
-                    "Closes TupleBase, installs {} and reopens",
-                    download.version
-                ))
-                .on_click(cx.listener(|this, _, _, cx| this.restart_to_update(cx)))
-                .into_any_element(),
-        })
-    }
-
-    fn toggle_folder(&mut self, folder: String, cx: &mut Context<Self>) {
-        if !self.collapsed.remove(&folder) {
-            self.collapsed.insert(folder);
-        }
-        cx.notify();
-    }
-
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (border, bg) = (theme.sidebar_border, theme.sidebar);
-        v_flex()
-            .size_full()
-            .bg(bg)
-            .when(cfg!(target_os = "macos"), |el| {
-                el.child(drag_area().w_full().h(px(WINDOW_TOP_STRIP)).flex_none())
-            })
-            .child(
-                h_flex()
-                    .flex_none()
-                    .h(rems(2.5))
-                    .pl_3()
-                    .pr_1p5()
-                    .justify_between()
-                    .child(div().text_sm().font_semibold().child("Connections"))
-                    .child(
-                        h_flex()
-                            .child(
-                                Button::new("add-folder")
-                                    .cursor_pointer()
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::default().data(NEW_FOLDER_ICON))
-                                    .tooltip("New folder")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.begin_folder_edit(String::new(), None, window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("add-connection")
-                                    .cursor_pointer()
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Plus)
-                                    .tooltip("New connection")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_form(None, String::new(), window, cx);
-                                    })),
-                            ),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .id("connections")
-                    .track_focus(&self.tree_focus)
-                    // The folder name field sits inside the tree and passes on keys it has
-                    // no use for, such as Enter; they must not reach the tree.
-                    .when(self.folder_edit.is_none(), |el| {
-                        el.key_context(tree_nav::CONTEXT)
-                    })
-                    .track_scroll(&self.tree_scroll)
-                    .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.move_cursor(-1, cx)))
-                    .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.move_cursor(1, cx)))
-                    .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.tree_collapse(cx)))
-                    .on_action(
-                        cx.listener(|this, _: &TreeExpand, window, cx| {
-                            this.tree_expand(window, cx)
-                        }),
-                    )
-                    .on_action(
-                        cx.listener(|this, _: &TreeOpen, window, cx| this.tree_open(window, cx)),
-                    )
-                    .flex_1()
-                    .min_h_0()
-                    .px_2()
-                    .gap_px()
-                    .overflow_y_scroll()
-                    .on_drop(cx.listener(|this, dragged: &DraggedConnection, _, cx| {
-                        this.move_connection(&dragged.name, "", cx);
-                    }))
-                    .on_drop(cx.listener(|this, dragged: &DraggedFolder, _, cx| {
-                        this.move_folder(&dragged.path, "", cx);
-                    }))
-                    .children(self.render_tree(cx)),
-            )
-            .child(
-                v_flex()
-                    .p_2()
-                    .gap_2()
-                    .border_t_1()
-                    .border_color(border)
-                    .children(self.render_update(cx))
-                    .child(
-                        // Wraps when the sidebar is narrow, rather than running past its edge.
-                        h_flex()
-                            .flex_wrap()
-                            .gap_y_1()
-                            .justify_between()
-                            .child(
-                                Button::new("open-settings")
-                                    .cursor_pointer()
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::Settings)
-                                    .label("Settings")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_settings(SettingsPage::General, window, cx);
-                                    })),
-                            )
-                            .child(
-                                h_flex()
-                                    .child(
-                                        Button::new("toggle-chat")
-                                            .cursor_pointer()
-                                            .ghost()
-                                            .small()
-                                            .selected(self.chat_open)
-                                            .icon(logos::agent())
-                                            .tooltip("Ask Claude Code about your databases")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.toggle_chat(window, cx);
-                                            })),
-                                    )
-                                    .child(self.render_mcp_status(cx)),
-                            ),
-                    ),
-            )
-    }
-
     fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.chat_open = !self.chat_open;
         if self.chat_open {
@@ -1829,438 +1428,11 @@ impl Workspace {
         });
     }
 
-    fn render_mcp_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let dot = if self.mcp_servers.is_empty() {
-            cx.theme().muted_foreground
-        } else {
-            cx.theme().success
-        };
-        Button::new("mcp-status")
-            .cursor_pointer()
-            .ghost()
-            .small()
-            .tooltip(mcp_status_text(&self.mcp_servers))
-            .child(
-                h_flex()
-                    .gap_1p5()
-                    .child(div().size(px(8.)).rounded_full().bg(dot))
-                    .child("MCP"),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_settings(SettingsPage::Agents, window, cx);
-            }))
-    }
-
-    fn is_cursor(&self, row: &TreeRow) -> bool {
-        self.tree_focused && self.cursor.as_ref() == Some(row)
-    }
-
-    fn render_tree(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let tree = self.config.tree();
-        let mut rows = Vec::new();
-        self.render_new_folder_field("", 0, &mut rows, cx);
-        self.render_folder_contents(&tree, 0, &mut rows, cx);
-        rows
-    }
-
-    fn render_new_folder_field(
-        &self,
-        parent: &str,
-        depth: usize,
-        rows: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        let edit = self.folder_edit.as_ref();
-        if let Some(edit) = edit.filter(|e| e.renaming.is_none() && e.parent == parent) {
-            rows.push(self.render_folder_input(edit, depth, cx).into_any_element());
-        }
-    }
-
-    /// Subfolders first, then the connections directly inside.
-    fn render_folder_contents(
-        &self,
-        node: &FolderNode<'_>,
-        depth: usize,
-        rows: &mut Vec<AnyElement>,
-        cx: &mut Context<Self>,
-    ) {
-        for folder in &node.folders {
-            let renaming = self
-                .folder_edit
-                .as_ref()
-                .filter(|e| e.renaming.as_deref() == Some(folder.path.as_str()));
-            rows.push(match renaming {
-                Some(edit) => self.render_folder_input(edit, depth, cx).into_any_element(),
-                None => self
-                    .render_folder(&folder.path, folder.connection_count(), depth, cx)
-                    .into_any_element(),
-            });
-            if !self.collapsed.contains(&folder.path) {
-                self.render_new_folder_field(&folder.path, depth + 1, rows, cx);
-                self.render_folder_contents(folder, depth + 1, rows, cx);
-            }
-        }
-        for conn in &node.connections {
-            rows.push(self.render_connection(conn, depth, cx).into_any_element());
-        }
-    }
-
-    fn render_folder_input(
-        &self,
-        edit: &FolderEdit,
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .when(depth == 0, |d| d.mt_2())
-            .pl(px(4. + depth as f32 * TREE_INDENT))
-            .pr_1()
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.commit_folder_edit(cx)))
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" {
-                    this.cancel_folder_edit(cx);
-                }
-            }))
-            .child(Input::new(&edit.input).id("folder-name").small())
-    }
-
-    fn render_folder(
-        &self,
-        folder: &str,
-        count: usize,
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let (muted, hover, radius, ring) = (
-            theme.muted_foreground,
-            theme.sidebar_accent,
-            theme.radius,
-            theme.ring,
-        );
-        let chevron = if self.collapsed.contains(folder) {
-            IconName::ChevronRight
-        } else {
-            IconName::ChevronDown
-        };
-        let row_group = SharedString::from(format!("folder-row-{folder}"));
-        let path = folder.to_owned();
-        let action = |id: String, tooltip: &'static str| {
-            Button::new(SharedString::from(id))
-                .cursor_pointer()
-                .ghost()
-                .xsmall()
-                .tooltip(tooltip)
-        };
-        let (add_in, new_in, rename, remove, toggle, into_connection, into_folder) = (
-            path.clone(),
-            path.clone(),
-            path.clone(),
-            path.clone(),
-            path.clone(),
-            path.clone(),
-            path.clone(),
-        );
-        h_flex()
-            .id(SharedString::from(format!("folder-{folder}")))
-            .test_support()
-            .border_1()
-            .border_color(if self.is_cursor(&TreeRow::Folder(folder.to_owned())) {
-                ring
-            } else {
-                transparent_black()
-            })
-            .group(row_group.clone())
-            .relative()
-            .when(depth == 0, |d| d.mt_2())
-            .gap_1p5()
-            .pl(px(4. + depth as f32 * TREE_INDENT))
-            .pr_1()
-            .h(px(30.))
-            .rounded(radius)
-            .cursor_pointer()
-            .hover(move |s| s.bg(hover))
-            .on_drag(DraggedFolder { path: path.clone() }, |dragged, _, _, cx| {
-                cx.new(|_| dragged.clone())
-            })
-            .drag_over::<DraggedConnection>(move |s, _, _, _| s.bg(hover))
-            .drag_over::<DraggedFolder>(move |s, _, _, _| s.bg(hover))
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedConnection, _, cx| {
-                    cx.stop_propagation();
-                    this.move_connection(&dragged.name, &into_connection, cx);
-                }),
-            )
-            .on_drop(cx.listener(move |this, dragged: &DraggedFolder, _, cx| {
-                cx.stop_propagation();
-                this.move_folder(&dragged.path, &into_folder, cx);
-            }))
-            .child(Icon::new(chevron).xsmall().text_color(muted))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .font_medium()
-                    .child(folder_name(folder).to_owned()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted)
-                    .pr_1()
-                    .group_hover(row_group.clone(), |s| s.invisible())
-                    .child(count.to_string()),
-            )
-            .child(
-                h_flex()
-                    .absolute()
-                    .right_0()
-                    .invisible()
-                    .group_hover(row_group, |s| s.visible())
-                    .child(
-                        action(format!("add-in-{folder}"), "New connection in this folder")
-                            .icon(IconName::Plus)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.open_form(None, add_in.clone(), window, cx);
-                            })),
-                    )
-                    .child(
-                        action(format!("add-folder-in-{folder}"), "New folder inside")
-                            .icon(Icon::default().data(NEW_FOLDER_ICON))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.begin_folder_edit(new_in.clone(), None, window, cx);
-                            })),
-                    )
-                    .child(
-                        action(format!("rename-{folder}"), "Rename folder")
-                            .icon(Icon::default().data(RENAME_ICON))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.begin_folder_edit(
-                                    String::new(),
-                                    Some(rename.clone()),
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                    .child(
-                        action(format!("remove-{folder}"), "Delete folder")
-                            .icon(Icon::default().data(DELETE_ICON))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.confirm_remove_folder(remove.clone(), window, cx);
-                            })),
-                    ),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.cursor = Some(TreeRow::Folder(toggle.clone()));
-                this.tree_focus.focus(window, cx);
-                this.toggle_folder(toggle.clone(), cx);
-            }))
-            .context_menu(self.folder_menu(folder, cx))
-    }
-
-    fn render_connection(
-        &self,
-        conn: &Connection,
-        depth: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let (muted, active, radius, ring) = (
-            theme.muted_foreground,
-            theme.sidebar_accent,
-            theme.radius,
-            theme.ring,
-        );
-        let selected = self.active.as_deref() == Some(conn.name.as_str());
-        let connected = self.connected.contains(&conn.name);
-        let success = cx.theme().success;
-        let row_group = SharedString::from(format!("conn-row-{}", conn.name));
-        let name = conn.name.clone();
-        let folder = conn.folder.clone();
-        let closing = conn.name.clone();
-        h_flex()
-            .id(SharedString::from(format!("conn-{}", conn.name)))
-            .test_support()
-            .group(row_group.clone())
-            .border_1()
-            .border_color(if self.is_cursor(&TreeRow::Connection(conn.name.clone())) {
-                ring
-            } else {
-                transparent_black()
-            })
-            .relative()
-            .h(px(32.))
-            .gap_2()
-            .pr_2()
-            .pl(px(8. + depth as f32 * TREE_INDENT))
-            .rounded(radius)
-            .cursor_pointer()
-            .when(selected, |d| d.bg(active))
-            .hover(move |s| s.bg(active))
-            .child(logos::icon(conn.adapter, 18.))
-            .child(
-                div()
-                    .max_w(px(170.))
-                    .truncate()
-                    .text_sm()
-                    .child(conn.name.clone()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(conn.location()),
-            )
-            .when(connected, |row| {
-                row.child(
-                    div()
-                        .id(SharedString::from(format!("conn-status-{}", conn.name)))
-                        .test_support()
-                        .flex_none()
-                        .size(px(8.))
-                        .rounded_full()
-                        .bg(success)
-                        .group_hover(row_group.clone(), |s| s.invisible()),
-                )
-                .child(
-                    h_flex()
-                        .absolute()
-                        .right_1()
-                        .invisible()
-                        .group_hover(row_group, |s| s.visible())
-                        .child(
-                            Button::new(SharedString::from(format!("disconnect-{}", conn.name)))
-                                .cursor_pointer()
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::default().data(UNPLUG_ICON))
-                                .tooltip("Disconnect")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.close_tab(closing.clone(), cx);
-                                })),
-                        ),
-                )
-            })
-            .on_drag(
-                DraggedConnection {
-                    name: conn.name.clone(),
-                    adapter: conn.adapter,
-                },
-                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
-            )
-            .on_drop(
-                cx.listener(move |this, dragged: &DraggedConnection, _, cx| {
-                    cx.stop_propagation();
-                    this.move_connection(&dragged.name, &folder, cx);
-                }),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.cursor = Some(TreeRow::Connection(name.clone()));
-                this.tree_focus.focus(window, cx);
-                this.open_connection(name.clone(), window, cx);
-            }))
-            .context_menu(self.connection_menu(conn, cx))
-    }
-
-    fn connection_menu(
-        &self,
-        conn: &Connection,
-        cx: &Context<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
-    {
-        let this = cx.entity().downgrade();
-        let conn = conn.clone();
-        let connected = self.connected.contains(&conn.name);
-        move |menu, _, _| {
-            let (edited, name, closing) = (conn.clone(), conn.name.clone(), conn.name.clone());
-            let menu = if connected {
-                menu.item(
-                    PopupMenuItem::new("Disconnect")
-                        .on_click(menu_click(&this, move |this, _, cx| {
-                            this.close_tab(closing.clone(), cx)
-                        })),
-                )
-                .separator()
-            } else {
-                menu
-            };
-            menu.item(
-                PopupMenuItem::new("Edit connection")
-                    .on_click(menu_click(&this, move |this, window, cx| {
-                        this.edit_connection(edited.clone(), window, cx)
-                    })),
-            )
-            .separator()
-            .item(
-                // "connection", so it's never mistaken for dropping the database.
-                PopupMenuItem::new("Delete connection")
-                    .on_click(menu_click(&this, move |this, window, cx| {
-                        this.confirm_delete(name.clone(), window, cx)
-                    })),
-            )
-        }
-    }
-
-    fn folder_menu(
-        &self,
-        folder: &str,
-        cx: &Context<Self>,
-    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
-    {
-        let this = cx.entity().downgrade();
-        let folder = folder.to_owned();
-        move |menu, _, _| {
-            let (add_in, new_in, rename, remove) = (
-                folder.clone(),
-                folder.clone(),
-                folder.clone(),
-                folder.clone(),
-            );
-            menu.item(
-                PopupMenuItem::new("New connection")
-                    .on_click(menu_click(&this, move |this, window, cx| {
-                        this.open_form(None, add_in.clone(), window, cx)
-                    })),
-            )
-            .item(
-                PopupMenuItem::new("New folder").on_click(menu_click(
-                    &this,
-                    move |this, window, cx| {
-                        this.begin_folder_edit(new_in.clone(), None, window, cx)
-                    },
-                )),
-            )
-            .separator()
-            .item(PopupMenuItem::new("Rename folder").on_click(menu_click(
-                &this,
-                move |this, window, cx| {
-                    this.begin_folder_edit(String::new(), Some(rename.clone()), window, cx);
-                },
-            )))
-            .item(
-                PopupMenuItem::new("Delete folder")
-                    .on_click(menu_click(&this, move |this, window, cx| {
-                        this.confirm_remove_folder(remove.clone(), window, cx)
-                    })),
-            )
-        }
-    }
-
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // A failure, or where an unreadable connections file was kept: both matter most
         // here, when no connections could be shown.
         let failed = matches!(self.status, Status::Failed(_)) || self.kept_note.is_some();
+        let none_saved = self.config.connections.is_empty();
         v_flex()
             .size_full()
             .child(
@@ -2270,21 +1442,43 @@ impl Workspace {
                     .justify_center()
                     .gap_4()
                     .child(logos::brand(72.))
-                    .child(div().text_color(cx.theme().muted_foreground).child(
-                        if self.config.connections.is_empty() {
-                            "Add a connection to start querying."
-                        } else {
-                            "Choose a connection from the sidebar."
-                        },
-                    ))
                     .child(
-                        Button::new("empty-add")
-                            .cursor_pointer()
-                            .primary()
-                            .label("Add connection")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_form(None, String::new(), window, cx)
-                            })),
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if none_saved {
+                                "Add a connection to start querying."
+                            } else {
+                                "Open a connection to start querying."
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when(!none_saved, |el| {
+                                el.child(
+                                    Button::new("empty-open")
+                                        .cursor_pointer()
+                                        .primary()
+                                        .label("Open a connection")
+                                        .when_some(
+                                            Keystroke::parse(CONNECTIONS_KEY).ok(),
+                                            |button, key| button.child(Kbd::new(key)),
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_connections(window, cx)
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("empty-add")
+                                    .cursor_pointer()
+                                    .when(none_saved, |button| button.primary())
+                                    .when(!none_saved, |button| button.outline())
+                                    .label("Add connection")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_form(None, String::new(), window, cx)
+                                    })),
+                            ),
                     ),
             )
             .when(failed, |el| {
@@ -2293,28 +1487,17 @@ impl Workspace {
     }
 }
 
-/// Empty region that moves the window, since there is no title bar. It must stay empty:
-/// a button inside it would start a window move instead of a click.
-fn drag_area() -> Div {
-    div()
-        .window_control_area(WindowControlArea::Drag)
-        .on_mouse_down(MouseButton::Left, |event, window, _| {
-            if event.click_count == 2 {
-                window.titlebar_double_click();
-            } else {
-                window.start_window_move();
-            }
-        })
-}
-
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.tree_focused = self.tree_focus.is_focused(window);
-        let has_toolbar = self.form.is_none() && self.active_tab().is_some();
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shown = self.active_tab().filter(|_| self.form.is_none()).cloned();
+        let color = shown.as_ref().map(|tab| {
+            let conn = tab.read(cx).connection();
+            logos::color_of(conn.adapter, &conn.color)
+        });
         let main = if let Some(form) = self.form.clone() {
             div().size_full().child(form).into_any_element()
-        } else if let Some(tab) = self.active_tab() {
-            tab.clone().into_any_element()
+        } else if let Some(tab) = shown {
+            tab.into_any_element()
         } else {
             self.render_empty(cx).into_any_element()
         };
@@ -2324,6 +1507,18 @@ impl Render for Workspace {
             .text_color(cx.theme().foreground)
             .when(cfg!(not(target_os = "macos")), |el| {
                 el.child(TitleBar::new().child(self.app_menu.clone()))
+            })
+            .child(self.render_top_bar(cx))
+            .when_some(color, |el, color| {
+                el.child(
+                    div()
+                        .id("connection-color")
+                        .test_support()
+                        .w_full()
+                        .h(px(3.))
+                        .flex_none()
+                        .bg(color),
+                )
             })
             .child(
                 div()
@@ -2341,47 +1536,17 @@ impl Render for Workspace {
                     }))
                     .child(
                         h_resizable("workspace-panels")
-                            .on_resize(
-                                self.remember_panel_sizes(&[Panel::Sidebar, Panel::Chat], cx),
-                            )
-                            .child(
-                                self.sized_panel(Panel::Sidebar)
-                                    .child(self.render_sidebar(cx)),
-                            )
+                            .on_resize(self.remember_panel_sizes(&[Panel::Chat], cx))
                             .child(
                                 resizable_panel()
                                     .size_range(px(MAIN_MIN_WIDTH)..Pixels::MAX)
-                                    .child(
-                                        div().relative().size_full().min_w_0().child(main).when(
-                                            !has_toolbar,
-                                            |el| {
-                                                el.child(
-                                                    drag_area()
-                                                        .absolute()
-                                                        .top_0()
-                                                        .left_0()
-                                                        .w_full()
-                                                        .h(px(WINDOW_TOP_STRIP)),
-                                                )
-                                            },
-                                        ),
-                                    ),
+                                    .child(div().size_full().min_w_0().child(main)),
                             )
                             .when(self.chat_open, |el| {
                                 el.child(self.sized_panel(Panel::Chat).child(self.chat.clone()))
                             }),
                     ),
             )
-    }
-}
-
-fn menu_click(
-    this: &WeakEntity<Workspace>,
-    run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
-    let this = this.clone();
-    move |_, window, cx| {
-        this.update(cx, |this, cx| run(this, window, cx)).ok();
     }
 }
 
@@ -2425,11 +1590,13 @@ fn mcp_status_text(servers: &[Option<String>]) -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
+    use super::connections::{ConnectionsDialog, TreeRow};
     use super::{
         About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, ConnectionTab,
-        OpenSettings, SettingsPage, Status, TreeRow, UpdateState, Workspace, bind_keys,
+        OpenSettings, SettingsPage, Status, UpdateState, Workspace, bind_keys,
         register_menu_actions,
     };
+    use crate::connection_tab::Light;
     use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -2603,42 +1770,51 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn right_clicking_a_connection_edits_it_without_selecting_it(cx: &mut TestAppContext) {
+    fn right_clicking_a_connection_edits_it_without_opening_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
         window_action(handle, cx, |window, cx| window.click(0usize, cx));
-        cx.update(|cx| {
+        window_action(handle, cx, |window, cx| {
             let this = workspace.read(cx);
             assert_eq!(this.form.as_ref().unwrap().read(cx).editing(), Some("db"));
             assert!(this.tabs.is_empty());
+            // The form shows in the window, not under the dialog.
+            assert!(!window.has_active_dialog(cx));
         });
     }
 
     #[gpui_kit::test]
     fn right_clicking_a_connection_can_delete_it_after_asking(cx: &mut TestAppContext) {
         let (handle, _) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
         window_action(handle, cx, |window, cx| window.click(2usize, cx));
         window_action(handle, cx, |window, cx| {
-            assert!(window.has_active_dialog(cx));
+            assert!(alert_open(window));
             // Its Cancel still reaches the dialog after the menu took focus.
             window.click("cancel", cx);
         });
-        window_action(handle, cx, |window, cx| {
-            assert!(!window.has_active_dialog(cx));
+        window_action(handle, cx, |window, _| {
+            assert!(!alert_open(window));
+            // The Connections dialog it was asked from stays.
+            assert!(window.find("conn-db").visible());
         });
     }
 
     #[gpui_kit::test]
     fn right_clicking_a_folder_can_delete_it_after_asking(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.right_click("folder-Production", cx);
         });
         window_action(handle, cx, |window, cx| window.click(4usize, cx));
         window_action(handle, cx, |window, cx| window.click("ok", cx));
-        window_action(handle, cx, |window, cx| {
-            assert!(!window.has_active_dialog(cx));
+        window_action(handle, cx, |window, _| {
+            assert!(!alert_open(window));
+            assert!(window.try_find("folder-Production").is_none());
+            assert!(window.find("conn-db").visible());
         });
         cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
@@ -2646,11 +1822,14 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn right_clicking_a_folder_renames_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.right_click("folder-Production", cx);
         });
         window_action(handle, cx, |window, cx| window.click(3usize, cx));
-        cx.update(|cx| assert!(workspace.read(cx).folder_edit.is_some()));
+        assert!(picker(&workspace, cx, |picker| picker
+            .folder_edit
+            .is_some()));
     }
 
     #[gpui_kit::test]
@@ -2679,6 +1858,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn deleting_a_connection_closes_its_edit_form(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
         window_action(handle, cx, |window, cx| window.click(0usize, cx));
         cx.update(|cx| {
@@ -2690,6 +1870,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn the_light_shows_only_on_connected_connections(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("conn-status-db").is_none());
         });
@@ -2704,8 +1885,45 @@ pub(crate) mod tests {
         });
     }
 
+    #[test]
+    fn the_light_says_connecting_then_connected_or_off() {
+        use crate::connection_tab::light;
+        assert_eq!(light(true, false), Light::Connecting);
+        // Checking a pool that is already open.
+        assert_eq!(light(true, true), Light::Connecting);
+        assert_eq!(light(false, true), Light::Connected);
+        assert_eq!(light(false, false), Light::Off);
+    }
+
     #[gpui_kit::test]
-    fn disconnecting_the_open_connection_leaves_it(cx: &mut TestAppContext) {
+    fn a_tab_shows_its_light(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| this.open_connection("db".into(), window, cx));
+        });
+        let tab = active(&workspace, cx);
+        let light = |cx: &mut TestAppContext| tab.read_with(cx, |tab, _| tab.light());
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("tab-status-db").visible());
+        });
+        assert_eq!(light(cx), Light::Connecting);
+        // Connecting failed: the status line says why, and the light goes out.
+        tab.update(cx, |tab, cx| {
+            tab.connecting = false;
+            tab.set_status(Status::Failed("refused".into()), cx);
+        });
+        assert_eq!(light(cx), Light::Off);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.connected.insert("db".into());
+                this.show_connected_tabs(cx);
+            });
+        });
+        assert_eq!(light(cx), Light::Connected);
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_open_tab_disconnects_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         open_tab(handle, &workspace, "db", cx);
         cx.update(|cx| {
@@ -2715,8 +1933,12 @@ pub(crate) mod tests {
                 cx.notify();
             });
         });
-        window_action(handle, cx, |_, _| {});
-        window_action(handle, cx, |window, cx| window.click("disconnect", cx));
+        window_action(handle, cx, |window, cx| window.click("tab-close-db", cx));
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("tab-db").is_none());
+            assert!(window.try_find("sql-editor").is_none());
+            assert!(window.find("empty-open").visible());
+        });
         cx.update(|cx| {
             let this = workspace.read(cx);
             assert_eq!(this.active, None);
@@ -2726,50 +1948,54 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn disconnecting_another_connection_keeps_the_open_one(cx: &mut TestAppContext) {
-        let mut config = config_with_connection();
-        let other = Connection {
-            name: "other".into(),
-            ..config.find("db").unwrap().clone()
-        };
-        config.upsert(other, None).unwrap();
-        let (handle, workspace) = open(config, cx);
+    fn closing_another_tab_keeps_the_open_one(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
         open_tab(handle, &workspace, "other", cx);
         open_tab(handle, &workspace, "db", cx);
         cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
+            workspace.update(cx, |this, _| {
                 this.connected
                     .extend(["db".to_string(), "other".to_string()]);
-                this.close_tab("other".into(), cx);
-                assert_eq!(this.active.as_deref(), Some("db"));
-                assert_eq!(this.tabs.len(), 1);
-                assert!(this.connected.contains("db"));
-                assert!(!this.connected.contains("other"));
             });
+        });
+        window_action(handle, cx, |window, cx| window.click("tab-close-other", cx));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert_eq!(this.active.as_deref(), Some("db"));
+            assert_eq!(this.tabs.len(), 1);
+            assert!(this.connected.contains("db"));
+            assert!(!this.connected.contains("other"));
         });
     }
 
     #[gpui_kit::test]
     fn the_right_click_menu_offers_disconnect_when_connected(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_tab(handle, &workspace, "db", cx);
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
                 this.connected.insert("db".into());
                 cx.notify();
             });
         });
-        window_action(handle, cx, |_, _| {});
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
         window_action(handle, cx, |window, cx| window.click(0usize, cx));
-        cx.update(|cx| assert!(workspace.read(cx).connected.is_empty()));
+        cx.update(|cx| {
+            let this = workspace.read(cx);
+            assert!(this.connected.is_empty());
+            // Its tab closes with it.
+            assert!(this.tabs.is_empty());
+        });
     }
 
     #[gpui_kit::test]
     fn no_disconnect_button_without_a_connection(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        open_tab(handle, &workspace, "db", cx);
+        let (handle, _) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.hover("conn-db", cx));
         window_action(handle, cx, |window, _| {
-            assert!(window.try_find("disconnect").is_none());
+            assert!(window.try_find("disconnect-db").is_none());
         });
     }
 
@@ -2902,15 +2128,27 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_connection_selects_it(cx: &mut TestAppContext) {
+    fn clicking_a_connection_opens_and_connects_its_tab(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            window.click("conn-db", cx);
-        })
-        .unwrap();
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| {
+            // The dialog has done its job.
+            assert!(!window.has_active_dialog(cx));
+            assert!(window.find("tab-db").visible());
+            // Ready to type in.
+            let editor = workspace
+                .read(cx)
+                .active_tab()
+                .unwrap()
+                .read(cx)
+                .editor
+                .clone();
+            assert!(gpui_kit::Focusable::focus_handle(editor.read(cx), cx).is_focused(window));
+        });
         cx.update(|cx| {
             let this = workspace.read(cx);
+            assert!(!this.connections_open);
             assert_eq!(this.active.as_deref(), Some("db"));
             let tab = this.active_tab().unwrap().read(cx);
             assert!(matches!(tab.status, Status::Busy(_)));
@@ -2978,6 +2216,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn clicking_a_folder_collapses_and_expands_it(cx: &mut TestAppContext) {
         let (handle, _) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         cx.update_window(handle, |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find("conn-db").visible());
@@ -3004,8 +2243,7 @@ pub(crate) mod tests {
         result.unwrap()
     }
 
-    /// Opens `name`'s tab as a click on it does, done connecting, with "SELECT 1;" in its
-    /// editor.
+    /// Opens `name`'s tab as a click on it does, done connecting.
     pub(crate) fn open_tab(
         handle: AnyWindowHandle,
         workspace: &Entity<Workspace>,
@@ -3016,17 +2254,34 @@ pub(crate) mod tests {
             workspace.update(cx, |this, cx| {
                 this.open_connection(name.into(), window, cx);
                 let tab = this.tab(name).expect("the tab opens").clone();
-                tab.update(cx, |tab, cx| {
+                tab.update(cx, |tab, _| {
                     // Nothing listens at the test connection's port, and tests never
                     // finish connecting: don't wait for it.
                     tab.connecting = false;
                     tab.status = Status::Idle;
-                    tab.editor
-                        .update(cx, |editor, cx| editor.set_value("SELECT 1;", window, cx));
                 });
                 tab
             })
         })
+    }
+
+    /// Opens the Connections dialog, as its shortcut does.
+    pub(crate) fn open_picker(handle: AnyWindowHandle, cx: &mut TestAppContext) {
+        window_action(handle, cx, |window, cx| window.press("secondary-k", cx));
+    }
+
+    /// Reads what the Connections dialog keeps.
+    fn picker<R>(
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+        read: impl FnOnce(&ConnectionsDialog) -> R,
+    ) -> R {
+        cx.update(|cx| read(workspace.read(cx).connections.read(cx)))
+    }
+
+    /// Whether a confirm dialog is asking, on top of any other dialog.
+    fn alert_open(window: &mut gpui_kit::Window) -> bool {
+        window.try_find("ok").is_some()
     }
 
     /// The tab on screen.
@@ -3042,6 +2297,7 @@ pub(crate) mod tests {
 
     /// Opens the form for a new connection and chooses PostgreSQL, which shows the rest.
     fn open_new_form(handle: AnyWindowHandle, cx: &mut TestAppContext) {
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         window_action(handle, cx, |window, cx| {
@@ -3052,6 +2308,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn sqlite_only_asks_for_a_file(cx: &mut TestAppContext) {
         let (handle, _) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         window_action(handle, cx, |window, cx| window.click("adapter-SQLite", cx));
@@ -3250,6 +2507,7 @@ pub(crate) mod tests {
         cx: &mut TestAppContext,
     ) {
         let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         let found = crate::aws_picker::tests::found("orders", Some(Adapter::Postgres))
@@ -3282,6 +2540,7 @@ pub(crate) mod tests {
         cx: &mut TestAppContext,
     ) {
         let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| window.click("source-manual", cx));
         let found = crate::aws_picker::tests::found("orders", Some(Adapter::Postgres))
@@ -3315,6 +2574,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn a_database_found_in_aws_fills_in_a_new_connection(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| {
             assert!(window.try_find("save").is_none());
@@ -3450,12 +2710,9 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn running_records_history_and_switching_keeps_drafts(cx: &mut TestAppContext) {
-        let mut config = config_with_connection();
-        let mut other = config.connections[0].clone();
-        other.name = "other".into();
-        config.upsert(other, None).unwrap();
-        let (handle, workspace) = open(config, cx);
+    fn each_tab_keeps_its_own_editor_and_draft(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("conn-db", cx));
         let db = active(&workspace, cx);
         window_action(handle, cx, |window, cx| {
@@ -3468,19 +2725,23 @@ pub(crate) mod tests {
                 tab.run_query(cx);
             });
         });
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("conn-other", cx));
-        // Each tab has its own editor, which starts with the connection's draft.
+        // Its own editor, which starts with the connection's draft.
         let other = active(&workspace, cx);
+        assert_ne!(other, db);
         window_action(handle, cx, |_, cx| {
             assert_eq!(other.read(cx).editor.read(cx).value().as_str(), "");
         });
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.click("tab-db", cx));
         window_action(handle, cx, |_, cx| {
             let this = workspace.read(cx);
             assert_eq!(this.active_tab(), Some(&db));
+            assert_eq!(this.tabs.len(), 2);
             assert_eq!(db.read(cx).editor.read(cx).value().as_str(), "select 42");
             assert_eq!(this.session.drafts["db"], "select 42");
             assert_eq!(this.session.history_for("db").next(), Some("select 42"));
+            assert_eq!(this.session.history_for("other").next(), None);
         });
     }
 
@@ -3488,25 +2749,34 @@ pub(crate) mod tests {
     fn arrow_keys_walk_and_fold_the_tree(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         let cursor = |cx: &mut TestAppContext| {
-            workspace
-                .read_with(cx, |this, _| this.cursor.clone())
-                .unwrap()
+            picker(&workspace, cx, |picker| picker.cursor.clone()).expect("a cursor")
         };
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
-        window_action(handle, cx, |window, cx| window.press("up", cx));
+        let collapsed =
+            |cx: &mut TestAppContext| picker(&workspace, cx, |picker| picker.collapsed.clone());
+        // The tree has the keys as soon as the dialog opens.
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.press("down", cx));
         assert_eq!(cursor(cx), TreeRow::Folder("Production".into()));
 
         window_action(handle, cx, |window, cx| window.press("left", cx));
-        cx.update(|cx| assert!(workspace.read(cx).collapsed.contains("Production")));
+        assert!(collapsed(cx).contains("Production"));
 
         window_action(handle, cx, |window, cx| window.press("right", cx));
-        cx.update(|cx| assert!(workspace.read(cx).collapsed.is_empty()));
+        assert!(collapsed(cx).is_empty());
 
         window_action(handle, cx, |window, cx| window.press("right", cx));
         assert_eq!(cursor(cx), TreeRow::Connection("db".into()));
 
         window_action(handle, cx, |window, cx| window.press("left", cx));
         assert_eq!(cursor(cx), TreeRow::Folder("Production".into()));
+
+        // Enter on a connection opens it.
+        window_action(handle, cx, |window, cx| window.press("down", cx));
+        window_action(handle, cx, |window, cx| window.press("enter", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
+        });
+        cx.update(|cx| assert_eq!(workspace.read(cx).active.as_deref(), Some("db")));
     }
 
     #[gpui_kit::test]
@@ -3555,23 +2825,6 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn dragging_the_sidebar_edge_resizes_it_and_keeps_the_size(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(Config::default(), cx);
-        let handle_left = |cx: &mut TestAppContext| {
-            window_action(handle, cx, |window, _| {
-                window.find(("resizable-handle", 0usize)).bounds().left()
-            })
-        };
-        let before = handle_left(cx);
-        let edge = point(px(300.), px(400.));
-        window_action(handle, cx, |window, cx| {
-            window.drag(edge, edge + point(px(80.), px(0.)), cx);
-        });
-        assert_eq!(handle_left(cx), before + px(80.));
-        cx.update(|cx| assert_eq!(workspace.read(cx).session.panels["sidebar"], 380));
-    }
-
-    #[gpui_kit::test]
     fn the_chat_opens_at_its_saved_width_and_dragging_its_edge_resizes_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
         workspace.update(cx, |this, _| {
@@ -3590,8 +2843,6 @@ pub(crate) mod tests {
         cx.update(|cx| {
             let panels = &workspace.read(cx).session.panels;
             assert_eq!(panels["chat"], 480);
-            // The sidebar was not dragged, so it keeps its width.
-            assert_eq!(panels["sidebar"], 300);
         });
     }
 
@@ -3695,6 +2946,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn settings_leaves_an_open_form_in_place(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-connection", cx));
         window_action(handle, cx, |window, cx| window.click("open-settings", cx));
         window_action(handle, cx, |window, cx| {
@@ -3722,14 +2974,16 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn new_folder_is_created_from_the_sidebar(cx: &mut TestAppContext) {
+    fn new_folder_is_created_from_the_connections_dialog(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-folder", cx));
         window_action(handle, cx, |window, cx| {
             window.input("Local", cx);
             window.press("enter", cx);
         });
         window_action(handle, cx, |window, _| {
+            // Enter names the folder and leaves the dialog open.
             assert!(window.find("folder-Local").visible());
         });
         cx.update(|cx| assert_eq!(workspace.read(cx).config.folders(), ["Local"]));
@@ -3738,27 +2992,42 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn enter_in_the_folder_field_leaves_the_tree_alone(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
-        window_action(handle, cx, |window, cx| window.press("up", cx));
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.press("down", cx));
         window_action(handle, cx, |window, cx| window.click("add-folder", cx));
         window_action(handle, cx, |window, cx| {
             window.input("Local", cx);
             window.press("enter", cx);
         });
         cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert!(this.config.folders().contains(&"Local".to_owned()));
-            assert!(this.collapsed.is_empty());
+            assert!(
+                workspace
+                    .read(cx)
+                    .config
+                    .folders()
+                    .contains(&"Local".to_owned())
+            );
         });
+        assert!(picker(&workspace, cx, |picker| picker.collapsed.is_empty()));
     }
 
     #[gpui_kit::test]
     fn escape_cancels_creating_a_folder(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-folder", cx));
         window_action(handle, cx, |window, cx| {
             window.input("Nope", cx);
             window.press("escape", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            // Only the field goes; a second Escape closes the dialog.
+            assert!(window.try_find("folder-name").is_none());
+            assert!(window.has_active_dialog(cx));
+            window.press("escape", cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx))
         });
         cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
@@ -3766,10 +3035,11 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn clicking_elsewhere_closes_the_folder_field(cx: &mut TestAppContext) {
         let (handle, _) = open(Config::default(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("add-folder", cx));
         window_action(handle, cx, |window, cx| {
             assert!(window.find("folder-name").visible());
-            window.click("open-settings", cx);
+            window.click("connections-title", cx);
         });
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("folder-name").is_none());
@@ -3779,6 +3049,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn a_folder_can_be_created_inside_another(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Production", cx);
             window.click("add-folder-in-Production", cx);
@@ -3803,6 +3074,7 @@ pub(crate) mod tests {
         let mut config = config_with_connection();
         config.add_folder("", "Archive").unwrap();
         let (handle, workspace) = open(config, cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.drag_to("folder-Production", "folder-Archive", cx);
         });
@@ -3817,6 +3089,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn renaming_a_folder_moves_its_connections(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Production", cx);
             window.click("rename-Production", cx);
@@ -3832,15 +3105,15 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn plus_on_a_folder_targets_that_folder_without_collapsing_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Production", cx);
             window.click("add-in-Production", cx);
         });
+        assert!(picker(&workspace, cx, |picker| picker.collapsed.is_empty()));
         cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert!(this.collapsed.is_empty());
-            let form = this.form.as_ref().expect("form opens").read(cx);
-            assert_eq!(form.folder, "Production");
+            let form = workspace.read(cx).form.clone().expect("form opens");
+            assert_eq!(form.read(cx).folder, "Production");
         });
     }
 
@@ -3849,6 +3122,7 @@ pub(crate) mod tests {
         let mut config = Config::default();
         config.add_folder("", "Old").unwrap();
         let (handle, workspace) = open(config, cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Old", cx);
             window.click("remove-Old", cx);
@@ -3859,6 +3133,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn the_buttons_of_a_confirm_dialog_cancel_and_confirm(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         let ask = |cx: &mut TestAppContext| {
             window_action(handle, cx, |window, cx| {
                 window.hover("folder-Production", cx);
@@ -3870,7 +3145,7 @@ pub(crate) mod tests {
         };
         ask(cx);
         window_action(handle, cx, |window, cx| {
-            assert!(window.has_active_dialog(cx));
+            assert!(alert_open(window));
             // The app's own Cancel and OK, laid out as the library's: side by side, as
             // wide as their labels, OK on the right.
             let (cancel, ok) = (window.find("cancel").bounds(), window.find("ok").bounds());
@@ -3879,35 +3154,28 @@ pub(crate) mod tests {
             assert!(cancel.size.width < px(100.) && ok.size.width < px(150.));
             window.click("cancel", cx);
         });
-        window_action(handle, cx, |window, cx| {
-            assert!(!window.has_active_dialog(cx))
-        });
+        window_action(handle, cx, |window, _| assert!(!alert_open(window)));
         assert_eq!(folders(cx), 1);
         ask(cx);
         window_action(handle, cx, |window, cx| window.press("escape", cx));
-        window_action(handle, cx, |window, cx| {
-            assert!(!window.has_active_dialog(cx))
-        });
+        window_action(handle, cx, |window, _| assert!(!alert_open(window)));
         assert_eq!(folders(cx), 1);
         ask(cx);
         window_action(handle, cx, |window, cx| window.click("ok", cx));
-        window_action(handle, cx, |window, cx| {
-            assert!(!window.has_active_dialog(cx))
-        });
+        window_action(handle, cx, |window, _| assert!(!alert_open(window)));
         assert_eq!(folders(cx), 0);
     }
 
     #[gpui_kit::test]
     fn enter_confirms_a_confirm_dialog(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.hover("folder-Production", cx);
             window.click("remove-Production", cx);
         });
         window_action(handle, cx, |window, cx| window.press("enter", cx));
-        window_action(handle, cx, |window, cx| {
-            assert!(!window.has_active_dialog(cx))
-        });
+        window_action(handle, cx, |window, _| assert!(!alert_open(window)));
         cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
 
@@ -3916,6 +3184,7 @@ pub(crate) mod tests {
         let mut config = config_with_connection();
         config.add_folder("", "Local").unwrap();
         let (handle, workspace) = open(config, cx);
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| {
             window.drag_to("conn-db", "folder-Local", cx);
         });
@@ -3954,7 +3223,7 @@ pub(crate) mod tests {
                 this.session.set_draft("other", "select 'other'")
             });
         });
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.input("select 42", cx);
@@ -3991,7 +3260,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn renaming_the_open_connection_keeps_it_open_with_its_draft(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_two_connections(), cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.input("select 42", cx);
@@ -4020,6 +3289,281 @@ pub(crate) mod tests {
             assert_eq!(tab.editor.read(cx).value().as_str(), "select 42");
             assert_eq!(this.session.drafts["renamed"], "select 42");
             assert!(!this.session.drafts.contains_key("db"));
+        });
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("tab-renamed").visible());
+            assert!(window.try_find("tab-db").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn an_edit_to_an_open_connection_reaches_its_tab(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        let tab = open_tab(handle, &workspace, "db", cx);
+        // An edit saved from the form: the tab runs with the new settings, such as the
+        // read-only switch.
+        let form = edit_form(handle, &workspace, "db", cx);
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                let mut edited = this.config.find("db").unwrap().clone();
+                edited.readonly = true;
+                let mut saved = this.config.clone();
+                saved.upsert(edited.clone(), Some("db")).unwrap();
+                let saving = super::Saving {
+                    form,
+                    connection: edited,
+                    previous: Some("db".into()),
+                };
+                this.finish_saving_connection(saving, saved, Ok(None), window, cx);
+            });
+        });
+        cx.update(|cx| {
+            let tab = tab.read(cx);
+            assert!(tab.connection().readonly);
+            // It connects again, with the new settings.
+            assert!(tab.connecting);
+        });
+        // A change made in the dialog, such as a move to another folder.
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                assert!(this.move_connection("db", "Staging", cx));
+            });
+            assert_eq!(tab.read(cx).connection().folder, "Staging");
+        });
+        window_action(handle, cx, |window, _| {
+            let crumb = window.find("breadcrumb");
+            assert!(crumb.visible());
+        });
+    }
+
+    fn config_with_three_connections() -> Config {
+        let mut config = config_with_two_connections();
+        let mut third = config.connections[0].clone();
+        third.name = "third".into();
+        config.upsert(third, None).unwrap();
+        config
+    }
+
+    fn tab_names(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> Vec<String> {
+        workspace.read_with(cx, |this, _| {
+            this.tabs.iter().map(|open| open.name.clone()).collect()
+        })
+    }
+
+    fn active_name(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> Option<String> {
+        workspace.read_with(cx, |this, _| this.active.clone())
+    }
+
+    #[gpui_kit::test]
+    fn the_shortcut_and_the_button_open_one_connections_dialog(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        let shown = |cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, _| {
+                window.find_all("connections-dialog").len()
+            })
+        };
+        assert_eq!(shown(cx), 0);
+        open_picker(handle, cx);
+        assert_eq!(shown(cx), 1);
+        // The shortcut again closes it.
+        open_picker(handle, cx);
+        assert_eq!(shown(cx), 0);
+        window_action(handle, cx, |window, cx| {
+            window.click("open-connections", cx)
+        });
+        assert_eq!(shown(cx), 1);
+        // The menu's item while it is open closes it too: never two of them.
+        window_action(handle, cx, |window, cx| {
+            window.dispatch_action(Box::new(super::OpenConnections), cx);
+        });
+        assert_eq!(shown(cx), 0);
+        window_action(handle, cx, |window, cx| window.click("new-tab", cx));
+        assert_eq!(shown(cx), 1);
+        window_action(handle, cx, |window, cx| window.press("escape", cx));
+        assert_eq!(shown(cx), 0);
+        assert!(workspace.read_with(cx, |this, _| !this.connections_open));
+        window_action(handle, cx, |window, cx| window.click("empty-open", cx));
+        assert_eq!(shown(cx), 1);
+    }
+
+    #[gpui_kit::test]
+    fn the_shortcut_works_from_the_editor_but_not_over_settings(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        open_tab(handle, &workspace, "db", cx);
+        window_action(handle, cx, |window, cx| window.click("sql-editor", cx));
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("connections-dialog").visible());
+        });
+        // Nothing was typed into the editor.
+        let tab = active(&workspace, cx);
+        assert_eq!(
+            tab.read_with(cx, |tab, cx| tab.editor.read(cx).value().to_string()),
+            ""
+        );
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("open-settings", cx));
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("connections-dialog").is_none());
+            assert!(window.find("check-updates").visible());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn opening_two_connections_gives_two_tabs_with_the_second_on_screen(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        for name in ["db", "other"] {
+            open_picker(handle, cx);
+            let id = gpui_kit::SharedString::from(format!("conn-{name}"));
+            window_action(handle, cx, |window, cx| window.click(id, cx));
+        }
+        assert_eq!(tab_names(&workspace, cx), ["db", "other"]);
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+        window_action(handle, cx, |window, _| {
+            assert!(window.find("tab-db").visible());
+            assert!(window.find("tab-other").visible());
+            assert!(window.find("tab-close-other").visible());
+        });
+        // Opening one that has a tab shows that tab, rather than another.
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        assert_eq!(tab_names(&workspace, cx), ["db", "other"]);
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("db"));
+    }
+
+    #[gpui_kit::test]
+    fn clicking_a_tab_shows_its_editor_results_and_schema(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        let db = open_tab(handle, &workspace, "db", cx);
+        let other = open_tab(handle, &workspace, "other", cx);
+        window_action(handle, cx, |window, cx| window.click("tab-db", cx));
+        assert_eq!(active(&workspace, cx), db);
+        // What is typed goes to the tab on screen only.
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 'db'", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click("tab-other", cx));
+        assert_eq!(active(&workspace, cx), other);
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.input("select 'other'", cx);
+        });
+        cx.update(|cx| {
+            let text =
+                |tab: &Entity<ConnectionTab>| tab.read(cx).editor.read(cx).value().to_string();
+            assert_eq!(text(&db), "select 'db'");
+            assert_eq!(text(&other), "select 'other'");
+            // Each tab has its own results and schema, for its own connection.
+            let (db, other) = (db.read(cx), other.read(cx));
+            assert_ne!(db.results.entity_id(), other.results.entity_id());
+            assert_ne!(db.schema.entity_id(), other.schema.entity_id());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn closing_the_tab_on_screen_shows_its_neighbour(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_three_connections(), cx);
+        for name in ["db", "other", "third"] {
+            open_tab(handle, &workspace, name, cx);
+        }
+        window_action(handle, cx, |window, cx| window.click("tab-other", cx));
+        window_action(handle, cx, |window, cx| window.click("tab-close-other", cx));
+        // The one to its right.
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("third"));
+        window_action(handle, cx, |window, cx| window.click("tab-close-third", cx));
+        // The last one has none to its right: the one to its left.
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("db"));
+        // A tab not on screen closes without changing which one is.
+        open_tab(handle, &workspace, "other", cx);
+        window_action(handle, cx, |window, cx| window.click("tab-close-db", cx));
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
+        assert_eq!(tab_names(&workspace, cx), ["other"]);
+    }
+
+    #[gpui_kit::test]
+    fn a_result_arriving_after_its_tab_closed_is_dropped(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        let tab = open_tab(handle, &workspace, "db", cx);
+        tab.update(cx, |tab, cx| tab.run_sql("select 1".into(), cx));
+        let running = tab.downgrade();
+        drop(tab);
+        window_action(handle, cx, |window, cx| window.click("tab-close-db", cx));
+        window_action(handle, cx, |_, _| {});
+        // The query's task holds the tab weakly: with the tab gone, its result has
+        // nowhere to go.
+        assert!(running.upgrade().is_none());
+    }
+
+    #[gpui_kit::test]
+    fn the_run_key_runs_only_in_the_tab_on_screen(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        let db = open_tab(handle, &workspace, "db", cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("conn-other", cx));
+        let other = active(&workspace, cx);
+        other.update(cx, |tab, cx| {
+            tab.connecting = false;
+            tab.status = Status::Idle;
+            cx.notify();
+        });
+        // Picking it put the keys in its editor: no click needed.
+        window_action(handle, cx, |window, cx| {
+            window.input("select 2", cx);
+            window.press("secondary-enter", cx);
+        });
+        cx.update(|cx| {
+            assert!(matches!(other.read(cx).status, Status::Busy(_)));
+            assert!(matches!(db.read(cx).status, Status::Idle));
+            let session = &workspace.read(cx).session;
+            assert_eq!(session.history_for("other").next(), Some("select 2"));
+            assert_eq!(session.history_for("db").next(), None);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn a_dragged_panel_size_holds_in_every_tab(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        open_tab(handle, &workspace, "db", cx);
+        open_tab(handle, &workspace, "other", cx);
+        window_action(handle, cx, |window, cx| window.click("tab-db", cx));
+        let editor = window_action(handle, cx, |window, _| window.find("sql-editor").bounds());
+        let edge = point(editor.center().x, editor.bottom());
+        window_action(handle, cx, |window, cx| {
+            window.drag(edge, edge + point(px(0.), px(60.)), cx);
+        });
+        let height = |cx: &mut TestAppContext| {
+            window_action(handle, cx, |window, _| {
+                window.find("sql-editor").bounds().size.height
+            })
+        };
+        let dragged = editor.size.height + px(60.);
+        assert_eq!(height(cx), dragged);
+        // A tab that was already open takes it too.
+        window_action(handle, cx, |window, cx| window.click("tab-other", cx));
+        assert_eq!(height(cx), dragged);
+        window_action(handle, cx, |window, cx| window.click("tab-db", cx));
+        assert_eq!(height(cx), dragged);
+    }
+
+    #[gpui_kit::test]
+    fn deleting_a_connection_closes_its_tab(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        open_tab(handle, &workspace, "db", cx);
+        open_tab(handle, &workspace, "other", cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            window.right_click("conn-other", cx)
+        });
+        // Disconnect, Edit and Delete, as it has a tab, with a line between each.
+        window_action(handle, cx, |window, cx| window.click(4usize, cx));
+        window_action(handle, cx, |window, cx| window.click("ok", cx));
+        assert_eq!(tab_names(&workspace, cx), ["db"]);
+        assert_eq!(active_name(&workspace, cx).as_deref(), Some("db"));
+        window_action(handle, cx, |window, _| {
+            assert!(window.try_find("tab-other").is_none());
+            assert!(window.try_find("conn-other").is_none());
         });
     }
 
@@ -4095,7 +3639,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn quitting_writes_what_still_waits_to_be_saved(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.input("select 42", cx);
@@ -4119,7 +3663,7 @@ pub(crate) mod tests {
     #[gpui_kit::test]
     fn the_app_quitting_takes_the_session_save_still_waiting(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.input("select 42", cx);
@@ -4134,6 +3678,7 @@ pub(crate) mod tests {
         let (handle, workspace) = open(config_with_connection(), cx);
         let tab = open_tab(handle, &workspace, "db", cx);
         tab.update(cx, |tab, cx| tab.run_sql("select 1".into(), cx));
+        open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.click("conn-db", cx));
         cx.update(|cx| {
             let status = &tab.read(cx).status;

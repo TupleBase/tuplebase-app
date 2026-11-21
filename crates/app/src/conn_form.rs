@@ -723,7 +723,7 @@ impl ConnForm {
             )
     }
 
-    /// What the sidebar shows for the connection.
+    /// What the tabs and the Connections dialog show for the connection.
     fn render_name(&self, cx: &mut Context<Self>) -> Div {
         h_flex()
             .gap_3()

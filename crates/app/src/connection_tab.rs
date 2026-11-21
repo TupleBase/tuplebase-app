@@ -22,7 +22,6 @@ use tuplebase_core::db::{Db, ExecOptions, ROLLED_BACK_NOTE, ScriptResult};
 use tuplebase_core::safety;
 
 use crate::completions::{self, SchemaNames, SqlCompletions};
-use crate::logos;
 use crate::results::ResultsDelegate;
 use crate::row_detail::{RowDetail, RowDetailEvent};
 use crate::run_button::{RunButton, RunStatement};
@@ -44,7 +43,6 @@ const NO_STATEMENT: &str =
 const EDIT_ICON: &[u8] = include_bytes!("../../../assets/icons/square-pen.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
 const HISTORY_ICON: &[u8] = include_bytes!("../../../assets/icons/clock.svg");
-const UNPLUG_ICON: &[u8] = include_bytes!("../../../assets/icons/unplug.svg");
 
 /// Queries the history menu lists.
 pub(crate) const HISTORY_MENU_SIZE: usize = 20;
@@ -63,6 +61,25 @@ pub(crate) enum Status {
     Failed(SharedString),
 }
 
+/// The colour of a tab's dot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Light {
+    Connecting,
+    Connected,
+    /// Not connected yet, or connecting failed.
+    Off,
+}
+
+pub(crate) fn light(connecting: bool, connected: bool) -> Light {
+    if connecting {
+        Light::Connecting
+    } else if connected {
+        Light::Connected
+    } else {
+        Light::Off
+    }
+}
+
 /// What a tab asks of the workspace.
 pub(crate) enum TabEvent {
     /// The editor now holds this SQL.
@@ -73,7 +90,6 @@ pub(crate) enum TabEvent {
     Resized(Vec<(&'static str, u32)>),
     Edit,
     Delete,
-    Close,
     /// Connecting is done, with why it failed.
     Connected(Result<(), SharedString>),
     /// The connection may have closed: look again at which pools are open.
@@ -282,6 +298,10 @@ impl ConnectionTab {
             self.connected = connected;
             cx.notify();
         }
+    }
+
+    pub(crate) fn light(&self) -> Light {
+        light(self.connecting, self.connected)
     }
 
     pub(crate) fn set_history(&mut self, history: Vec<String>, cx: &mut Context<Self>) {
@@ -568,28 +588,32 @@ impl Render for ConnectionTab {
         v_flex()
             .size_full()
             .child(
-                div()
-                    .id("connection-color")
-                    .test_support()
-                    .w_full()
-                    .h(px(3.))
-                    .flex_none()
-                    .bg(logos::color_of(conn.adapter, &conn.color)),
-            )
-            .child(
                 h_flex()
-                    .h(px(48.))
+                    .h(px(40.))
                     .flex_none()
                     .pl_3()
                     .pr_2()
                     .gap_2()
                     .border_b_1()
                     .border_color(border)
-                    .child(logos::icon(conn.adapter, 20.))
-                    .child(div().font_semibold().child(conn.name.clone()))
-                    .when_some(folder_label, |el, name| {
-                        el.child(chip(name, muted, muted_bg))
-                    })
+                    .child(
+                        h_flex()
+                            .id("breadcrumb")
+                            .test_support()
+                            .min_w_0()
+                            .gap_1p5()
+                            .text_sm()
+                            .when_some(folder_label, |el, folders| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(muted)
+                                        .child(format!("{folders} /")),
+                                )
+                            })
+                            .child(div().flex_none().font_semibold().child(conn.name.clone())),
+                    )
                     .when(conn.readonly, |el| {
                         el.child(chip("Read-only".into(), muted, muted_bg))
                     })
@@ -624,17 +648,6 @@ impl Render for ConnectionTab {
                                 menu
                             }),
                     )
-                    .when(self.connected, |el| {
-                        el.child(
-                            Button::new("disconnect")
-                                .cursor_pointer()
-                                .ghost()
-                                .small()
-                                .icon(Icon::default().data(UNPLUG_ICON))
-                                .tooltip("Disconnect")
-                                .on_click(cx.listener(|_, _, _, cx| cx.emit(TabEvent::Close))),
-                        )
-                    })
                     .child(
                         Button::new("edit")
                             .cursor_pointer()
@@ -727,12 +740,17 @@ mod tests {
     use std::rc::Rc;
     use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE};
 
-    /// The test connection's tab, open and done connecting.
+    /// The test connection's tab, open and done connecting, with "SELECT 1;" in its
+    /// editor.
     fn open_db(
         cx: &mut TestAppContext,
     ) -> (AnyWindowHandle, Entity<Workspace>, Entity<ConnectionTab>) {
         let (handle, workspace) = open(config_with_connection(), cx);
         let tab = open_tab(handle, &workspace, "db", cx);
+        window_action(handle, cx, |window, cx| {
+            let editor = tab.read(cx).editor.clone();
+            editor.update(cx, |editor, cx| editor.set_value("SELECT 1;", window, cx));
+        });
         (handle, workspace, tab)
     }
 
