@@ -1,13 +1,15 @@
 //! PostgreSQL: its catalog queries, object sources, routine calls and value decoding.
 
+use std::fmt::Write as _;
+
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use sqlx::postgres::{PgPool, PgRow};
+use sqlx::postgres::{PgConnection, PgPool, PgRow, PgValueFormat};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use sqlx::types::{Decimal, JsonValue, Uuid};
-use sqlx::{Row, TypeInfo, ValueRef};
+use sqlx::types::{JsonValue, Uuid};
+use sqlx::{Executor, Row, TypeInfo, ValueRef};
 
-use super::decode::{bytes, decode_first, fallback, text, type_name_or_return};
+use super::decode::{bytes, decode_first, fallback, float, text, type_name_or_return};
 use super::{
     Dialect, ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
     sql_comment, unsupported,
@@ -104,6 +106,38 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "ROLLBACK",
     objects: OBJECTS,
 };
+
+/// Ends any transaction a run left open, such as one it began, or one a failed
+/// statement aborted, so the connection goes back to the pool without one. Returns
+/// whether there was one, to tell the user.
+///
+/// The driver doesn't expose the server's transaction status, so this asks: sent as a
+/// simple query outside a transaction, a statement starts its own, at the same moment;
+/// inside one, the transaction started earlier. In one a failed statement aborted, any
+/// query is refused with `in_failed_sql_transaction`. The answer only decides whether
+/// to tell: two times in the same microsecond would read as no transaction, so
+/// `ROLLBACK` is sent either way (with none open, PostgreSQL only warns).
+pub(super) async fn end_transaction(
+    conn: &mut PgConnection,
+    _script_left_open: bool,
+) -> Result<bool> {
+    const IN_FAILED_TRANSACTION: &str = "25P02";
+    let open = match sqlx::raw_sql("SELECT now() <> statement_timestamp()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(row) => row.try_get::<bool, _>(0)?,
+        Err(e)
+            if e.as_database_error().and_then(|e| e.code()).as_deref()
+                == Some(IN_FAILED_TRANSACTION) =>
+        {
+            true
+        }
+        Err(e) => return Err(e.into()),
+    };
+    conn.execute("ROLLBACK").await?;
+    Ok(open)
+}
 
 pub(super) async fn column_names(pool: &PgPool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(
@@ -257,14 +291,21 @@ fn call_sql(kind: ObjectKind, schema: &str, name: &str, params: &[Parameter]) ->
 
 pub(super) fn value(row: &PgRow, i: usize) -> Value {
     let type_name = type_name_or_return!(row, i);
+    if type_name == "NUMERIC"
+        && let Some(n) = row.try_get_raw(i).ok().and_then(|raw| match raw.format() {
+            PgValueFormat::Text => raw.as_str().ok().map(str::to_owned),
+            PgValueFormat::Binary => numeric(raw.as_bytes().ok()?),
+        })
+    {
+        return Value::String(n);
+    }
     decode_first!(row, i;
         bool => |v: bool| json!(v),
         i16 => |v: i16| json!(v),
         i32 => |v: i32| json!(v),
         i64 => |v: i64| json!(v),
-        f32 => |v: f32| json!(v),
-        f64 => |v: f64| json!(v),
-        Decimal => text,
+        f32 => float,
+        f64 => float,
         String => Value::String,
         Uuid => text,
         JsonValue => |v| v,
@@ -277,10 +318,112 @@ pub(super) fn value(row: &PgRow, i: usize) -> Value {
     fallback(row, i, &type_name)
 }
 
+/// A NUMERIC in PostgreSQL's binary form, as PostgreSQL prints it: every digit, to its
+/// scale, and `NaN` or `Infinity`. No Rust decimal type holds them all (a NUMERIC can
+/// have 131072 digits before the point). `None` if the bytes aren't a NUMERIC.
+///
+/// The form is four 16-bit words, the count of base-10000 digits, the weight of the
+/// first (its power of 10000), the sign and the scale (decimal places shown), then the
+/// digits.
+fn numeric(bytes: &[u8]) -> Option<String> {
+    const POSITIVE: u16 = 0x0000;
+    const NEGATIVE: u16 = 0x4000;
+    const NAN: u16 = 0xC000;
+    const INFINITY: u16 = 0xD000;
+    const NEGATIVE_INFINITY: u16 = 0xF000;
+    let word = |at: usize| {
+        let pair = bytes.get(at * 2..at * 2 + 2)?;
+        Some(u16::from_be_bytes([pair[0], pair[1]]))
+    };
+    let count = usize::from(word(0)?);
+    let weight = i64::from(word(1)? as i16);
+    let scale = usize::from(word(3)?);
+    match word(2)? {
+        NAN => return Some("NaN".into()),
+        INFINITY => return Some("Infinity".into()),
+        NEGATIVE_INFINITY => return Some("-Infinity".into()),
+        POSITIVE | NEGATIVE => {}
+        _ => return None,
+    }
+    if bytes.len() != (4 + count) * 2 {
+        return None;
+    }
+    // The digit worth 10000^(weight - at); zero outside the ones sent.
+    let digit = |at: i64| match usize::try_from(at) {
+        Ok(at) if at < count => word(4 + at).filter(|d| *d < 10_000),
+        _ => Some(0),
+    };
+    let mut out = String::new();
+    if word(2)? == NEGATIVE {
+        out.push('-');
+    }
+    if weight < 0 {
+        out.push('0');
+    }
+    for at in 0..=weight {
+        let d = digit(at)?;
+        if at == 0 {
+            write!(out, "{d}").ok()?;
+        } else {
+            write!(out, "{d:04}").ok()?;
+        }
+    }
+    if scale > 0 {
+        let mut fraction = String::with_capacity(scale + 4);
+        let mut at = weight + 1;
+        while fraction.len() < scale {
+            write!(fraction, "{:04}", digit(at)?).ok()?;
+            at += 1;
+        }
+        fraction.truncate(scale);
+        out.push('.');
+        out.push_str(&fraction);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::param;
     use super::*;
+
+    /// A NUMERIC's binary form: digit count, weight, sign, scale, digits.
+    fn binary(weight: i16, sign: u16, scale: u16, digits: &[u16]) -> Vec<u8> {
+        let head = [digits.len() as u16, weight as u16, sign, scale];
+        head.iter()
+            .chain(digits)
+            .flat_map(|word| word.to_be_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn numerics_print_every_digit_to_their_scale() {
+        let cases: [(Vec<u8>, &str); 9] = [
+            (binary(0, 0, 2, &[1, 5000]), "1.50"),
+            (binary(0, 0, 2, &[]), "0.00"),
+            (binary(0, 0, 0, &[]), "0"),
+            (binary(-1, 0x4000, 3, &[10]), "-0.001"),
+            (binary(1, 0, 0, &[1]), "10000"),
+            (binary(2, 0, 0, &[12, 3456, 7890]), "1234567890"),
+            (
+                binary(-10, 0, 39, &[10]),
+                "0.000000000000000000000000000000000000001",
+            ),
+            (binary(0, 0xC000, 0, &[]), "NaN"),
+            (binary(0, 0xF000, 0, &[]), "-Infinity"),
+        ];
+        for (bytes, shown) in cases {
+            assert_eq!(numeric(&bytes).as_deref(), Some(shown));
+        }
+        assert_eq!(
+            numeric(&binary(0, 0xD000, 0, &[])).as_deref(),
+            Some("Infinity")
+        );
+        // Not a NUMERIC: cut short, an unknown sign, a digit out of range.
+        assert_eq!(numeric(&binary(0, 0, 0, &[1])[..9]), None);
+        assert_eq!(numeric(&binary(0, 0x1234, 0, &[1])), None);
+        assert_eq!(numeric(&binary(0, 0, 0, &[10_000])), None);
+    }
 
     #[test]
     fn a_procedure_passes_null_for_outputs() {

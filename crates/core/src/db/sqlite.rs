@@ -5,12 +5,14 @@ use std::ffi::CStr;
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
-use libsqlite3_sys::{SQLITE_OK, sqlite3_errmsg, sqlite3_finalize, sqlite3_prepare_v2};
+use libsqlite3_sys::{
+    SQLITE_OK, sqlite3_errmsg, sqlite3_finalize, sqlite3_get_autocommit, sqlite3_prepare_v2,
+};
 use serde_json::{Value, json};
-use sqlx::sqlite::{SqlitePool, SqliteRow};
-use sqlx::{Row, TypeInfo, ValueRef};
+use sqlx::sqlite::{SqliteConnection, SqlitePool, SqliteRow};
+use sqlx::{Executor, Row, TypeInfo, ValueRef};
 
-use super::decode::{bytes, decode_first, fallback, type_name_or_return};
+use super::decode::{bytes, decode_first, fallback, float, type_name_or_return};
 use super::{Dialect, ObjectInfo, ObjectKind, Source, objects, unsupported};
 
 /// Each query returns schema, name and detail.
@@ -33,6 +35,25 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "PRAGMA query_only = OFF",
     objects: OBJECTS,
 };
+
+/// Ends any transaction a run left open, so the connection goes back to the pool
+/// without one, and without the lock that would keep everyone else from writing.
+/// SQLite says whether one is open; `ROLLBACK` without one is an error. Returns whether
+/// there was one.
+pub(super) async fn end_transaction(
+    conn: &mut SqliteConnection,
+    _script_left_open: bool,
+) -> Result<bool> {
+    let open = {
+        let mut handle = conn.lock_handle().await?;
+        // SAFETY: the locked handle keeps sqlx off the connection until it's dropped.
+        unsafe { sqlite3_get_autocommit(handle.as_raw_handle().as_ptr()) == 0 }
+    };
+    if open {
+        conn.execute("ROLLBACK").await?;
+    }
+    Ok(open)
+}
 
 /// Refuses `sql` unless SQLite reads it as one statement (S2). Given several, sqlx runs
 /// them all, one after another, so a second statement that the guard's own splitter
@@ -149,7 +170,7 @@ pub(super) fn value(row: &SqliteRow, i: usize) -> Value {
     let type_name = type_name_or_return!(row, i);
     decode_first!(row, i;
         i64 => |v: i64| json!(v),
-        f64 => |v: f64| json!(v),
+        f64 => float,
         String => Value::String,
         Vec<u8> => bytes,
     );

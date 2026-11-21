@@ -3,7 +3,7 @@
 
 use serde_json::json;
 use tuplebase_core::config::{Adapter, Connection};
-use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
+use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind, ROLLED_BACK_NOTE};
 
 const READ: ExecOptions = ExecOptions {
     read_only: true,
@@ -485,6 +485,246 @@ async fn sqlite_indexes_and_triggers_are_listed() {
 /// A fresh connection doesn't know a custom type yet. Looking it up must not lose the
 /// statement that asked for it: PostgreSQL drops the unnamed prepared statement whenever
 /// another query runs on the connection.
+/// More than a pool holds: the pool hands its idle connections out in turn, so this many
+/// queries reach each of them.
+const EVERY_CONNECTION: usize = 8;
+
+/// A pooled connection never goes back with a transaction open: the next query, from
+/// another tab or the MCP server, would run inside it.
+#[tokio::test]
+async fn a_transaction_left_open_ends_with_its_run() {
+    each_adapter(async |db, conn| {
+        // The rows each connection sees.
+        let count = async |db: &Db| {
+            let mut seen = Vec::new();
+            for _ in 0..EVERY_CONNECTION {
+                let r = db
+                    .execute(&conn, "SELECT COUNT(*) FROM it_txn_leak", WRITE)
+                    .await
+                    .unwrap();
+                seen.push(r.rows[0][0].as_i64().unwrap());
+            }
+            seen.dedup();
+            seen
+        };
+        // Separate statements: MariaDB commits around each DDL statement anyway.
+        for sql in [
+            "DROP TABLE IF EXISTS it_txn_leak",
+            "CREATE TABLE it_txn_leak (id INT)",
+        ] {
+            db.execute(&conn, sql, WRITE).await.unwrap();
+        }
+        db.execute_script(
+            &conn,
+            "START TRANSACTION; INSERT INTO it_txn_leak VALUES (1)",
+            WRITE,
+        )
+        .await
+        .unwrap();
+        let adapter = conn.adapter;
+        assert_eq!(
+            count(&db).await,
+            [0],
+            "{adapter:?}: ran in the open transaction"
+        );
+        if adapter == Adapter::Postgres {
+            // Read-only work gets its own read-only transaction, not the one left open.
+            db.execute(&conn, "START TRANSACTION", WRITE).await.unwrap();
+            for _ in 0..EVERY_CONNECTION {
+                let r = db
+                    .execute(&conn, "SHOW transaction_read_only", READ)
+                    .await
+                    .unwrap();
+                assert_eq!(r.rows, [[json!("on")]]);
+            }
+        }
+        // A later COMMIT doesn't commit what an earlier run left open.
+        db.execute_script(
+            &conn,
+            "START TRANSACTION; INSERT INTO it_txn_leak VALUES (2)",
+            WRITE,
+        )
+        .await
+        .unwrap();
+        for _ in 0..EVERY_CONNECTION {
+            db.execute(&conn, "COMMIT", WRITE).await.unwrap();
+        }
+        assert_eq!(count(&Db::new()).await, [0], "{adapter:?}");
+        // A script that fails inside a transaction leaves every connection usable.
+        let failed = db
+            .execute_script(
+                &conn,
+                "START TRANSACTION; INSERT INTO it_txn_leak VALUES (3); \
+                 INSERT INTO it_txn_missing VALUES (1)",
+                WRITE,
+            )
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(count(&db).await, [0], "{adapter:?}");
+        if adapter == Adapter::Mariadb {
+            // A connection left without autocommit gets it back, so later writes on it
+            // aren't rolled back at the end of their run.
+            db.execute(&conn, "SET autocommit = 0", WRITE)
+                .await
+                .unwrap();
+            for _ in 0..EVERY_CONNECTION {
+                db.execute(&conn, "INSERT INTO it_txn_leak VALUES (4)", WRITE)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(count(&Db::new()).await, [EVERY_CONNECTION as i64]);
+        }
+        db.execute(&conn, "DROP TABLE it_txn_leak", WRITE)
+            .await
+            .unwrap();
+    })
+    .await;
+}
+
+/// Rolling back what a run left open is never silent: the result or the error says so.
+#[tokio::test]
+async fn a_transaction_rolled_back_at_the_end_of_a_run_is_reported() {
+    each_adapter(async |db, conn| {
+        let adapter = conn.adapter;
+        let run = db
+            .execute_script(&conn, "START TRANSACTION; SELECT 1 AS n", WRITE)
+            .await
+            .unwrap();
+        assert!(run.rolled_back, "{adapter:?}");
+        // Ended in the same run, or never begun: nothing to say.
+        for script in ["START TRANSACTION; SELECT 1 AS n; COMMIT", "SELECT 1 AS n"] {
+            let run = db.execute_script(&conn, script, WRITE).await.unwrap();
+            assert!(!run.rolled_back, "{adapter:?}: {script}");
+        }
+        // Read-only work's own transaction is the guard's, not the user's.
+        for _ in 0..EVERY_CONNECTION {
+            let run = db
+                .execute_script(&conn, "SELECT 1 AS n", READ)
+                .await
+                .unwrap();
+            assert!(!run.rolled_back, "{adapter:?}");
+        }
+        // A failure inside one says so in the error.
+        let error = db
+            .execute_script(
+                &conn,
+                "START TRANSACTION; SELECT * FROM it_rollback_missing",
+                WRITE,
+            )
+            .await
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("it_rollback_missing"), "{error}");
+        assert!(error.contains(ROLLED_BACK_NOTE), "{adapter:?}: {error}");
+        // One statement, as the MCP server runs it.
+        let r = db.execute(&conn, "START TRANSACTION", WRITE).await.unwrap();
+        assert_eq!(r.note, Some(ROLLED_BACK_NOTE), "{adapter:?}");
+        let r = db.execute(&conn, "SELECT 1", WRITE).await.unwrap();
+        assert_eq!(r.note, None, "{adapter:?}");
+    })
+    .await;
+}
+
+/// Statements that don't start with a read keyword but return rows show them.
+#[tokio::test]
+async fn calls_and_returning_show_their_rows() {
+    each_adapter(async |db, conn| {
+        let setup: &[&str] = match conn.adapter {
+            Adapter::Postgres => &[
+                "DROP PROCEDURE IF EXISTS it_rows_proc(int, int)",
+                "CREATE PROCEDURE it_rows_proc(IN a int, INOUT b int) \
+                 LANGUAGE plpgsql AS $$ BEGIN b := a * 2; END $$",
+            ],
+            _ => &[
+                "DROP PROCEDURE IF EXISTS it_rows_proc",
+                "CREATE PROCEDURE it_rows_proc() \
+                 BEGIN SELECT 1 AS first; SELECT 'two' AS second, 3 AS third; END",
+            ],
+        };
+        for sql in setup {
+            db.execute(&conn, sql, WRITE).await.unwrap();
+        }
+        let (call, columns, rows) = match conn.adapter {
+            Adapter::Postgres => ("CALL it_rows_proc(21, NULL)", vec!["b"], json!([[42]])),
+            // The first result set: rows of another shape would not fit its columns.
+            _ => ("CALL it_rows_proc()", vec!["first"], json!([[1]])),
+        };
+        let r = db.execute(&conn, call, WRITE).await.unwrap();
+        assert_eq!(r.columns, columns, "{:?}", conn.adapter);
+        assert_eq!(json!(r.rows), rows, "{:?}", conn.adapter);
+        // The connection is still in step afterwards.
+        let r = db.execute(&conn, "SELECT 5 AS n", WRITE).await.unwrap();
+        assert_eq!(r.rows, [[json!(5)]]);
+        // RETURNING with no space before it, which both engines read.
+        let r = db
+            .execute(&conn, "DELETE FROM users WHERE id < 0 RETURNING*", WRITE)
+            .await
+            .unwrap();
+        assert!(r.rows.is_empty());
+        assert!(r.rows_affected.is_none(), "{:?}", conn.adapter);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_shows_nan_infinity_and_numerics_of_any_size_exactly() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let conn = connection(Adapter::Postgres);
+    let db = Db::new();
+    let numerics = [
+        "1.50",
+        "0.00",
+        "-0.001",
+        "100",
+        "0",
+        "10000",
+        "-12345678.9",
+        "0.0001",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        // More digits than rust_decimal holds.
+        "1234567890123456789012345678901234567890",
+        "-98765432109876543210.123456789012345678901234567890",
+        "0.000000000000000000000000000000000000001",
+        "100000000000000000000000000000000000000000000",
+    ];
+    for opts in [READ, WRITE] {
+        let mut wrong = Vec::new();
+        for value in numerics {
+            let sql = format!("SELECT '{value}'::numeric AS n");
+            let r = db.execute(&conn, &sql, opts).await.unwrap();
+            if r.rows != [[json!(value)]] {
+                wrong.push(format!("{value} shown as {}", r.rows[0][0]));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let r = db
+            .execute(
+                &conn,
+                "SELECT 'NaN'::float8, 'Infinity'::float8, '-Infinity'::float4, \
+                 1.5::float8, 'NaN'::numeric(10, 2), 2.50::numeric(10, 2)",
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.rows,
+            [[
+                json!("NaN"),
+                json!("Infinity"),
+                json!("-Infinity"),
+                json!(1.5),
+                json!("NaN"),
+                json!("2.50")
+            ]]
+        );
+    }
+}
+
 #[tokio::test]
 async fn postgres_custom_types_can_be_read_on_a_fresh_connection() {
     if !enabled() {

@@ -28,6 +28,23 @@ macro_rules! type_name_or_return {
 }
 pub(super) use type_name_or_return;
 
+/// A float as a number, or NaN and the infinities as text, as PostgreSQL spells them:
+/// JSON has no number for them, so they would show as null.
+pub(super) fn float<T: Into<f64> + Copy>(v: T) -> Value
+where
+    Value: From<T>,
+{
+    let wide: f64 = v.into();
+    if wide.is_nan() {
+        Value::String("NaN".into())
+    } else if wide.is_infinite() {
+        let sign = if wide < 0.0 { "-" } else { "" };
+        Value::String(format!("{sign}Infinity"))
+    } else {
+        Value::from(v)
+    }
+}
+
 pub(super) fn text<T: ToString>(v: T) -> Value {
     Value::String(v.to_string())
 }

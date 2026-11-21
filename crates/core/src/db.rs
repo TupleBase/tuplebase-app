@@ -23,6 +23,7 @@ use futures_util::TryStreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::mysql::MySqlPool;
+use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPool;
 use sqlx::sqlite::SqlitePool;
 use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
@@ -43,7 +44,17 @@ pub struct QueryResult {
     /// Set for statements that do not return rows.
     pub rows_affected: Option<u64>,
     pub elapsed_ms: u64,
+    /// Something the user must know about the run, such as [`ROLLED_BACK_NOTE`]. Set by
+    /// [`Db::execute`], whose result is all an agent sees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
 }
+
+/// Said when a run left a transaction open and it was rolled back, so nothing it
+/// changed in it was kept. The connection goes back to a pool, so a transaction can't
+/// span runs.
+pub const ROLLED_BACK_NOTE: &str =
+    "An open transaction was rolled back: run BEGIN … COMMIT in one go.";
 
 /// What running a script produced.
 #[derive(Debug, Clone)]
@@ -53,6 +64,9 @@ pub struct ScriptResult {
     pub statements: usize,
     /// At least one statement changed something rather than reading.
     pub changed: bool,
+    /// The run left a transaction open, and it was rolled back ([`ROLLED_BACK_NOTE`]).
+    /// Never set for read-only work, whose transactions are the guard's own.
+    pub rolled_back: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -432,7 +446,12 @@ impl Db {
         {
             bail!("read-only: run one statement at a time");
         }
-        Ok(self.run(conn, &[statement], opts).await?.result)
+        let run = self.run(conn, &[statement], opts).await?;
+        let mut result = run.result;
+        if run.rolled_back {
+            result.note = Some(ROLLED_BACK_NOTE);
+        }
+        Ok(result)
     }
 
     /// Runs `;`-separated statements in order, stopping at the first error.
@@ -467,47 +486,78 @@ impl Db {
         let started = Instant::now();
         let mut shown: Option<QueryResult> = None;
         let mut changed = false;
+        let mut rolled_back = false;
 
         macro_rules! run_all {
-            ($pool:expr, $dialect:expr, $decode:path) => {{
+            ($pool:expr, $dialect:expr, $decode:path, $end_transaction:path) => {{
                 let Dialect {
                     read_only_begin: begin,
                     read_only_end: end,
                     ..
                 } = $dialect;
-                let mut c = $pool.acquire().await?;
-                for (index, sql) in statements.iter().copied().enumerate() {
-                    if read_only {
-                        c.execute(begin).await?;
-                    }
-                    let mut out = run!(&mut *c, conn.adapter, sql, opts.max_rows, $decode);
-                    // The statement never ran, and its types are known now: run it again,
-                    // in a new read-only transaction when it had one.
-                    if out.as_ref().is_err_and(lost_unnamed_statement) {
+                let mut c = Lease::new($pool.acquire().await?);
+                // The statements that were sent, up to the one that failed.
+                let mut sent = 0;
+                let mut ran = async {
+                    for (index, sql) in statements.iter().copied().enumerate() {
+                        sent = index + 1;
                         if read_only {
-                            c.execute(end).await?;
                             c.execute(begin).await?;
                         }
-                        out = run!(&mut *c, conn.adapter, sql, opts.max_rows, $decode);
+                        let mut out = run!(&mut **c, conn.adapter, sql, opts.max_rows, $decode);
+                        // The statement never ran, and its types are known now: run it
+                        // again, in a new read-only transaction when it had one.
+                        if out.as_ref().is_err_and(lost_unnamed_statement) {
+                            if read_only {
+                                c.execute(end).await?;
+                                c.execute(begin).await?;
+                            }
+                            out = run!(&mut **c, conn.adapter, sql, opts.max_rows, $decode);
+                        }
+                        if read_only && c.execute(end).await.is_err() {
+                            c.close_on_drop();
+                        }
+                        let result = if total > 1 {
+                            out.with_context(|| format!("statement {} of {total}", index + 1))?
+                        } else {
+                            out?
+                        };
+                        // A CALL or a RETURNING shows rows yet may have changed things.
+                        changed |= result.rows_affected.is_some()
+                            || !safety::starts_with_read(conn.adapter, sql);
+                        if shown.is_none() || !result.columns.is_empty() {
+                            shown = Some(result);
+                        }
                     }
-                    if read_only && c.execute(end).await.is_err() {
-                        c.close_on_drop();
-                    }
-                    let result = if total > 1 {
-                        out.with_context(|| format!("statement {} of {total}", index + 1))?
-                    } else {
-                        out?
-                    };
-                    changed |= result.rows_affected.is_some();
-                    if shown.is_none() || !result.columns.is_empty() {
-                        shown = Some(result);
-                    }
+                    Ok::<_, anyhow::Error>(())
                 }
+                .await;
+                // Whether the statements succeeded or not, none of them may leave a
+                // transaction open on a connection that later work, from another tab or
+                // the MCP server, would get from the pool. Ending one loses what it
+                // changed, so the user is told.
+                // Where the server can't say whether one is open, the statements tell.
+                let script_left_open =
+                    safety::leaves_transaction_open(conn.adapter, &statements[..sent]);
+                if let Ok(open) = $end_transaction(&mut **c, script_left_open).await {
+                    c.reusable();
+                    // Read-only work's transactions are the guard's own.
+                    rolled_back = open && !read_only;
+                }
+                if rolled_back {
+                    ran = ran.map_err(|e| anyhow!("{e:#}. {ROLLED_BACK_NOTE}"));
+                }
+                ran?;
             }};
         }
         match self.pool(conn).await? {
-            Pool::Pg(pool) => run_all!(pool, postgres::DIALECT, postgres::value),
-            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value),
+            Pool::Pg(pool) => run_all!(
+                pool,
+                postgres::DIALECT,
+                postgres::value,
+                postgres::end_transaction
+            ),
+            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value, mysql::end_transaction),
             Pool::Sqlite(pools) => {
                 let pool = if read_only {
                     for statement in statements {
@@ -517,7 +567,12 @@ impl Db {
                 } else {
                     pools.main
                 };
-                run_all!(pool, sqlite::DIALECT, sqlite::value)
+                run_all!(
+                    pool,
+                    sqlite::DIALECT,
+                    sqlite::value,
+                    sqlite::end_transaction
+                )
             }
         }
 
@@ -527,6 +582,7 @@ impl Db {
             result,
             statements: total,
             changed,
+            rolled_back,
         })
     }
 
@@ -674,6 +730,50 @@ fn same_target(a: &Connection, b: &Connection) -> bool {
     a == *b
 }
 
+/// A pooled connection for one run. Dropped before [`Lease::reusable`], it is closed
+/// instead of going back to the pool: a run cut short, or whose transaction couldn't be
+/// ended, may have left one open on it.
+struct Lease<DB: sqlx::Database> {
+    conn: PoolConnection<DB>,
+    reusable: bool,
+}
+
+impl<DB: sqlx::Database> Lease<DB> {
+    fn new(conn: PoolConnection<DB>) -> Self {
+        Self {
+            conn,
+            reusable: false,
+        }
+    }
+
+    /// No transaction is open: the connection may go back to the pool.
+    fn reusable(&mut self) {
+        self.reusable = true;
+    }
+}
+
+impl<DB: sqlx::Database> std::ops::Deref for Lease<DB> {
+    type Target = PoolConnection<DB>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl<DB: sqlx::Database> std::ops::DerefMut for Lease<DB> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
+    }
+}
+
+impl<DB: sqlx::Database> Drop for Lease<DB> {
+    fn drop(&mut self) {
+        if !self.reusable {
+            self.conn.close_on_drop();
+        }
+    }
+}
+
 /// Whether PostgreSQL lost the statement before running it. The driver prepares each
 /// statement unnamed; when the result has a type it hasn't seen, such as an enum, it
 /// looks the type up with a query of its own, and any other query drops the unnamed
@@ -702,13 +802,27 @@ macro_rules! run {
                     truncated: false,
                     rows_affected: Some(done.rows_affected()),
                     elapsed_ms: 0,
+                    note: None,
                 });
             }
-            let mut stream = query.fetch($conn);
+            // One statement; its results and the end of each result set.
+            let mut stream = Executor::fetch_many($conn, query);
             let mut columns = Vec::new();
             let mut rows = Vec::new();
             let mut truncated = false;
-            while let Some(row) = stream.try_next().await? {
+            // A MySQL procedure can return several result sets, of different shapes: the
+            // first one with rows is shown. The rest are still read, not left behind:
+            // stopping right after a result set leaves sqlx-mysql waiting for it forever.
+            let mut shown_set = false;
+            while let Some(item) = stream.try_next().await? {
+                let row = match item {
+                    sqlx::Either::Right(_) if shown_set => continue,
+                    sqlx::Either::Right(row) => row,
+                    sqlx::Either::Left(_) => {
+                        shown_set = !rows.is_empty();
+                        continue;
+                    }
+                };
                 if rows.len() == $max {
                     truncated = true;
                     break;
@@ -738,6 +852,7 @@ macro_rules! run {
                 truncated,
                 rows_affected: None,
                 elapsed_ms: 0,
+                note: None,
             })
         }
         .await

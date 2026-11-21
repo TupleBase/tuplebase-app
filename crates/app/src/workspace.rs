@@ -26,7 +26,8 @@ use tuplebase_core::config::{
     Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
     kept_unreadable_message, parent_of, rebase_folder,
 };
-use tuplebase_core::db::{Db, ExecOptions, ScriptResult};
+use tuplebase_core::db::{Db, ExecOptions, ROLLED_BACK_NOTE, ScriptResult};
+use tuplebase_core::secrets::{ConnectionSecrets, Secret};
 use tuplebase_core::state::SessionState;
 use tuplebase_core::{app_status, mcp_status, safety, secrets, updates};
 
@@ -1153,21 +1154,21 @@ impl Workspace {
         let (conn, prev) = (connection.clone(), previous.clone());
         cx.spawn(async move |this, cx| {
             let result = blocking(move || {
-                let kept = save.run(Config::save)?;
-                let renamed = previous.as_ref().filter(|p| **p != connection.name);
-                if let Some(old) = renamed {
-                    secrets::rename(old, &connection.name)?;
-                }
-                if !connection.auth.is_password() {
+                let password = match &password {
                     // The credentials now come from AWS; don't keep an unused password.
-                    secrets::delete_password(&connection.name)?;
-                } else if let Some(pw) = &password {
-                    secrets::set_password(&connection.name, pw)?;
-                }
-                if let Some(secret) = &ssh_password {
-                    secrets::set_ssh_password(&connection.name, secret)?;
-                }
-                Ok(kept)
+                    _ if !connection.auth.is_password() => Secret::Delete,
+                    Some(pw) => Secret::Set(pw),
+                    None => Secret::Keep,
+                };
+                let ssh_password = ssh_password.as_deref().map_or(Secret::Keep, Secret::Set);
+                let changes = ConnectionSecrets {
+                    previous: previous.as_deref(),
+                    name: &connection.name,
+                    password,
+                    ssh_password,
+                };
+                // The keychain first, undone if the config can't be written.
+                secrets::save_connection(&changes, || save.run(Config::save))
             })
             .await;
             if let (Ok(_), Some(previous)) = (&result, prev.clone()) {
@@ -1199,6 +1200,7 @@ impl Workspace {
         let kept = match result {
             Ok(kept) => kept,
             Err(e) => {
+                self.forget_unwritten_config_save();
                 form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx));
                 return;
             }
@@ -1268,6 +1270,7 @@ impl Workspace {
             self.form = None;
         }
         self.connected.remove(&name);
+        let removed = self.config.find(&name).cloned();
         self.config.remove(&name);
         self.session.remove_connection(&name);
         self.schedule_session_save(cx);
@@ -1276,21 +1279,46 @@ impl Workspace {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let forget_name = name.clone();
-            let result = blocking(move || {
-                let kept = save.run(Config::save)?;
-                secrets::delete_all(&name)?;
-                Ok(kept)
-            })
-            .await;
+            // The keychain first, put back if the config can't be written.
+            let result =
+                blocking(move || secrets::delete_connection(&name, || save.run(Config::save)))
+                    .await;
             io(async move {
                 db.forget(&forget_name).await;
                 Ok(())
             })
             .await
             .ok();
-            this.update(cx, |this, cx| this.show_saved(result, cx)).ok();
+            this.update(cx, |this, cx| {
+                this.finish_deleting_connection(removed, result, cx)
+            })
+            .ok();
         })
         .detach();
+    }
+
+    /// Once deleting a connection is written, or failed and was undone.
+    fn finish_deleting_connection(
+        &mut self,
+        removed: Option<Connection>,
+        result: anyhow::Result<Option<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
+        if result.is_err() {
+            // Nothing was deleted: show the connection again, as it still is on disk.
+            if let Some(conn) = removed {
+                self.config.upsert(conn, None).ok();
+                cx.notify();
+            }
+            self.forget_unwritten_config_save();
+        }
+        self.show_saved(result, cx);
+    }
+
+    /// After a connection's save or delete failed and its keychain change was undone: the
+    /// config as it is becomes the newest save, so quitting doesn't write the failed one.
+    fn forget_unwritten_config_save(&mut self) {
+        self.config_saves.save(self.config.clone());
     }
 
     /// Runs the selected text, or else the statement at the cursor, split as a script
@@ -1375,7 +1403,15 @@ impl Workspace {
             return;
         }
         self.status = match &result {
-            Ok(run) => Status::Done(summary(&run.result, run.statements).into()),
+            Ok(run) => {
+                let done = summary(&run.result, run.statements);
+                // What the run changed in its open transaction was not kept: say so.
+                Status::Done(if run.rolled_back {
+                    format!("{done} · {ROLLED_BACK_NOTE}").into()
+                } else {
+                    done.into()
+                })
+            }
             Err(e) => Status::Failed(format!("{e:#}").into()),
         };
         if let Ok(run) = &result {
@@ -2774,7 +2810,7 @@ mod tests {
     use serde_json::json;
     use std::rc::Rc;
     use tuplebase_core::config::{Adapter, Appearance, Auth, AwsIamAuth, AwsSecretRef, TlsMode};
-    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult};
+    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE};
 
     fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
         cx.update(|cx| {
@@ -2938,6 +2974,7 @@ mod tests {
                         truncated: false,
                         rows_affected: None,
                         elapsed_ms: 1,
+                        note: None,
                     });
                     table.refresh(cx);
                 });
@@ -2992,6 +3029,7 @@ mod tests {
                         truncated: false,
                         rows_affected: None,
                         elapsed_ms: 1,
+                        note: None,
                     });
                     table.refresh(cx);
                 });
@@ -3145,6 +3183,7 @@ mod tests {
                     truncated: false,
                     rows_affected: None,
                     elapsed_ms: 1,
+                    note: None,
                 };
                 this.results.update(cx, |table, cx| {
                     table.delegate_mut().show(&result);
@@ -3337,6 +3376,7 @@ mod tests {
             truncated,
             rows_affected: affected,
             elapsed_ms: 5,
+            note: None,
         };
         assert_eq!(super::summary(&result(1, None, false), 1), "1 row in 5 ms");
         assert_eq!(
@@ -3544,6 +3584,64 @@ mod tests {
             let form = this.form.as_ref().expect("form stays open").read(cx);
             assert!(form.error.is_some());
         });
+    }
+
+    #[gpui_kit::test]
+    fn passwords_keep_their_spaces_while_other_fields_are_trimmed(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(Config::default(), cx);
+        open_new_form(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("use-ssh", cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-name", cx);
+            window.input(" spaced ", cx);
+            window.click("conn-host", cx);
+            window.input(" db ", cx);
+            window.click("conn-user", cx);
+            window.input(" me ", cx);
+            window.click("conn-password", cx);
+            window.input("  pass word ", cx);
+            // The SSH fields are below the fold.
+            let down = gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-2000.)));
+            window.scroll("conn-form", down, cx);
+        });
+        window_action(handle, cx, |window, cx| {
+            window.click("conn-ssh-host", cx);
+            window.input("bastion", cx);
+            window.click("conn-ssh-user", cx);
+            window.input("me", cx);
+            window.click("conn-ssh-password", cx);
+            window.input(" phrase\t", cx);
+            window.click("conn-ssh-fingerprint", cx);
+            window.input("SHA256:abc", cx);
+        });
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(None));
+        cx.update(|cx| {
+            let form = workspace.read(cx).form.clone().expect("form is open");
+            let saved = saved.clone();
+            cx.subscribe(&form, move |_, event, _| {
+                if let ConnFormEvent::Save {
+                    connection,
+                    password,
+                    ssh_password,
+                    ..
+                } = event
+                {
+                    *saved.borrow_mut() =
+                        Some((connection.clone(), password.clone(), ssh_password.clone()));
+                }
+            })
+            .detach();
+        });
+        window_action(handle, cx, |window, cx| window.click("save", cx));
+        let (connection, password, ssh_password) =
+            saved.borrow_mut().take().expect("the form saved");
+        assert_eq!(password.as_deref(), Some("  pass word "));
+        assert_eq!(ssh_password.as_deref(), Some(" phrase\t"));
+        assert_eq!(
+            (connection.name.as_str(), connection.host.as_str()),
+            ("spaced", "db")
+        );
+        assert_eq!(connection.user, "me");
     }
 
     #[gpui_kit::test]
@@ -3856,6 +3954,7 @@ mod tests {
             truncated: false,
             rows_affected: None,
             elapsed_ms: 5,
+            note: None,
         };
         assert_eq!(super::summary(&result, 3), "3 statements. 2 rows in 5 ms");
         assert_eq!(super::history_label("select\n  1"), "select 1");
@@ -4798,6 +4897,7 @@ mod tests {
                         truncated: false,
                         rows_affected: None,
                         elapsed_ms: 1,
+                        note: None,
                     });
                     table.refresh(cx);
                 });
@@ -4946,6 +5046,77 @@ mod tests {
         });
     }
 
+    /// A save that failed was undone in the keychain: quitting must not write it after all.
+    #[gpui_kit::test]
+    fn quitting_after_a_failed_save_or_delete_writes_the_config_as_it_is(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        let form = edit_form(handle, &workspace, "other", cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let before = this.config.clone();
+                let mut renamed = this.config.find("other").unwrap().clone();
+                renamed.name = "renamed".into();
+                // Taken at Save, as `save_connection` does, then never written.
+                let mut saved = this.config.clone();
+                saved.upsert(renamed.clone(), Some("other")).unwrap();
+                this.config_saves.save(saved.clone());
+                let failed = Err(anyhow::anyhow!("the keychain refused"));
+                let previous = Some("other".into());
+                this.finish_saving_connection(form, renamed, previous, saved, failed, cx);
+                let newest = this.final_saves().1.expect("a config save was made");
+                let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
+                assert_eq!(written.as_ref(), Some(&before));
+
+                // The same after a delete that failed.
+                let removed = this.config.find("other").cloned();
+                this.config.remove("other");
+                this.config_saves.save(this.config.clone());
+                let failed = Err(anyhow::anyhow!("the keychain refused"));
+                this.finish_deleting_connection(removed, failed, cx);
+                assert!(this.config.find("other").is_some(), "shown again");
+                let newest = this.final_saves().1.expect("a config save was made");
+                let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
+                assert!(written.unwrap().find("other").is_some());
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn the_status_line_says_when_an_open_transaction_was_rolled_back(cx: &mut TestAppContext) {
+        let (_, workspace) = open(config_with_connection(), cx);
+        let run = |rolled_back| tuplebase_core::db::ScriptResult {
+            result: QueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                truncated: false,
+                rows_affected: Some(1),
+                elapsed_ms: 1,
+                note: None,
+            },
+            statements: 2,
+            changed: true,
+            rolled_back,
+        };
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                this.selected = Some("db".into());
+                let conn = this.config.find("db").unwrap().clone();
+                for rolled_back in [true, false] {
+                    this.run_query(cx);
+                    this.finish_query(this.run, conn.clone(), Ok(run(rolled_back)), cx);
+                    let Status::Done(text) = &this.status else {
+                        panic!("not done");
+                    };
+                    assert!(
+                        text.starts_with(&super::summary(&run(false).result, 2)),
+                        "{text}"
+                    );
+                    assert_eq!(text.contains(ROLLED_BACK_NOTE), rolled_back, "{text}");
+                }
+            });
+        });
+    }
+
     #[gpui_kit::test]
     fn an_earlier_query_finishing_late_does_not_replace_a_later_one(cx: &mut TestAppContext) {
         let (_, workspace) = open(config_with_connection(), cx);
@@ -4956,9 +5127,11 @@ mod tests {
                 truncated: false,
                 rows_affected: None,
                 elapsed_ms: 1,
+                note: None,
             },
             statements: 1,
             changed: false,
+            rolled_back: false,
         };
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {

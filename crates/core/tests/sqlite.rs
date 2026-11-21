@@ -5,7 +5,7 @@ use sqlx::Executor;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{ConnectOptions, Connection as _};
 use tuplebase_core::config::{Adapter, Connection};
-use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind};
+use tuplebase_core::db::{Db, ExecOptions, ObjectInfo, ObjectKind, ROLLED_BACK_NOTE};
 
 const READ: ExecOptions = ExecOptions {
     read_only: true,
@@ -60,6 +60,92 @@ async fn user_count(db: &Db, conn: &Connection) -> i64 {
         .await
         .unwrap();
     r.rows[0][0].as_i64().unwrap()
+}
+
+/// A pooled connection never goes back with a transaction open: the next query would
+/// run inside it, and its lock would keep everyone else from writing.
+#[tokio::test]
+async fn a_transaction_left_open_ends_with_its_run() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    db.execute_script(
+        &conn,
+        "BEGIN; INSERT INTO users (id, name) VALUES (3, 'Left open')",
+        WRITE,
+    )
+    .await
+    .unwrap();
+    let r = db
+        .execute(&conn, "SELECT COUNT(*) FROM users", WRITE)
+        .await
+        .unwrap();
+    assert_eq!(r.rows, [[json!(2)]], "ran in the open transaction");
+    // Another connection to the file can write.
+    Db::new()
+        .execute(
+            &conn,
+            "INSERT INTO users (id, name) VALUES (4, 'Other')",
+            WRITE,
+        )
+        .await
+        .unwrap();
+    assert_eq!(user_count(&db, &conn).await, 3);
+    // A failure inside a transaction leaves none open either.
+    let failed = db
+        .execute_script(&conn, "BEGIN; INSERT INTO missing VALUES (1)", WRITE)
+        .await;
+    assert!(failed.is_err());
+    db.execute(&conn, "BEGIN", WRITE).await.unwrap();
+    db.execute(&conn, "INSERT INTO users (id, name) VALUES (5, 'x')", WRITE)
+        .await
+        .unwrap();
+    assert_eq!(
+        user_count(&Db::new(), &conn).await,
+        4,
+        "no transaction swallowed it"
+    );
+}
+
+/// Rolling back what a run left open is never silent: the result or the error says so.
+#[tokio::test]
+async fn a_transaction_rolled_back_at_the_end_of_a_run_is_reported() {
+    let (_dir, conn) = database().await;
+    let db = Db::new();
+    let run = db
+        .execute_script(&conn, "BEGIN; UPDATE users SET name = 'x'", WRITE)
+        .await
+        .unwrap();
+    assert!(run.rolled_back);
+    assert_eq!(user_count(&db, &conn).await, 2);
+    for script in ["BEGIN; SELECT 1; COMMIT", "SELECT 1"] {
+        let run = db.execute_script(&conn, script, WRITE).await.unwrap();
+        assert!(!run.rolled_back, "{script}");
+    }
+    let run = db.execute_script(&conn, "SELECT 1", READ).await.unwrap();
+    assert!(!run.rolled_back);
+    let error = db
+        .execute_script(&conn, "BEGIN; SELECT * FROM missing", WRITE)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains(ROLLED_BACK_NOTE), "{error:#}");
+    let r = db.execute(&conn, "BEGIN", WRITE).await.unwrap();
+    assert_eq!(r.note, Some(ROLLED_BACK_NOTE));
+}
+
+#[tokio::test]
+async fn a_pragma_shows_its_rows() {
+    let (_dir, conn) = database().await;
+    let r = Db::new()
+        .execute(&conn, "PRAGMA table_info(users)", WRITE)
+        .await
+        .unwrap();
+    assert!(r.columns.contains(&"name".to_owned()), "{:?}", r.columns);
+    assert_eq!(r.rows.len(), 4);
+    // One that sets a value still runs.
+    Db::new()
+        .execute(&conn, "PRAGMA foreign_keys = ON", WRITE)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

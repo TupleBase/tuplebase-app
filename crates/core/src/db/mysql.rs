@@ -8,12 +8,12 @@
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
-use sqlx::mysql::{MySqlPool, MySqlRow};
+use sqlx::mysql::{MySqlConnection, MySqlPool, MySqlRow};
 use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue};
 use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo, ValueRef};
 
-use super::decode::{bytes, decode_first, fallback, text, type_name_or_return};
+use super::decode::{bytes, decode_first, fallback, float, text, type_name_or_return};
 use super::{
     Dialect, ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
     sql_comment, unsupported,
@@ -83,6 +83,36 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_end: "ROLLBACK",
     objects: OBJECTS,
 };
+
+/// Ends any transaction a run left open, so the connection goes back to the pool
+/// without one, and returns whether there was one. Autocommit comes back on after it,
+/// not before, which would commit: a run that turned it off would otherwise leave every
+/// later write on this connection to be rolled back here.
+///
+/// MariaDB says whether a transaction is open (`@@in_transaction`). MySQL has no such
+/// variable, so there both steps always run, and whether the statements sent left one
+/// open (`script_left_open`) is the answer.
+pub(super) async fn end_transaction(
+    conn: &mut MySqlConnection,
+    script_left_open: bool,
+) -> Result<bool> {
+    let state: Result<(i64, i64), _> =
+        sqlx::query_as("SELECT CAST(@@in_transaction AS SIGNED), CAST(@@autocommit AS SIGNED)")
+            .fetch_one(&mut *conn)
+            .await;
+    let (open, autocommit) = match state {
+        Ok((open, autocommit)) => (open != 0, autocommit != 0),
+        Err(_) => (script_left_open, false),
+    };
+    let unsure = state.is_err();
+    if open || unsure {
+        conn.execute("ROLLBACK").await?;
+    }
+    if !autocommit {
+        conn.execute("SET autocommit = 1").await?;
+    }
+    Ok(open)
+}
 
 pub(super) async fn column_names(pool: &MySqlPool) -> Result<Vec<(String,)>> {
     Ok(sqlx::query_as(
@@ -251,8 +281,8 @@ pub(super) fn value(row: &MySqlRow, i: usize) -> Value {
     decode_first!(row, i;
         i64 => |v: i64| json!(v),
         u64 => |v: u64| json!(v),
-        f64 => |v: f64| json!(v),
-        f32 => |v: f32| json!(v),
+        f64 => float,
+        f32 => float,
         Decimal => text,
         String => Value::String,
         JsonValue => |v| v,

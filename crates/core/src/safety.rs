@@ -361,10 +361,66 @@ fn dollar_quote_len(text: &str) -> usize {
     }
 }
 
-/// Whether the statement produces a result set (as opposed to a row count).
+/// Statements that return rows without starting with a read keyword. Not part of the
+/// read-only guard, which only allows [`READ_KEYWORDS`].
+fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
+    match adapter {
+        // A procedure's OUT and INOUT values come back as a row; FETCH reads a cursor.
+        Adapter::Postgres => &["call", "fetch"],
+        // A procedure can return result sets; table maintenance reports one.
+        Adapter::Mysql | Adapter::Mariadb => {
+            &["call", "check", "checksum", "analyze", "optimize", "repair"]
+        }
+        // Many pragmas return rows, and one that sets a value returns nothing at all.
+        Adapter::Sqlite => &["pragma"],
+    }
+}
+
+/// Whether these statements, run in order, leave a transaction open: one begun and not
+/// ended, or autocommit turned off and something run after it. Read from their first
+/// words, for a server that can't say itself (MySQL). Not part of the read-only guard.
+pub fn leaves_transaction_open(adapter: Adapter, statements: &[&str]) -> bool {
+    let (mut open, mut manual) = (false, false);
+    for statement in statements {
+        let words: Vec<String> = tokens(adapter, statement)
+            .filter(|&(kind, _)| kind == Token::Word)
+            .map(|(_, word)| word.to_ascii_lowercase())
+            .filter(|word| !matches!(word.as_str(), "session" | "local"))
+            .take(3)
+            .collect();
+        let word = |i: usize| words.get(i).map_or("", String::as_str);
+        match (word(0), word(1), word(2)) {
+            ("set", "autocommit", value) => {
+                manual = matches!(value, "0" | "off");
+                // Turning it back on commits.
+                open &= manual;
+            }
+            ("begin", ..) | ("start", "transaction", _) => open = true,
+            ("rollback", "to", _) => {}
+            ("commit" | "rollback", ..) => open = false,
+            // MySQL commits before each of these.
+            ("create" | "alter" | "drop" | "rename" | "truncate", ..) => open = false,
+            _ => open |= manual,
+        }
+    }
+    open
+}
+
+/// Whether the statement starts with a read keyword (SELECT, WITH, SHOW, ...).
+pub fn starts_with_read(adapter: Adapter, sql: &str) -> bool {
+    first_keyword(adapter, sql).is_some_and(|k| READ_KEYWORDS.contains(&k.as_str()))
+}
+
+/// Whether the statement produces a result set (as opposed to a row count). When it's
+/// unsure it says yes: a statement read for rows loses only its row count, while one
+/// run for a count loses its rows.
 pub fn returns_rows(adapter: Adapter, sql: &str) -> bool {
-    let is_read = first_keyword(adapter, sql).is_some_and(|k| READ_KEYWORDS.contains(&k.as_str()));
-    is_read || normalized(sql).contains(" returning ")
+    let keyword = first_keyword(adapter, sql).unwrap_or_default();
+    READ_KEYWORDS.contains(&keyword.as_str())
+        || row_keywords(adapter).contains(&keyword.as_str())
+        // As the engine reads it: not in a string or a comment.
+        || tokens(adapter, sql)
+            .any(|(kind, text)| kind == Token::Word && text.eq_ignore_ascii_case("returning"))
 }
 
 /// Rejects anything that is not a plain read.
@@ -582,6 +638,93 @@ mod tests {
                 "insert into t (a) values (1) returning id"
             ));
             assert!(!returns_rows(adapter, "update t set a = 1"));
+        }
+    }
+
+    #[test]
+    fn a_script_that_leaves_a_transaction_open_is_told_from_its_statements() {
+        let open = |statements: &[&str]| leaves_transaction_open(Adapter::Mysql, statements);
+        assert!(open(&["BEGIN", "UPDATE t SET a = 1"]));
+        assert!(open(&["start transaction"]));
+        assert!(open(&["SET autocommit = 0", "insert into t values (1)"]));
+        assert!(open(&["SET SESSION autocommit=OFF", "delete from t"]));
+        assert!(open(&["BEGIN", "SAVEPOINT a", "ROLLBACK TO a"]));
+        assert!(!open(&["BEGIN", "UPDATE t SET a = 1", "COMMIT"]));
+        assert!(!open(&["START TRANSACTION", "ROLLBACK"]));
+        assert!(!open(&["select 1", "update t set a = 1"]));
+        assert!(!open(&["SET autocommit = 0"]), "nothing ran in it");
+        assert!(!open(&[
+            "SET autocommit = 0",
+            "insert into t values (1)",
+            "SET autocommit = 1"
+        ]));
+        // DDL commits first on MySQL.
+        assert!(!open(&[
+            "BEGIN",
+            "insert into t values (1)",
+            "CREATE TABLE u (a int)"
+        ]));
+        // In a comment or a string, it's not a statement.
+        assert!(!open(&["/* BEGIN */ select 'start transaction'"]));
+    }
+
+    #[test]
+    fn returns_rows_finds_returning_wherever_the_engine_does() {
+        for adapter in Adapter::ALL {
+            for sql in [
+                "insert into t (a)\nvalues (1)\n\tRETURNING\tid",
+                "insert into t (a) values (1)returning id",
+                "delete from t returning*",
+                "update t set a = 1 /* note */ returning a",
+            ] {
+                assert!(returns_rows(adapter, sql), "{adapter:?}: {sql}");
+            }
+            // In a string or a comment, it returns nothing: the row count would be lost.
+            for sql in [
+                "update t set note = ' returning '",
+                "-- returning id\nupdate t set a = 1",
+                "insert into t values (1) /* returning id */",
+                "update t set a = 1 where b = 'x returning y'",
+            ] {
+                assert!(!returns_rows(adapter, sql), "{adapter:?}: {sql}");
+            }
+        }
+        // A word that only contains it.
+        assert!(!returns_rows(
+            Adapter::Postgres,
+            "update t set returning_soon = 1"
+        ));
+    }
+
+    #[test]
+    fn returns_rows_knows_the_statements_without_a_read_keyword_that_return_rows() {
+        let rows = [
+            (Adapter::Postgres, "CALL p(1, NULL)"),
+            (Adapter::Postgres, "FETCH 10 FROM c"),
+            (Adapter::Postgres, "show search_path"),
+            (Adapter::Mysql, "CALL report()"),
+            (Adapter::Mariadb, "call report()"),
+            (Adapter::Mariadb, "CHECK TABLE t"),
+            (Adapter::Mysql, "ANALYZE TABLE t"),
+            (Adapter::Mysql, "OPTIMIZE TABLE t"),
+            (Adapter::Mysql, "REPAIR TABLE t"),
+            (Adapter::Mysql, "CHECKSUM TABLE t"),
+            (Adapter::Mariadb, "SHOW TABLES"),
+            (Adapter::Sqlite, "PRAGMA table_info(users)"),
+            (Adapter::Sqlite, "pragma journal_mode = wal"),
+        ];
+        for (adapter, sql) in rows {
+            assert!(returns_rows(adapter, sql), "{adapter:?}: {sql}");
+        }
+        let counts = [
+            (Adapter::Postgres, "analyze t"),
+            (Adapter::Postgres, "vacuum t"),
+            (Adapter::Postgres, "insert into t values (1)"),
+            (Adapter::Mysql, "insert into t values (1)"),
+            (Adapter::Sqlite, "delete from t"),
+        ];
+        for (adapter, sql) in counts {
+            assert!(!returns_rows(adapter, sql), "{adapter:?}: {sql}");
         }
     }
 
