@@ -295,7 +295,12 @@ fn change_toml(text: &str, server: &str) -> Result<Option<String>> {
         .replace("\r\n", "\n")
         .parse()
         .context("the file isn't valid TOML, so it was left alone")?;
-    let was_empty = doc.is_empty();
+    // A new table goes at the end, after comments that ended the file, and a blank line.
+    let mut prefix = doc.trailing().as_str().unwrap_or_default().to_owned();
+    if !text.trim().is_empty() {
+        prefix.push('\n');
+    }
+    let mut header_added = false;
     let servers = doc.entry(TOML_SERVERS).or_insert_with(|| {
         // No `[mcp_servers]` header of its own, only `[mcp_servers.tuplebase]`.
         let mut table = toml_edit::Table::new();
@@ -313,10 +318,9 @@ fn change_toml(text: &str, server: &str) -> Result<Option<String>> {
             if inline {
                 return toml_edit::value(toml_edit::InlineTable::new());
             }
+            header_added = true;
             let mut table = toml_edit::Table::new();
-            if !was_empty {
-                table.decor_mut().set_prefix("\n");
-            }
+            table.decor_mut().set_prefix(prefix);
             table.into()
         })
         .as_table_like_mut()
@@ -325,6 +329,9 @@ fn change_toml(text: &str, server: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     entry.insert("command", toml_edit::value(server));
+    if header_added {
+        doc.set_trailing("");
+    }
     let updated = doc.to_string();
     Ok(Some(if crlf {
         updated.replace('\n', "\r\n")
@@ -503,6 +510,9 @@ mod tests {
 
     #[test]
     fn toml_is_appended_without_disturbing_the_file() {
+        for text in ["# only a comment\n", "model = \"x\"\n# tail\n"] {
+            assert!(toml_changed(text, SERVER).starts_with(text));
+        }
         let text = "# mine\nmodel = \"x\"\n";
         let updated = toml_changed(text, SERVER);
         assert!(updated.starts_with(text));

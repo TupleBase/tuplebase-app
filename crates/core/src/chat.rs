@@ -456,39 +456,48 @@ mod tests {
         assert_eq!(find_in(&[empty], &["claude"]), None);
     }
 
-    /// Runs `script` as the agent on another thread: its result, or `None` if it hangs.
-    #[cfg(unix)]
-    fn run_script(script: &str, stop: &Stop) -> Option<Result<Option<String>>> {
-        let mut command = Command::new("sh");
-        command.args(["-c", script]);
+    /// Runs `agent` on another thread: its result, or `None` if it hangs.
+    fn run_agent(agent: Command, stop: &Stop) -> Option<Result<Option<String>>> {
         let stop = stop.clone();
         let (done, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = done.send(run(command, "hi", None, &stop, |_| {}));
+            let _ = done.send(run(agent, "hi", None, &stop, |_| {}));
         });
         result.recv_timeout(std::time::Duration::from_secs(10)).ok()
     }
 
-    #[cfg(unix)]
+    /// An agent that takes long to answer. On Windows, like `claude.cmd`, a child of
+    /// cmd.exe holds the output, so killing cmd.exe alone would leave the turn hanging.
+    fn slow_agent() -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping -n 30 127.0.0.1"]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "exec sleep 30"]);
+            command
+        }
+    }
+
     #[test]
     fn stopping_a_turn_kills_its_agent() {
         let stop = Stop::default();
         let stopper = stop.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::thread::sleep(std::time::Duration::from_millis(500));
             stopper.stop();
         });
-        let result = run_script("exec sleep 30", &stop).expect("the agent kept running");
+        let result = run_agent(slow_agent(), &stop).expect("the agent kept running");
         assert!(result.is_err());
         assert!(stop.release().is_none());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_turn_stopped_before_its_agent_starts_never_runs_it() {
         let stop = Stop::default();
         stop.stop();
-        let result = run_script("exec sleep 30", &stop).expect("the agent ran");
+        let result = run_agent(slow_agent(), &stop).expect("the agent ran");
         assert!(result.is_err());
     }
 
@@ -496,8 +505,9 @@ mod tests {
     #[test]
     fn an_agent_that_answers_names_the_session() {
         let line = r#"{"type":"assistant","session_id":"s9","message":{"content":[]}}"#;
-        let script = format!("cat >/dev/null; echo '{line}'");
-        let result = run_script(&script, &Stop::default()).expect("the agent hung");
+        let mut agent = Command::new("sh");
+        agent.args(["-c", &format!("cat >/dev/null; echo '{line}'")]);
+        let result = run_agent(agent, &Stop::default()).expect("the agent hung");
         assert_eq!(result.unwrap().as_deref(), Some("s9"));
     }
 
