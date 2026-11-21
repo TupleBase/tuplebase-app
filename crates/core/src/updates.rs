@@ -529,6 +529,104 @@ mod tests {
         assert_finished(root.path());
     }
 
+    /// Runs the real `install.ps1` on a release made here, while an agent runs the
+    /// installed MCP server. It also writes a Start menu shortcut, so it runs in CI only.
+    #[cfg(windows)]
+    #[test]
+    fn installing_on_windows_replaces_a_running_mcp_server() {
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("TupleBase");
+        let download = root.path().join("download");
+        let stage = root.path().join("stage");
+        for d in [&dir, &download, &stage] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // The installed server: a program that keeps running, as one an agent started.
+        let system = Path::new(&std::env::var("SystemRoot").unwrap()).join("System32");
+        let server = dir.join("tuplebase-mcp.exe");
+        fs::copy(system.join("PING.EXE"), &server).unwrap();
+        fs::write(dir.join("tuplebase-app.exe"), "old app").unwrap();
+        let mut running = Command::new(&server)
+            .args(["-n", "120", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            running.try_wait().unwrap().is_none(),
+            "the server should run"
+        );
+        assert!(
+            fs::write(&server, "x").is_err(),
+            "Windows should refuse to overwrite a running program"
+        );
+
+        let version = "9.9.9";
+        let file = format!("TupleBase-{version}-windows-x64.zip");
+        fs::write(stage.join("tuplebase-mcp.exe"), "new server").unwrap();
+        fs::write(stage.join("tuplebase-app.exe"), "new app").unwrap();
+        let zip = download.join(&file);
+        let zipped = Command::new("powershell")
+            .args(["-NoProfile", "-Command"])
+            .arg(format!(
+                "Compress-Archive -Path '{}\\*' -DestinationPath '{}'",
+                stage.display(),
+                zip.display()
+            ))
+            .status()
+            .unwrap();
+        assert!(zipped.success());
+        let sum = format!("{:x}", Sha256::digest(fs::read(&zip).unwrap()));
+        fs::write(download.join("SHA256SUMS"), format!("{sum}  {file}\n")).unwrap();
+
+        let install = || {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.ps1");
+            let output = Command::new("powershell")
+                .args(["-NoProfile", "-Command"])
+                .arg(format!("Get-Content -Raw '{}' | iex", script.display()))
+                .env("TUPLEBASE_INSTALL_DIR", &dir)
+                .env("TUPLEBASE_VERSION", version)
+                .env("TUPLEBASE_DOWNLOAD_DIR", &download)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let set_aside = || {
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".old-")
+                })
+                .count()
+        };
+        install();
+        assert_eq!(fs::read_to_string(&server).unwrap(), "new server");
+        assert_eq!(
+            fs::read_to_string(dir.join("tuplebase-app.exe")).unwrap(),
+            "new app"
+        );
+        // The running server could only be set aside; the old app is gone.
+        assert_eq!(set_aside(), 1);
+
+        running.kill().unwrap();
+        running.wait().unwrap();
+        // The next install removes what the last one set aside.
+        install();
+        assert_eq!(set_aside(), 0);
+    }
+
     /// Downloads a real release, so it only runs on request.
     #[test]
     fn real_release_downloads() {
