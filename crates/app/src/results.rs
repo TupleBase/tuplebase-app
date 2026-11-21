@@ -14,6 +14,10 @@ pub struct ResultsDelegate {
     rows: Vec<Vec<String>>,
     /// What the database returned, for the row detail panel.
     values: Vec<Vec<Value>>,
+    /// A document engine's documents, one per row, in relaxed Extended JSON; `None` for
+    /// SQL. Where set, cells shorten Extended JSON, and a field a document lacks shows
+    /// as an empty cell rather than as `NULL`.
+    documents: Option<Vec<Value>>,
     ran: bool,
     /// Columns that hold only numbers, which line up on the right in the code font.
     numeric: Vec<bool>,
@@ -27,11 +31,31 @@ impl ResultsDelegate {
         self.ran = true;
         let char_width = f32::from(font_size) * CHAR_WIDTH_EM;
         self.values = result.rows.clone();
-        self.rows = result
-            .rows
-            .iter()
-            .map(|row| row.iter().map(cell_text).collect())
-            .collect();
+        self.documents = result.documents.clone();
+        self.rows = match &self.documents {
+            None => result
+                .rows
+                .iter()
+                .map(|row| row.iter().map(cell_text).collect())
+                .collect(),
+            Some(documents) => result
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(i, row)| {
+                    row.iter()
+                        .zip(&result.columns)
+                        .map(|(value, column)| {
+                            if is_absent(documents.get(i), column) {
+                                String::new()
+                            } else {
+                                document_cell_text(value)
+                            }
+                        })
+                        .collect()
+                })
+                .collect(),
+        };
         self.columns = result
             .columns
             .iter()
@@ -44,8 +68,9 @@ impl ResultsDelegate {
                     .p_0()
             })
             .collect();
+        let documents = self.documents.is_some();
         self.numeric = (0..self.columns.len())
-            .map(|i| is_numeric_column(&self.values, i))
+            .map(|i| is_numeric_column(&self.values, i, documents))
             .collect();
     }
 
@@ -72,8 +97,22 @@ impl ResultsDelegate {
         Some(names.zip(values.iter().cloned()).collect())
     }
 
+    /// The document a row shows, when the result holds documents.
+    pub fn document(&self, row_ix: usize) -> Option<&Value> {
+        self.documents.as_ref()?.get(row_ix)
+    }
+
+    /// Whether a cell is a field its document lacks, as opposed to one holding null.
+    fn is_absent_cell(&self, row_ix: usize, col_ix: usize) -> bool {
+        self.documents.as_ref().is_some_and(|documents| {
+            let column = self.columns.get(col_ix).map(|c| c.name.to_string());
+            column.is_some_and(|column| is_absent(documents.get(row_ix), &column))
+        })
+    }
+
     pub fn clear(&mut self) {
         self.ran = false;
+        self.documents = None;
         self.menu_cell = None;
         self.columns.clear();
         self.rows.clear();
@@ -100,14 +139,16 @@ fn column_width(name: &str, rows: &[Vec<String>], index: usize, char_width: f32)
 
 /// Whether every value in the column the database returned is a number. Exact
 /// numbers (`NUMERIC`, `DECIMAL`) arrive as text, so text that is a plain number counts.
-/// NULLs don't decide it; a column of NULLs only is not numeric.
-fn is_numeric_column(rows: &[Vec<Value>], index: usize) -> bool {
+/// NULLs don't decide it; a column of NULLs only is not numeric. In `documents`, the
+/// Extended JSON numbers (`{"$numberDecimal": "1.5"}`) count too.
+fn is_numeric_column(rows: &[Vec<Value>], index: usize, documents: bool) -> bool {
     let mut any = false;
     for value in rows.iter().take(200).filter_map(|row| row.get(index)) {
         let number = match value {
             Value::Null => continue,
             Value::Number(_) => true,
             Value::String(text) => is_plain_number(text),
+            Value::Object(object) if documents => ejson_number(object).is_some(),
             _ => false,
         };
         if !number {
@@ -134,6 +175,101 @@ fn cell_text(value: &Value) -> String {
         Value::Null => "NULL".into(),
         Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Whether `document` lacks the top-level field `column`. A row with no document, or
+/// a document that isn't an object, lacks nothing.
+fn is_absent(document: Option<&Value>, column: &str) -> bool {
+    document
+        .and_then(Value::as_object)
+        .is_some_and(|object| !object.contains_key(column))
+}
+
+/// The number an Extended JSON number wrapper holds, as text: `{"$numberLong": "5"}`.
+fn ejson_number(object: &serde_json::Map<String, Value>) -> Option<&str> {
+    let (tag, value) = single_entry(object)?;
+    matches!(
+        tag,
+        "$numberDecimal" | "$numberLong" | "$numberInt" | "$numberDouble"
+    )
+    .then(|| value.as_str())
+    .flatten()
+}
+
+fn single_entry(object: &serde_json::Map<String, Value>) -> Option<(&str, &Value)> {
+    let mut entries = object.iter();
+    let (key, value) = entries.next()?;
+    entries.next().is_none().then_some((key.as_str(), value))
+}
+
+/// A one-key Extended JSON value written as the shell writes it: `ObjectId("…")`, the
+/// number of a `$numberDecimal`, a date as ISO text (`top`) or `ISODate("…")` (nested).
+fn short_ejson(object: &serde_json::Map<String, Value>, top: bool) -> Option<String> {
+    if let Some(number) = ejson_number(object) {
+        return Some(number.to_owned());
+    }
+    let (tag, value) = single_entry(object)?;
+    match (tag, value) {
+        ("$oid", Value::String(id)) => Some(format!("ObjectId(\"{id}\")")),
+        ("$date", Value::String(iso)) if top => Some(iso.clone()),
+        ("$date", Value::String(iso)) => Some(format!("ISODate(\"{iso}\")")),
+        // Outside years 1970 to 9999 the date comes as milliseconds since 1970.
+        ("$date", Value::Object(inner)) => {
+            ejson_number(inner).map(|millis| format!("Date({millis})"))
+        }
+        _ => None,
+    }
+}
+
+/// A document's value as its cell shows it: text without quotes, `NULL` for null, and
+/// compact JSON for the rest, with Extended JSON wrappers shortened at any depth.
+fn document_cell_text(value: &Value) -> String {
+    match value {
+        Value::Object(object) => match short_ejson(object, true) {
+            Some(text) => text,
+            None => compact_ejson(value),
+        },
+        Value::Array(_) => compact_ejson(value),
+        other => cell_text(other),
+    }
+}
+
+fn compact_ejson(value: &Value) -> String {
+    let mut out = String::new();
+    write_compact(&mut out, value);
+    out
+}
+
+fn write_compact(out: &mut String, value: &Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(text) = short_ejson(object, false) {
+                out.push_str(&text);
+                return;
+            }
+            out.push('{');
+            for (i, (key, value)) in object.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::from(key.as_str()).to_string());
+                out.push(':');
+                write_compact(out, value);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_compact(out, item);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
     }
 }
 
@@ -226,19 +362,21 @@ impl TableDelegate for ResultsDelegate {
         let theme = cx.theme();
         let numeric = self.numeric.get(col_ix).copied().unwrap_or_default();
         let value = &self.values[row_ix][col_ix];
+        let absent = self.is_absent_cell(row_ix, col_ix);
         // The SQL editor's colors: numbers and booleans stand out, NULL steps back.
         let syntax = |name: &str| {
             let style = theme.highlight_theme.style(name).unwrap_or_default();
             (style.color, style.font_style)
         };
         let (color, font_style) = match value {
+            _ if absent => (None, None),
             Value::Null => syntax("comment"),
             Value::Bool(_) => syntax("boolean"),
             _ if numeric => syntax("number"),
             _ => (None, None),
         };
         padded_cell(cx)
-            .when(numeric || value.is_null(), |cell| {
+            .when(numeric || (value.is_null() && !absent), |cell| {
                 cell.font_family(theme.mono_font_family.clone())
                     .text_size(theme.mono_font_size)
             })
@@ -263,13 +401,17 @@ impl TableDelegate for ResultsDelegate {
         _: &mut Window,
         _: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
+        // The text the cell shows, as `cell_text` or the document's own wrote it.
         let value = self
             .menu_cell
             .take()
             .filter(|(row, _)| *row == row_ix)
-            .and_then(|(row, col)| self.values.get(row)?.get(col))
-            .map(cell_text);
-        let row = self.row(row_ix).map(|row| row_json(&row));
+            .and_then(|(row, col)| self.rows.get(row)?.get(col))
+            .cloned();
+        let row = match self.document(row_ix) {
+            Some(document) => serde_json::to_string_pretty(document).ok(),
+            None => self.row(row_ix).map(|row| row_json(&row)),
+        };
         menu.when_some(value, |menu, value| {
             menu.item(copy_item("Copy value", value))
         })
@@ -298,12 +440,19 @@ impl ResultsDelegate {
     pub(crate) fn show(&mut self, result: &QueryResult) {
         self.set(result, px(15.));
     }
+
+    /// The text a cell shows.
+    pub(crate) fn cell(&self, row_ix: usize, col_ix: usize) -> &str {
+        &self.rows[row_ix][col_ix]
+    }
 }
 
 #[cfg(test)]
 mod tests {
     // No glob: gpui_kit's `test` macro would shadow the built-in `#[test]`.
-    use super::{column_width, is_numeric_column, is_plain_number, row_json};
+    use super::{
+        column_width, document_cell_text, is_absent, is_numeric_column, is_plain_number, row_json,
+    };
     use serde_json::json;
 
     #[test]
@@ -319,7 +468,7 @@ mod tests {
     fn number_columns_are_found_also_when_they_arrive_as_text() {
         let column = |values: Vec<serde_json::Value>| {
             let rows: Vec<_> = values.into_iter().map(|v| vec![v]).collect();
-            is_numeric_column(&rows, 0)
+            is_numeric_column(&rows, 0, false)
         };
         assert!(column(vec![json!(1), json!(null), json!(2.5)]));
         assert!(column(vec![json!("3700.00"), json!("-1"), json!(null)]));
@@ -344,5 +493,58 @@ mod tests {
             row_json(&row),
             "{\n  \"name\": \"say \\\"hi\\\"\",\n  \"id\": 1,\n  \"id_2\": null\n}"
         );
+    }
+
+    #[test]
+    fn document_cells_shorten_extended_json() {
+        let id = json!({"$oid": "65f0c0ffee0000000000abcd"});
+        assert_eq!(
+            document_cell_text(&id),
+            "ObjectId(\"65f0c0ffee0000000000abcd\")"
+        );
+        let date = json!({"$date": "2024-02-03T04:05:06Z"});
+        assert_eq!(document_cell_text(&date), "2024-02-03T04:05:06Z");
+        let old = json!({"$date": {"$numberLong": "-1000"}});
+        assert_eq!(document_cell_text(&old), "Date(-1000)");
+        assert_eq!(
+            document_cell_text(&json!({"$numberDecimal": "19.99"})),
+            "19.99"
+        );
+        assert_eq!(
+            document_cell_text(&json!({"$numberLong": "9007199254740993"})),
+            "9007199254740993"
+        );
+        // Nested values are shortened too; plain objects and text stay as they are.
+        assert_eq!(
+            document_cell_text(&json!({"by": id, "at": date, "n": 1, "s": "x"})),
+            "{\"by\":ObjectId(\"65f0c0ffee0000000000abcd\"),\
+             \"at\":ISODate(\"2024-02-03T04:05:06Z\"),\"n\":1,\"s\":\"x\"}"
+        );
+        assert_eq!(
+            document_cell_text(&json!([{"$numberDecimal": "1.5"}, null])),
+            "[1.5,null]"
+        );
+        assert_eq!(
+            document_cell_text(&json!({"$oid": "a", "x": 1})),
+            "{\"$oid\":\"a\",\"x\":1}"
+        );
+        assert_eq!(document_cell_text(&json!("plain")), "plain");
+        assert_eq!(document_cell_text(&json!(null)), "NULL");
+    }
+
+    #[test]
+    fn decimal_columns_of_documents_line_up_as_numbers() {
+        let rows = vec![vec![json!({"$numberDecimal": "19.99"})], vec![json!(5)]];
+        assert!(is_numeric_column(&rows, 0, true));
+        assert!(!is_numeric_column(&rows, 0, false));
+    }
+
+    #[test]
+    fn a_missing_field_is_absent_and_a_null_one_is_not() {
+        let document = json!({"a": null});
+        assert!(!is_absent(Some(&document), "a"));
+        assert!(is_absent(Some(&document), "b"));
+        assert!(!is_absent(None, "b"));
+        assert!(!is_absent(Some(&json!(3)), "b"));
     }
 }

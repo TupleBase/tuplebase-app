@@ -13,7 +13,7 @@ use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tuplebase_core::config::Connection;
+use tuplebase_core::config::{Connection, Family};
 use tuplebase_core::db::{ColumnInfo, Db, ObjectInfo, ObjectKind, TableInfo};
 
 use crate::completions::SchemaNames;
@@ -21,6 +21,7 @@ use crate::runtime::io;
 use crate::tree_nav::{self, TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeUp};
 
 const TABLE_ICON: &[u8] = include_bytes!("../../../assets/icons/table-2.svg");
+const VIEW_ICON: &[u8] = include_bytes!("../../../assets/icons/eye.svg");
 const ROW_HEIGHT: f32 = 30.;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -60,6 +61,14 @@ enum Row {
         open: bool,
     },
     Object(ObjectInfo),
+    /// The indexes of an expanded collection, as one group under its fields.
+    Indexes {
+        key: TableKey,
+        count: usize,
+        open: bool,
+    },
+    /// One index in a collection's open group.
+    Index(ObjectInfo),
     Note(&'static str),
 }
 
@@ -71,6 +80,7 @@ enum Target {
     Group(String, ObjectKind),
     /// An object whose definition a click shows.
     Object(ObjectInfo),
+    Indexes(TableKey),
 }
 
 impl Row {
@@ -79,10 +89,11 @@ impl Row {
             Row::Schema { name, .. } => Some(Target::Schema(name.clone())),
             Row::Table { key, .. } => Some(Target::Table(key.clone())),
             Row::Group { schema, kind, .. } => Some(Target::Group(schema.clone(), *kind)),
-            Row::Object(object) if object.kind.has_definition() => {
+            Row::Object(object) | Row::Index(object) if object.kind.has_definition() => {
                 Some(Target::Object(object.clone()))
             }
-            Row::Column { .. } | Row::Object(_) | Row::Note(_) => None,
+            Row::Indexes { key, .. } => Some(Target::Indexes(key.clone())),
+            Row::Column { .. } | Row::Object(_) | Row::Index(_) | Row::Note(_) => None,
         }
     }
 }
@@ -133,8 +144,15 @@ fn object_id(object: &ObjectInfo) -> String {
 /// The groups the user has opened.
 type OpenGroups = HashSet<(String, ObjectKind)>;
 
-/// The visible lines, in order. A filter searches names across every schema, so matches
-/// stay visible even in a collapsed schema or group.
+/// The collection a document engine's index belongs to, from its detail (`on users`).
+fn index_collection(object: &ObjectInfo) -> Option<&str> {
+    (object.kind == ObjectKind::Index)
+        .then(|| object.detail.strip_prefix("on "))
+        .flatten()
+}
+
+/// The visible lines of a SQL database's tree, for the tests. See [`flatten_tree`].
+#[cfg(test)]
 fn flatten(
     tables: &[TableInfo],
     objects: &[ObjectInfo],
@@ -143,10 +161,41 @@ fn flatten(
     open_groups: &OpenGroups,
     expanded: &HashMap<TableKey, Columns>,
 ) -> Vec<Row> {
+    flatten_tree(
+        tables,
+        objects,
+        filter,
+        collapsed,
+        open_groups,
+        expanded,
+        None,
+    )
+}
+
+/// The visible lines, in order. A filter searches names across every schema, so matches
+/// stay visible even in a collapsed schema or group.
+///
+/// `open_indexes` is set for a document engine: its indexes then sit in an "Indexes"
+/// group under their expanded collection, after the sampled fields, rather than in the
+/// database's own groups. The filter matches collections there, not their indexes.
+fn flatten_tree(
+    tables: &[TableInfo],
+    objects: &[ObjectInfo],
+    filter: &str,
+    collapsed: &HashSet<String>,
+    open_groups: &OpenGroups,
+    expanded: &HashMap<TableKey, Columns>,
+    open_indexes: Option<&HashSet<TableKey>>,
+) -> Vec<Row> {
     let filter = filter.trim().to_lowercase();
     let matches = |name: &str| name.to_lowercase().contains(&filter);
+    let all_objects = objects;
     let tables: Vec<&TableInfo> = tables.iter().filter(|t| matches(&t.name)).collect();
-    let objects: Vec<&ObjectInfo> = objects.iter().filter(|o| matches(&o.name)).collect();
+    let nested = |o: &ObjectInfo| open_indexes.is_some() && index_collection(o).is_some();
+    let objects: Vec<&ObjectInfo> = objects
+        .iter()
+        .filter(|o| !nested(o) && matches(&o.name))
+        .collect();
     let schemas: BTreeSet<&str> = tables
         .iter()
         .map(|t| t.schema.as_str())
@@ -171,19 +220,40 @@ fn flatten(
             };
             let columns = expanded.get(&key);
             rows.push(Row::Table {
-                key,
+                key: key.clone(),
                 is_view: table.kind.to_uppercase().contains("VIEW"),
                 expanded: columns.is_some(),
             });
+            let (loading, failed) = match open_indexes {
+                Some(_) => ("Sampling fields…", "Could not sample fields."),
+                None => ("Loading columns…", "Could not load columns."),
+            };
             match columns {
                 None => {}
-                Some(Columns::Loading) => rows.push(Row::Note("Loading columns…")),
-                Some(Columns::Failed) => rows.push(Row::Note("Could not load columns.")),
+                Some(Columns::Loading) => rows.push(Row::Note(loading)),
+                Some(Columns::Failed) => rows.push(Row::Note(failed)),
                 Some(Columns::Loaded(list)) => {
                     rows.extend(list.iter().map(|c| Row::Column {
                         name: c.name.clone(),
                         data_type: c.data_type.clone(),
                     }));
+                }
+            }
+            if let (Some(open_indexes), Some(_)) = (open_indexes, columns) {
+                let indexes: Vec<&ObjectInfo> = all_objects
+                    .iter()
+                    .filter(|o| o.schema == schema && index_collection(o) == Some(&table.name))
+                    .collect();
+                if !indexes.is_empty() {
+                    let open = open_indexes.contains(&key);
+                    rows.push(Row::Indexes {
+                        key,
+                        count: indexes.len(),
+                        open,
+                    });
+                    if open {
+                        rows.extend(indexes.into_iter().map(|o| Row::Index(o.clone())));
+                    }
                 }
             }
         }
@@ -222,6 +292,9 @@ pub enum SchemaEvent {
     Insert(String),
     /// Looking something up failed; this says what went wrong.
     Failed(String),
+    /// Show this text to read, not to run, such as a document engine's index or view
+    /// definition, under this title.
+    Show { title: String, text: String },
 }
 
 pub struct SchemaPanel {
@@ -238,6 +311,8 @@ pub struct SchemaPanel {
     collapsed: HashSet<String>,
     open_groups: OpenGroups,
     pub(crate) expanded: HashMap<TableKey, Columns>,
+    /// Document engines: the collections whose "Indexes" group is open.
+    pub(crate) open_indexes: HashSet<TableKey>,
     filter: Entity<InputState>,
     scroll: UniformListScrollHandle,
     focus: FocusHandle,
@@ -282,6 +357,7 @@ impl SchemaPanel {
             collapsed: HashSet::new(),
             open_groups: HashSet::new(),
             expanded: HashMap::new(),
+            open_indexes: HashSet::new(),
             filter,
             scroll: UniformListScrollHandle::new(),
             focus,
@@ -299,6 +375,7 @@ impl SchemaPanel {
         self.names.borrow_mut().clear();
         self.collapsed.clear();
         self.open_groups.clear();
+        self.open_indexes.clear();
         self.cursor = None;
         self.load = Load::Idle;
         self.refresh(cx);
@@ -343,11 +420,11 @@ impl SchemaPanel {
         }
         match result {
             Ok((tables, columns, objects)) => {
-                let mut names: Vec<String> = tables.iter().map(|t| t.name.clone()).collect();
-                names.extend(columns);
-                names.sort();
-                names.dedup();
-                *self.names.borrow_mut() = names;
+                let names = tables
+                    .iter()
+                    .map(|t| (t.schema.clone(), t.name.clone()))
+                    .collect();
+                self.names.borrow_mut().set(names, columns);
                 self.tables = tables;
                 self.objects = objects;
                 self.load = Load::Ready;
@@ -364,6 +441,14 @@ impl SchemaPanel {
     /// Drops the definition or call still loading, as when the editor has changed.
     pub fn forget_lookup(&mut self) {
         self.looking_up += 1;
+    }
+
+    /// Whether the connection is a document engine, such as MongoDB, whose tree nests
+    /// indexes under collections and samples their fields.
+    fn is_document(&self) -> bool {
+        self.connection
+            .as_ref()
+            .is_some_and(|c| c.adapter.family() == Family::Document)
     }
 
     /// Results can arrive after the user has moved to another connection.
@@ -403,6 +488,24 @@ impl SchemaPanel {
         if self.expanded.remove(&key).is_some() {
             return;
         }
+        self.load_columns(key, cx);
+    }
+
+    /// Samples a collection's fields again, as its documents may have changed.
+    fn resample(&mut self, key: TableKey, cx: &mut Context<Self>) {
+        cx.notify();
+        self.load_columns(key, cx);
+    }
+
+    fn toggle_indexes(&mut self, key: TableKey, cx: &mut Context<Self>) {
+        if !self.open_indexes.remove(&key) {
+            self.open_indexes.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Loads a table's columns, or samples a collection's fields, and shows them under it.
+    fn load_columns(&mut self, key: TableKey, cx: &mut Context<Self>) {
         let Some(conn) = self.connection.clone() else {
             return;
         };
@@ -417,8 +520,15 @@ impl SchemaPanel {
             })
             .await;
             this.update(cx, |this, cx| {
-                if !this.is_showing(&name) || !this.expanded.contains_key(&key) {
+                // Collapsed meanwhile, or already shown by a later load.
+                if !this.is_showing(&name)
+                    || !matches!(this.expanded.get(&key), Some(Columns::Loading))
+                {
                     return;
+                }
+                if let Ok(columns) = &result {
+                    let names = columns.iter().map(|c| c.name.clone());
+                    this.names.borrow_mut().add_columns(names);
                 }
                 let columns = result.map_or(Columns::Failed, Columns::Loaded);
                 this.expanded.insert(key, columns);
@@ -446,6 +556,14 @@ impl SchemaPanel {
             Lookup::Definition => format!("Could not show the definition of {}", object.name),
             Lookup::Call => format!("Could not write a call of {}", object.name),
         };
+        // A document engine's definition is shell text to read: shown beside the
+        // results, so the editor keeps what was typed.
+        let show_title =
+            (self.is_document() && lookup == Lookup::Definition).then(|| match object.kind {
+                ObjectKind::Index => format!("Index {} {}", object.name, object.detail),
+                ObjectKind::View => format!("View {}", object.name),
+                _ => object.name.clone(),
+            });
         let fetch = (self.fetch)(conn, object, lookup);
         self.looking_up += 1;
         let id = self.looking_up;
@@ -456,9 +574,10 @@ impl SchemaPanel {
                 if !this.is_showing(&name) || this.looking_up != id {
                     return;
                 }
-                cx.emit(match result {
-                    Ok(sql) => SchemaEvent::Insert(sql),
-                    Err(e) => SchemaEvent::Failed(format!("{what}: {e:#}")),
+                cx.emit(match (result, show_title) {
+                    (Ok(text), Some(title)) => SchemaEvent::Show { title, text },
+                    (Ok(sql), None) => SchemaEvent::Insert(sql),
+                    (Err(e), _) => SchemaEvent::Failed(format!("{what}: {e:#}")),
                 });
             })
             .ok();
@@ -492,19 +611,60 @@ impl SchemaPanel {
         }
     }
 
+    /// The right-click menu of a document engine's collection or view.
+    fn collection_menu(
+        &self,
+        key: &TableKey,
+        is_view: bool,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static + use<>
+    {
+        let this = cx.entity().downgrade();
+        let key = key.clone();
+        move |menu, _, _| {
+            let item =
+                |label: &'static str, action: fn(&mut Self, TableKey, &mut Context<Self>)| {
+                    let (this, key) = (this.clone(), key.clone());
+                    PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| action(this, key.clone(), cx))
+                            .ok();
+                    })
+                };
+            let menu = menu
+                .item(item("Show first 100 documents", |this, key, cx| {
+                    this.preview(&key, cx)
+                }))
+                .item(item("Resample fields", Self::resample));
+            if is_view {
+                menu.item(item("Show definition", |this, key, cx| {
+                    let view = ObjectInfo {
+                        schema: key.schema,
+                        kind: ObjectKind::View,
+                        name: key.table,
+                        detail: String::new(),
+                    };
+                    this.look_up(view, Lookup::Definition, cx);
+                }))
+            } else {
+                menu
+            }
+        }
+    }
+
     fn filter_text(&self, cx: &App) -> String {
         self.filter.read(cx).value().to_string()
     }
 
     /// The visible lines, top to bottom.
     fn rows(&self, cx: &App) -> Vec<Row> {
-        flatten(
+        flatten_tree(
             &self.tables,
             &self.objects,
             &self.filter_text(cx),
             &self.collapsed,
             &self.open_groups,
             &self.expanded,
+            self.is_document().then_some(&self.open_indexes),
         )
     }
 
@@ -515,6 +675,7 @@ impl SchemaPanel {
             Target::Table(key) => key.table.clone(),
             Target::Group(_, kind) => kind.plural().to_owned(),
             Target::Object(object) => object.name.clone(),
+            Target::Indexes(key) => format!("{} indexes", key.table),
         })
     }
 
@@ -581,6 +742,19 @@ impl SchemaPanel {
                 expanded: true,
                 ..
             }) => self.toggle_table(key, cx),
+            Some(Row::Indexes {
+                key, open: true, ..
+            }) => self.toggle_indexes(key, cx),
+            Some(Row::Indexes { key, .. }) => self.set_cursor(Target::Table(key), cx),
+            Some(Row::Index(object)) => {
+                if let Some(table) = index_collection(&object) {
+                    let key = TableKey {
+                        schema: object.schema.clone(),
+                        table: table.to_owned(),
+                    };
+                    self.set_cursor(Target::Indexes(key), cx);
+                }
+            }
             Some(Row::Table { key, .. }) => self.set_cursor(Target::Schema(key.schema), cx),
             Some(Row::Group { schema, .. }) => self.set_cursor(Target::Schema(schema), cx),
             Some(Row::Object(object)) => {
@@ -610,6 +784,9 @@ impl SchemaPanel {
                 open: false,
                 ..
             }) => self.toggle_group(schema, kind, cx),
+            Some(Row::Indexes {
+                key, open: false, ..
+            }) => self.toggle_indexes(key, cx),
             _ => {}
         }
     }
@@ -621,7 +798,10 @@ impl SchemaPanel {
             Some(Row::Schema { name, .. }) => self.toggle_schema(&name, cx),
             Some(Row::Table { key, .. }) => self.preview(&key, cx),
             Some(Row::Group { schema, kind, .. }) => self.toggle_group(schema, kind, cx),
-            Some(Row::Object(object)) => self.look_up(object, Lookup::Definition, cx),
+            Some(Row::Object(object) | Row::Index(object)) => {
+                self.look_up(object, Lookup::Definition, cx)
+            }
+            Some(Row::Indexes { key, .. }) => self.toggle_indexes(key, cx),
             _ => {}
         }
     }
@@ -694,7 +874,11 @@ impl SchemaPanel {
                     detail: String::new(),
                 };
                 let view_key = key.clone();
-                line()
+                let icon = if is_view { VIEW_ICON } else { TABLE_ICON };
+                let menu = self
+                    .is_document()
+                    .then(|| self.collection_menu(&key, is_view, cx));
+                let el = line()
                     .id(SharedString::from(id.clone()))
                     .test_support()
                     .group(group.clone())
@@ -702,7 +886,7 @@ impl SchemaPanel {
                     .cursor_pointer()
                     .hover(move |s| s.bg(hover))
                     .child(chevron(expanded))
-                    .child(Icon::default().data(TABLE_ICON).xsmall().text_color(muted))
+                    .child(Icon::default().data(icon).xsmall().text_color(muted))
                     .child(
                         div()
                             .flex_1()
@@ -753,8 +937,11 @@ impl SchemaPanel {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.take_cursor(Target::Table(key.clone()), window, cx);
                         this.toggle_table(key.clone(), cx);
-                    }))
-                    .into_any_element()
+                    }));
+                match menu {
+                    Some(menu) => el.context_menu(menu).into_any_element(),
+                    None => el.into_any_element(),
+                }
             }
             Row::Column { name, data_type } => line()
                 .pl(px(50.))
@@ -839,6 +1026,50 @@ impl SchemaPanel {
                     None => el.into_any_element(),
                 }
             }
+            Row::Indexes { key, count, open } => line()
+                .id(SharedString::from(format!(
+                    "indexes-{}-{}",
+                    key.schema, key.table
+                )))
+                .test_support()
+                .pl(px(34.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(chevron(open))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Indexes"),
+                )
+                .child(count_pill(count, cx))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.take_cursor(Target::Indexes(key.clone()), window, cx);
+                    this.toggle_indexes(key.clone(), cx);
+                }))
+                .into_any_element(),
+            Row::Index(object) => line()
+                .id(SharedString::from(object_id(&object)))
+                .test_support()
+                .pl(px(62.))
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .child(object.name.clone()),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.take_cursor(Target::Object(object.clone()), window, cx);
+                    this.look_up(object.clone(), Lookup::Definition, cx);
+                }))
+                .into_any_element(),
             Row::Note(text) => line()
                 .pl(px(50.))
                 .text_xs()
@@ -940,7 +1171,7 @@ mod tests {
     // No glob: gpui_kit's `test` macro would shadow the built-in `#[test]`.
     use super::{
         ColumnInfo, Columns, HashMap, HashSet, ObjectInfo, ObjectKind, Row, TableInfo, TableKey,
-        flatten,
+        flatten, flatten_tree,
     };
 
     fn plain_flatten(
@@ -992,6 +1223,8 @@ mod tests {
                 Row::Column { name, .. } => format!("  {name}"),
                 Row::Group { kind, count, .. } => format!("{}({count})", kind.plural()),
                 Row::Object(object) => format!("  {}", object.name),
+                Row::Indexes { count, .. } => format!("  Indexes({count})"),
+                Row::Index(object) => format!("    {}", object.name),
                 Row::Note(text) => format!("  {text}"),
             })
             .collect()
@@ -1123,5 +1356,127 @@ mod tests {
     #[test]
     fn no_tables_means_no_rows() {
         assert!(plain_flatten(&[], "", &HashSet::new(), &HashMap::new()).is_empty());
+    }
+
+    fn index(database: &str, collection: &str, name: &str) -> ObjectInfo {
+        ObjectInfo {
+            schema: database.into(),
+            kind: ObjectKind::Index,
+            name: name.into(),
+            detail: format!("on {collection}"),
+        }
+    }
+
+    fn collections() -> Vec<TableInfo> {
+        vec![
+            table("app", "active_users", "VIEW"),
+            table("app", "orders", "COLLECTION"),
+            table("app", "users", "COLLECTION"),
+        ]
+    }
+
+    fn mongo_indexes() -> Vec<ObjectInfo> {
+        vec![
+            index("app", "orders", "_id_"),
+            index("app", "users", "_id_"),
+            index("app", "users", "email_1"),
+        ]
+    }
+
+    fn field(name: &str, data_type: &str) -> ColumnInfo {
+        ColumnInfo {
+            name: name.into(),
+            data_type: data_type.into(),
+            nullable: false,
+        }
+    }
+
+    #[test]
+    fn a_collection_lists_its_sampled_fields_then_its_indexes() {
+        let expanded = HashMap::from([(
+            key("app", "users"),
+            Columns::Loaded(vec![field("_id", "int32"), field("email", "string|null")]),
+        )]);
+        let rows = flatten_tree(
+            &collections(),
+            &mongo_indexes(),
+            "",
+            &HashSet::new(),
+            &HashSet::new(),
+            &expanded,
+            Some(&HashSet::new()),
+        );
+        // No database-level Indexes group: each collection holds its own.
+        assert_eq!(
+            names(&rows),
+            [
+                "app(3)",
+                "active_users",
+                "orders",
+                "users",
+                "  _id",
+                "  email",
+                "  Indexes(2)",
+            ]
+        );
+        assert!(matches!(rows[1], Row::Table { is_view: true, .. }));
+        assert!(matches!(rows[2], Row::Table { is_view: false, .. }));
+    }
+
+    #[test]
+    fn an_open_indexes_group_lists_only_its_collections_indexes() {
+        let expanded = HashMap::from([
+            (key("app", "users"), Columns::Loading),
+            (key("app", "orders"), Columns::Failed),
+        ]);
+        let open = HashSet::from([key("app", "users")]);
+        let rows = flatten_tree(
+            &collections(),
+            &mongo_indexes(),
+            "",
+            &HashSet::new(),
+            &HashSet::new(),
+            &expanded,
+            Some(&open),
+        );
+        assert_eq!(
+            names(&rows),
+            [
+                "app(3)",
+                "active_users",
+                "orders",
+                "  Could not sample fields.",
+                "  Indexes(1)",
+                "users",
+                "  Sampling fields…",
+                "  Indexes(2)",
+                "    _id_",
+                "    email_1",
+            ]
+        );
+    }
+
+    #[test]
+    fn sql_indexes_stay_in_their_schema_group() {
+        let objects = [index("public", "orders", "orders_pkey")];
+        let rows = flatten(
+            &sample(),
+            &objects,
+            "",
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            names(&rows),
+            [
+                "public(2)",
+                "orders",
+                "users",
+                "Indexes(1)",
+                "reports(1)",
+                "daily"
+            ]
+        );
     }
 }

@@ -593,6 +593,55 @@ fn line_column(src: &str, offset: usize) -> (usize, usize) {
 
 /// The deepest nesting of documents and arrays accepted, so a hostile input can't
 /// exhaust the stack.
+/// The collection methods that read, as the parser reads them after `db.<collection>.`;
+/// the editor's completions offer these names.
+pub const READ_METHODS: [&str; 7] = [
+    "find",
+    "findOne",
+    "aggregate",
+    "countDocuments",
+    "estimatedDocumentCount",
+    "distinct",
+    "getIndexes",
+];
+
+/// The collection methods that write, run only on a writable connection.
+pub const WRITE_METHODS: [&str; 10] = [
+    "insertOne",
+    "insertMany",
+    "updateOne",
+    "updateMany",
+    "replaceOne",
+    "deleteOne",
+    "deleteMany",
+    "createIndex",
+    "dropIndex",
+    "drop",
+];
+
+/// The methods the parser reads right after `db.`, besides a collection's name.
+pub const DATABASE_METHODS: [&str; 5] = [
+    "getCollection",
+    "getSiblingDB",
+    "getCollectionNames",
+    "runCommand",
+    "adminCommand",
+];
+
+/// The methods that may follow `find(...)`.
+pub const FIND_CURSOR_METHODS: [&str; 7] = [
+    "sort",
+    "projection",
+    "limit",
+    "skip",
+    "pretty",
+    "toArray",
+    "explain",
+];
+
+/// The methods that may follow `aggregate(...)`.
+pub const AGGREGATE_CURSOR_METHODS: [&str; 3] = ["pretty", "toArray", "explain"];
+
 const MAX_DEPTH: usize = 100;
 
 struct Parser<'a> {
@@ -1060,16 +1109,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let method = self.word("a cursor method")?;
             let method_at = self.toks[self.pos - 1].1.start;
-            const FIND_CHAIN: [&str; 7] = [
-                "sort",
-                "projection",
-                "limit",
-                "skip",
-                "pretty",
-                "toArray",
-                "explain",
-            ];
-            if !FIND_CHAIN.contains(&method.as_str()) {
+            if !FIND_CURSOR_METHODS.contains(&method.as_str()) {
                 return Err(self.error_at(
                     method_at,
                     &format!("unknown or unsupported cursor method `{method}`"),
@@ -1593,6 +1633,46 @@ mod tests {
         Target {
             database: None,
             collection: "users".into(),
+        }
+    }
+
+    /// The method lists the editor offers stay those the parser reads.
+    #[test]
+    fn every_listed_method_parses() {
+        let args = |method: &str| match method {
+            "aggregate" | "insertMany" => "[{}]",
+            "distinct" => "'a'",
+            "insertOne" | "deleteOne" | "deleteMany" | "createIndex" => "{a: 1}",
+            "updateOne" | "updateMany" | "replaceOne" => "{}, {a: 1}",
+            "dropIndex" => "'a_1'",
+            _ => "",
+        };
+        for method in READ_METHODS.iter().chain(&WRITE_METHODS) {
+            let src = format!("db.c.{method}({})", args(method));
+            assert!(parse_command(&src).is_ok(), "{src}");
+        }
+        for method in FIND_CURSOR_METHODS {
+            let arg = match method {
+                "sort" | "projection" => "{a: 1}",
+                "limit" | "skip" => "1",
+                _ => "",
+            };
+            let src = format!("db.c.find().{method}({arg})");
+            assert!(parse_command(&src).is_ok(), "{src}");
+        }
+        for method in AGGREGATE_CURSOR_METHODS {
+            let src = format!("db.c.aggregate([]).{method}()");
+            assert!(parse_command(&src).is_ok(), "{src}");
+        }
+        for (method, arg) in DATABASE_METHODS.iter().zip([
+            "'c').find(",
+            "'d').c.find(",
+            "",
+            "{ping: 1}",
+            "{ping: 1}",
+        ]) {
+            let src = format!("db.{method}({arg})");
+            assert!(parse_command(&src).is_ok(), "{src}");
         }
     }
 

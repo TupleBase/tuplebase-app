@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::ser::SerializeSeq as _;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -546,6 +546,118 @@ impl MongoSettings {
         }
         Ok(())
     }
+}
+
+/// What a pasted `mongodb://` or `mongodb+srv://` connection string holds, split into the
+/// form's fields. The string itself is never kept: the password goes to the credential
+/// store like a typed one, and the rest to plain settings (S1).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct MongoUri {
+    pub srv: bool,
+    /// The first host, as written (an IPv6 address keeps its brackets).
+    pub host: String,
+    /// `None` when not given, or for an SRV address, which has none.
+    pub port: Option<u16>,
+    /// How many more hosts the string listed. A connection keeps one; with `replicaSet`
+    /// the driver finds the others from it.
+    pub other_hosts: usize,
+    pub user: String,
+    pub password: Option<String>,
+    pub database: String,
+    /// The options, as written, without any that would put a secret in the settings.
+    pub options: String,
+    /// The names of the options left out for holding a secret.
+    pub dropped: Vec<String>,
+}
+
+/// Splits a MongoDB connection string into the form's fields. Errors never quote the
+/// string, which may hold a password.
+pub fn parse_mongo_uri(text: &str) -> Result<MongoUri> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    let (srv, rest) = if lower.starts_with("mongodb+srv://") {
+        (true, &text["mongodb+srv://".len()..])
+    } else if lower.starts_with("mongodb://") {
+        (false, &text["mongodb://".len()..])
+    } else {
+        bail!("a connection string starts with mongodb:// or mongodb+srv://");
+    };
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (userinfo, hosts) = match authority.rfind('@') {
+        Some(at) => (Some(&authority[..at]), &authority[at + 1..]),
+        None => (None, authority),
+    };
+    let (user, password) = match userinfo {
+        None => (String::new(), None),
+        Some(info) => {
+            let (user, password) = match info.split_once(':') {
+                Some((user, password)) => (user, Some(password)),
+                None => (info, None),
+            };
+            let password = password.map(percent_decode).filter(|p| !p.is_empty());
+            (percent_decode(user), password)
+        }
+    };
+    let mut list = hosts.split(',').map(str::trim).filter(|h| !h.is_empty());
+    let first = list
+        .next()
+        .ok_or_else(|| anyhow!("the connection string names no host"))?;
+    let other_hosts = list.count();
+    let (host, port) = split_host_port(first)?;
+    let (path, query) = match tail.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (tail, ""),
+    };
+    let database = percent_decode(path.trim_start_matches('/'));
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for pair in query.split('&').filter(|p| !p.trim().is_empty()) {
+        let settings = MongoSettings {
+            srv: false,
+            options: pair.to_owned(),
+        };
+        if settings.check().is_ok() {
+            kept.push(pair);
+        } else {
+            let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+            dropped.push(percent_decode(key));
+        }
+    }
+    Ok(MongoUri {
+        srv,
+        host,
+        port: if srv { None } else { port },
+        other_hosts,
+        user,
+        password,
+        database,
+        options: kept.join("&"),
+        dropped,
+    })
+}
+
+/// `host`, `host:port`, `[v6]` or `[v6]:port`.
+fn split_host_port(text: &str) -> Result<(String, Option<u16>)> {
+    let (host, port) = if text.starts_with('[') {
+        match text.find(']') {
+            Some(end) => (&text[..=end], text[end + 1..].strip_prefix(':')),
+            None => bail!("an IPv6 host in the connection string lacks its closing ]"),
+        }
+    } else {
+        match text.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (text, None),
+        }
+    };
+    let port = match port {
+        None | Some("") => None,
+        Some(port) => Some(
+            port.parse()
+                .map_err(|_| anyhow!("the port in the connection string isn't a number"))?,
+        ),
+    };
+    Ok((percent_decode(host), port))
 }
 
 /// `%XX` decoded, with `+` left as it is; bytes that aren't UTF-8 are replaced.
@@ -2251,6 +2363,69 @@ mod tests {
         let mut wrong = pg("p");
         wrong.mongo = Some(MongoSettings::default());
         assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn a_connection_string_is_split_into_fields() {
+        let uri = parse_mongo_uri(
+            " mongodb://ada%40corp:p%40ss%3Aw0rd@db1.example.com:27018,db2.example.com/app\
+             ?replicaSet=rs0&authSource=admin ",
+        )
+        .unwrap();
+        assert_eq!(
+            uri,
+            MongoUri {
+                srv: false,
+                host: "db1.example.com".into(),
+                port: Some(27018),
+                other_hosts: 1,
+                user: "ada@corp".into(),
+                password: Some("p@ss:w0rd".into()),
+                database: "app".into(),
+                options: "replicaSet=rs0&authSource=admin".into(),
+                dropped: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_srv_string_has_no_port_and_secret_options_are_left_out() {
+        let uri = parse_mongo_uri(
+            "MONGODB+SRV://u@cluster0.example.net/?retryWrites=true&password=x\
+             &authMechanismProperties=AWS_SESSION_TOKEN:t&w=majority",
+        )
+        .unwrap();
+        assert!(uri.srv);
+        assert_eq!(uri.host, "cluster0.example.net");
+        assert_eq!(uri.port, None);
+        assert_eq!(uri.user, "u");
+        assert_eq!(uri.password, None);
+        assert_eq!(uri.database, "");
+        assert_eq!(uri.options, "retryWrites=true&w=majority");
+        assert_eq!(uri.dropped, ["password", "authMechanismProperties"]);
+        let settings = MongoSettings {
+            srv: true,
+            options: uri.options,
+        };
+        assert!(settings.check().is_ok());
+    }
+
+    #[test]
+    fn plain_and_ipv6_hosts_and_bad_strings() {
+        let uri = parse_mongo_uri("mongodb://localhost").unwrap();
+        assert_eq!((uri.host.as_str(), uri.port), ("localhost", None));
+        let uri = parse_mongo_uri("mongodb://[::1]:57017/x").unwrap();
+        assert_eq!((uri.host.as_str(), uri.port), ("[::1]", Some(57017)));
+        assert_eq!(uri.database, "x");
+        for bad in [
+            "postgres://u:secret@h",
+            "mongodb://u:secret@",
+            "mongodb://u:secret@h:port",
+            "mongodb://u:secret@[::1",
+        ] {
+            let error = parse_mongo_uri(bad).unwrap_err().to_string();
+            assert!(!error.contains("secret"), "{error}");
+        }
     }
 
     #[test]

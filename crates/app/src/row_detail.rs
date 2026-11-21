@@ -4,6 +4,11 @@
 //! is escaped, so a value shows exactly as the database returned it. The text sits in a
 //! read-only editor, so any part of it can be selected and copied; a button copies the
 //! whole row as real JSON. Keys and values take the SQL editor's syntax colors.
+//!
+//! A document from a document engine, such as MongoDB, shows as itself instead: pretty
+//! JSON with nested indentation, highlighted as JSON, each object and array folding from
+//! the gutter. "Copy as JSON" then copies the document. The panel also shows a document
+//! engine's index or view definition, as text to read.
 
 use std::ops::Range;
 
@@ -19,14 +24,27 @@ pub enum RowDetailEvent {
     Close,
 }
 
+/// What the panel shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    /// A result row, field by field.
+    Row,
+    /// A document, as JSON that folds.
+    Document,
+    /// A definition, to read.
+    Definition,
+}
+
 pub struct RowDetail {
     text: Entity<EditorState>,
     /// The colors over `text`, one range per key and value.
     colors: TextDecorationCollection,
     tokens: Vec<(Range<usize>, Token)>,
-    /// The row as JSON for "Copy as JSON". `None` while no row is chosen, which keeps
-    /// the panel closed.
+    /// What the copy button copies: the row or document as JSON, or the definition.
+    /// `None` while nothing is chosen, which keeps the panel closed.
     json: Option<SharedString>,
+    shown: Shown,
+    title: SharedString,
 }
 
 impl EventEmitter<RowDetailEvent> for RowDetail {}
@@ -53,6 +71,8 @@ impl RowDetail {
             colors,
             tokens: Vec::new(),
             json: None,
+            shown: Shown::Row,
+            title: "Row".into(),
         }
     }
 
@@ -63,11 +83,72 @@ impl RowDetail {
     pub fn show(&mut self, row: Vec<(String, Value)>, window: &mut Window, cx: &mut Context<Self>) {
         self.json = Some(row_json(&row).into());
         let (text, tokens) = row_text(&row);
+        self.set_mode(Shown::Row, "Row", window, cx);
         self.text
             .update(cx, |state, cx| state.set_value(text, window, cx));
         self.tokens = tokens;
         self.paint(cx);
         cx.notify();
+    }
+
+    /// Shows a document as pretty JSON, each nested object or array folding.
+    pub fn show_document(&mut self, document: &Value, window: &mut Window, cx: &mut Context<Self>) {
+        let text = document_text(document);
+        self.json = Some(text.clone().into());
+        self.show_plain(Shown::Document, "Document".into(), text, window, cx);
+    }
+
+    /// Shows a definition to read, such as a document engine's index, under `title`.
+    pub fn show_definition(
+        &mut self,
+        title: String,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.json = Some(text.clone().into());
+        self.show_plain(Shown::Definition, title.into(), text, window, cx);
+    }
+
+    fn show_plain(
+        &mut self,
+        shown: Shown,
+        title: SharedString,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_mode(shown, title, window, cx);
+        self.text
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+        // The grammar colors it; the row's own colors would land on the wrong text.
+        self.tokens.clear();
+        self.paint(cx);
+        cx.notify();
+    }
+
+    /// Sets the grammar and folding for what is shown, when it changes.
+    fn set_mode(
+        &mut self,
+        shown: Shown,
+        title: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.title = title.into();
+        if self.shown == shown {
+            return;
+        }
+        self.shown = shown;
+        let (language, folding) = match shown {
+            Shown::Row => ("text", false),
+            Shown::Document => ("json", true),
+            Shown::Definition => ("javascript", false),
+        };
+        self.text.update(cx, |state, cx| {
+            state.set_highlighter(language, cx);
+            state.set_folding(folding, window, cx);
+        });
     }
 
     fn paint(&self, cx: &mut Context<Self>) {
@@ -178,6 +259,11 @@ impl Writer {
     }
 }
 
+/// A document as the panel shows it: JSON, two spaces per level.
+fn document_text(document: &Value) -> String {
+    serde_json::to_string_pretty(document).unwrap_or_default()
+}
+
 /// The row as the panel shows it, one field per line inside braces, with where each key
 /// and value lies in the text.
 fn row_text(row: &[(String, Value)]) -> (String, Vec<(Range<usize>, Token)>) {
@@ -199,6 +285,10 @@ impl Render for RowDetail {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let json = self.json.clone().unwrap_or_default();
+        let copy_tip = match self.shown {
+            Shown::Definition => "Copy",
+            Shown::Row | Shown::Document => "Copy as JSON",
+        };
         v_flex()
             .id("row-detail")
             .test_support()
@@ -206,14 +296,14 @@ impl Render for RowDetail {
             .border_l_1()
             .border_color(theme.border)
             .child(
-                crate::theme::panel_header("Row", cx)
+                crate::theme::panel_header(self.title.clone(), cx)
                     .child(
                         Button::new("row-detail-copy")
                             .cursor_pointer()
                             .ghost()
                             .xsmall()
                             .icon(IconName::Copy)
-                            .tooltip("Copy as JSON")
+                            .tooltip(copy_tip)
                             .on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(json.to_string()));
                             }),
@@ -247,6 +337,10 @@ impl RowDetail {
 
     pub(crate) fn text(&self) -> &Entity<EditorState> {
         &self.text
+    }
+
+    pub(crate) fn title(&self) -> &str {
+        &self.title
     }
 }
 
