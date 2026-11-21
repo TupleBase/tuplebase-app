@@ -2951,7 +2951,26 @@ mod tests {
         window_action(handle, cx, |window, cx| window.click(2usize, cx));
         window_action(handle, cx, |window, cx| {
             assert!(window.has_active_dialog(cx));
+            // Its Cancel still reaches the dialog after the menu took focus.
+            window.click("cancel", cx);
         });
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn right_clicking_a_folder_can_delete_it_after_asking(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        window_action(handle, cx, |window, cx| {
+            window.right_click("folder-Production", cx);
+        });
+        window_action(handle, cx, |window, cx| window.click(4usize, cx));
+        window_action(handle, cx, |window, cx| window.click("ok", cx));
+        window_action(handle, cx, |window, cx| {
+            assert!(!window.has_active_dialog(cx));
+        });
+        cx.update(|cx| assert!(workspace.read(cx).config.folders().is_empty()));
     }
 
     #[gpui_kit::test]
