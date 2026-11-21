@@ -109,6 +109,9 @@ pub struct EngineInfo {
     pub default_port: u16,
     /// A local file, with no server, user or password.
     pub is_file: bool,
+    /// The user a new server usually has, shown as an example in an empty User field;
+    /// empty for a file database.
+    pub user_hint: &'static str,
     pub quote: IdentQuote,
     pub script: ScriptFlavor,
 }
@@ -117,6 +120,7 @@ const POSTGRES: EngineInfo = EngineInfo {
     label: "PostgreSQL",
     default_port: 5432,
     is_file: false,
+    user_hint: "postgres",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Postgres,
 };
@@ -125,6 +129,7 @@ const MARIADB: EngineInfo = EngineInfo {
     label: "MariaDB",
     default_port: 3306,
     is_file: false,
+    user_hint: "root",
     quote: IdentQuote::Backtick,
     script: ScriptFlavor::Mysql,
 };
@@ -133,6 +138,7 @@ const MYSQL: EngineInfo = EngineInfo {
     label: "MySQL",
     default_port: 3306,
     is_file: false,
+    user_hint: "root",
     quote: IdentQuote::Backtick,
     script: ScriptFlavor::Mysql,
 };
@@ -141,6 +147,7 @@ const SQLITE: EngineInfo = EngineInfo {
     label: "SQLite",
     default_port: 0,
     is_file: true,
+    user_hint: "",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Sqlite,
 };
@@ -149,6 +156,7 @@ const REDSHIFT: EngineInfo = EngineInfo {
     label: "Redshift",
     default_port: 5439,
     is_file: false,
+    user_hint: "awsuser",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Redshift,
 };
@@ -201,6 +209,10 @@ impl Adapter {
 
     pub fn default_port(self) -> u16 {
         self.info().default_port
+    }
+
+    pub fn user_hint(self) -> &'static str {
+        self.info().user_hint
     }
 }
 
@@ -1128,10 +1140,13 @@ mod tests {
         );
         let ports = Adapter::ALL.map(Adapter::default_port);
         assert_eq!(ports, [5432, 3306, 3306, 0, 5439]);
+        let users = Adapter::ALL.map(Adapter::user_hint);
+        assert_eq!(users, ["postgres", "root", "root", "", "awsuser"]);
         for adapter in Adapter::ALL {
-            // Only a server has a port.
+            // Only a server has a port, and a user.
             let info = adapter.info();
             assert_eq!(info.is_file, info.default_port == 0, "{}", info.label);
+            assert_eq!(info.is_file, info.user_hint.is_empty(), "{}", info.label);
         }
         assert!(Adapter::Sqlite.is_file());
         assert_eq!(Adapter::Sqlite.quote_ident(r#"a"b"#), r#""a""b""#);

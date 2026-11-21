@@ -127,7 +127,8 @@ impl ConnForm {
         let host = input("localhost", field(|c| c.host.clone()));
         let port = input("Default", field(|c| c.port.to_string()));
         let database = input("Optional", field(|c| c.database.clone()));
-        let user = input("postgres", field(|c| c.user.clone()));
+        let adapter = existing.map_or(Adapter::Postgres, |c| c.adapter);
+        let user = input(adapter.user_hint(), field(|c| c.user.clone()));
         let password = input(
             if existing.is_some() {
                 "Leave blank to keep the current password"
@@ -186,7 +187,7 @@ impl ConnForm {
             form_scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
             previous: existing.map(|c| c.name.clone()),
-            adapter: existing.map_or(Adapter::Postgres, |c| c.adapter),
+            adapter,
             chosen: existing.is_some(),
             folder,
             name,
@@ -309,7 +310,7 @@ impl ConnForm {
             secret.map(|s| s.name.clone()).unwrap_or_default(),
         );
         self.use_secret_host = secret.is_some_and(|s| s.use_secret_host);
-        self.adapter = conn.adapter;
+        self.set_adapter(conn.adapter, window, cx);
         self.chosen = true;
         self.auth_kind = conn.auth.kind();
         self.tls = conn.tls;
@@ -479,6 +480,14 @@ impl ConnForm {
         cx.notify();
     }
 
+    /// The engine, and the user its servers usually have as the User field's example.
+    fn set_adapter(&mut self, adapter: Adapter, window: &mut Window, cx: &mut Context<Self>) {
+        self.adapter = adapter;
+        self.user.update(cx, |input, cx| {
+            input.set_placeholder(adapter.user_hint(), window, cx);
+        });
+    }
+
     fn render_adapter(&self, adapter: Adapter, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let selected = self.chosen && self.adapter == adapter;
@@ -500,7 +509,7 @@ impl ConnForm {
             .child(logos::icon(adapter, 18.))
             .child(div().text_sm().child(adapter.label()))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.adapter = adapter;
+                this.set_adapter(adapter, window, cx);
                 // The first choice reveals the rest of the form, so move on to it.
                 if !this.chosen {
                     this.chosen = true;
@@ -1389,6 +1398,37 @@ mod tests {
             assert!(window.find("aws-chosen").visible());
         });
         cx.update(|cx| assert_eq!(form.read(cx).mode, Mode::Aws));
+    }
+
+    #[gpui_kit::test]
+    fn the_user_example_follows_the_engine(cx: &mut TestAppContext) {
+        let (handle, _form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        for (engine, user) in [
+            ("MySQL", "root"),
+            ("MariaDB", "root"),
+            ("Redshift", "awsuser"),
+            ("PostgreSQL", "postgres"),
+        ] {
+            act(handle, cx, |window, cx| {
+                window.click(
+                    gpui_kit::SharedString::from(format!("adapter-{engine}")),
+                    cx,
+                )
+            });
+            act(handle, cx, |window, _| {
+                assert_eq!(
+                    window.find("conn-user").placeholder(),
+                    Some(user),
+                    "{engine}"
+                );
+            });
+        }
+        // A file has no user to ask for.
+        act(handle, cx, |window, cx| window.click("adapter-SQLite", cx));
+        act(handle, cx, |window, _| {
+            assert!(window.try_find("conn-user").is_none());
+        });
     }
 
     #[gpui_kit::test]
