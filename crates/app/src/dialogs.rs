@@ -10,13 +10,15 @@ use gpui_kit::*;
 /// `content` with the close icon in its top right corner, for a dialog opened with
 /// `close_button(false)` and `p_0()`, so that the icon sits where the library's would.
 pub fn with_close_button(content: impl IntoElement) -> Div {
-    div().relative().child(content).child(
-        div()
-            .absolute()
-            .top_2()
-            .right_2()
-            .child(DialogClose::new().trigger(close_icon)),
-    )
+    div()
+        .relative()
+        .child(content)
+        .child(div().absolute().top_2().right_2().child(close_button()))
+}
+
+/// The close icon on its own, for a dialog that lays out its own header.
+pub fn close_button() -> DialogClose {
+    DialogClose::new().trigger(close_icon)
 }
 
 /// Cancel and a red `ok_text` button, for an alert dialog that confirms a deletion.

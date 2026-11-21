@@ -18,6 +18,8 @@ static BRAND: LazyLock<Arc<Image>> = LazyLock::new(|| {
 struct Logo {
     glyph: &'static [u8],
     color: u32,
+    /// Two letters for the badge, where a list names the database in text.
+    letters: &'static str,
 }
 
 /// Each engine's logo. A new engine adds its SVG to `assets/logos/` and an arm here.
@@ -26,18 +28,22 @@ fn logo(adapter: Adapter) -> Logo {
         Adapter::Postgres => Logo {
             glyph: include_bytes!("../../../assets/logos/postgresql.svg"),
             color: 0x336791,
+            letters: "PG",
         },
         Adapter::Mariadb => Logo {
             glyph: include_bytes!("../../../assets/logos/mariadb.svg"),
             color: 0xA0522D,
+            letters: "MA",
         },
         Adapter::Mysql => Logo {
             glyph: include_bytes!("../../../assets/logos/mysql.svg"),
             color: 0x00758F,
+            letters: "MY",
         },
         Adapter::Sqlite => Logo {
             glyph: include_bytes!("../../../assets/logos/sqlite.svg"),
             color: 0x0F80CC,
+            letters: "SL",
         },
     }
 }
@@ -71,6 +77,25 @@ pub fn icon(adapter: Adapter, size: f32) -> Div {
         )
 }
 
+/// A database's badge: its two letters on a tile of its brand color, the same color as
+/// its icon.
+pub fn badge(adapter: Adapter, size: f32) -> Div {
+    let logo = logo(adapter);
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(size))
+        .rounded(px(size * 0.24))
+        .bg(rgb(logo.color))
+        .text_color(white())
+        .text_size(px((size * 0.4).round()))
+        .font_weight(FontWeight::SEMIBOLD)
+        .line_height(px(size))
+        .child(logo.letters)
+}
+
 const CLAUDE: &[u8] = include_bytes!("../../../assets/logos/claude.svg");
 const CLAUDE_COLOR: u32 = 0xD97757;
 
@@ -99,6 +124,18 @@ mod tests {
                 logos.iter().filter(|l| l.color == logo.color).count(),
                 1,
                 "{} shares its color",
+                adapter.label()
+            );
+            assert_eq!(
+                logo.letters.len(),
+                2,
+                "{} needs two letters",
+                adapter.label()
+            );
+            assert_eq!(
+                logos.iter().filter(|l| l.letters == logo.letters).count(),
+                1,
+                "{} shares its letters",
                 adapter.label()
             );
         }

@@ -83,7 +83,7 @@ scripts/                   install, packaging, release helpers
 | `main`                  | startup, window, key bindings                              |
 | `workspace`             | the main window: the open connections, one tab each        |
 | `workspace/top_bar`     | the bar of tabs, with Connections, chat, Settings and MCP  |
-| `workspace/connections` | the Connections dialog: the folder tree, to open a tab     |
+| `workspace/connections` | the Connections dialog: search, folder tree and details    |
 | `workspace/settings`    | the Settings dialog                                        |
 | `connection_tab`        | one open connection: SQL editor, schema, results, status   |
 | `conn_form`             | the add and edit connection form                           |

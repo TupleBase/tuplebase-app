@@ -93,3 +93,32 @@ pub fn panel_header(title: impl Into<SharedString>, cx: &App) -> Div {
                 .child(title.into()),
         )
 }
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
+    use gpui_kit::{Hsla, TestAppContext, rgb};
+
+    /// The status colors come from the app's theme, not the library's defaults: a key
+    /// spelled wrong would be ignored without a word.
+    #[gpui_kit::test]
+    fn the_theme_sets_the_status_colors(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            super::init(cx);
+            let colors = |cx: &mut gpui_kit::App, mode| {
+                Theme::change(mode, None, cx);
+                (cx.theme().success, cx.theme().warning)
+            };
+            let hsla = |color: u32| -> Hsla { rgb(color).into() };
+            assert_eq!(
+                colors(cx, ThemeMode::Dark),
+                (hsla(0x8FD19E), hsla(0xF0B072))
+            );
+            assert_eq!(
+                colors(cx, ThemeMode::Light),
+                (hsla(0x2A7A4B), hsla(0xA15C12))
+            );
+        });
+    }
+}
