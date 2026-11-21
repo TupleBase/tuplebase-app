@@ -7,6 +7,7 @@
 //! nothing here. The rest of `db` asks for a pool and gets an [`Open`]; nothing here runs
 //! queries.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -15,7 +16,7 @@ use sqlx::pool::PoolOptions;
 
 use super::{Open, Pool};
 use crate::cloud::aws;
-use crate::config::{Connection, TlsMode};
+use crate::config::{self, Connection, TlsMode};
 use crate::credentials::{self, Expiry};
 use crate::{secrets, ssh};
 
@@ -197,6 +198,32 @@ pub(super) fn extra_roots(conn: &Connection) -> Option<&'static [u8]> {
     (conn.tls == TlsMode::Verify && aws::is_rds_host(&conn.host)).then_some(aws::RDS_CA_BUNDLE)
 }
 
+/// The file holding Amazon's RDS certificate authorities, for verifying a DocumentDB
+/// database's certificate: the MongoDB driver takes authorities only from a file, and
+/// then trusts only those. `None` unless `conn` verifies a DocumentDB host. The file is
+/// public data, kept in the config folder and rewritten only when its content changed.
+pub(super) fn ca_file(conn: &Connection) -> Result<Option<PathBuf>> {
+    if conn.tls != TlsMode::Verify || !aws::is_docdb_host(&conn.host) {
+        return Ok(None);
+    }
+    let dir = config::config_dir()?.join("certs");
+    write_if_changed(&dir, "rds-global-bundle.pem", aws::RDS_CA_BUNDLE).map(Some)
+}
+
+/// Writes `content` to `dir/name` unless the file already holds it; returns its path.
+fn write_if_changed(dir: &Path, name: &str, content: &[u8]) -> Result<PathBuf> {
+    let path = dir.join(name);
+    if std::fs::read(&path).is_ok_and(|old| old == content) {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Written beside and renamed over, so a driver never reads half a file.
+    let partial = dir.join(format!("{name}.partial"));
+    std::fs::write(&partial, content).with_context(|| format!("writing {}", partial.display()))?;
+    std::fs::rename(&partial, &path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use sqlx::postgres::PgPoolOptions;
@@ -242,6 +269,37 @@ pub(super) mod tests {
         let mut china = rds(TlsMode::Verify);
         china.host = "orders.abc.cn-north-1.rds.amazonaws.com.cn".into();
         assert!(extra_roots(&china).is_some());
+    }
+
+    #[test]
+    fn the_authorities_file_is_written_once_and_kept_while_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_if_changed(dir.path(), "ca.pem", b"one").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"one");
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            write_if_changed(dir.path(), "ca.pem", b"one").unwrap(),
+            path
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written
+        );
+        write_if_changed(dir.path(), "ca.pem", b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(!dir.path().join("ca.pem.partial").exists());
+    }
+
+    #[test]
+    fn only_a_verified_documentdb_host_needs_the_authorities_file() {
+        let mut docdb = rds(TlsMode::Require);
+        docdb.adapter = crate::config::Adapter::Documentdb;
+        docdb.host = "docs.cluster-abc.eu-west-1.docdb.amazonaws.com".into();
+        assert!(ca_file(&docdb).unwrap().is_none());
+        let mut elsewhere = rds(TlsMode::Verify);
+        elsewhere.host = "mongo.example.com".into();
+        assert!(ca_file(&elsewhere).unwrap().is_none());
     }
 
     #[tokio::test]

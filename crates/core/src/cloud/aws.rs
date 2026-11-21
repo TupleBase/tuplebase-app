@@ -387,7 +387,15 @@ pub fn is_rds_host(host: &str) -> bool {
     host.ends_with(".rds.amazonaws.com") || host.ends_with(".rds.amazonaws.com.cn")
 }
 
-/// Amazon's RDS certificate authorities, for verifying an RDS database's certificate.
+/// Whether `host` is an Amazon DocumentDB endpoint, whose certificates also come from
+/// Amazon's RDS certificate authorities.
+pub fn is_docdb_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.ends_with(".docdb.amazonaws.com") || host.ends_with(".docdb.amazonaws.com.cn")
+}
+
+/// Amazon's RDS certificate authorities, for verifying an RDS or DocumentDB database's
+/// certificate.
 ///
 /// Source: <https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem>, the
 /// bundle for every commercial region, linked from "Using SSL/TLS to encrypt a connection
@@ -845,6 +853,8 @@ pub fn adapter_for_engine(engine: &str) -> Option<Adapter> {
         // `aurora` is Aurora MySQL 5.6, from before the engine had its own name.
         "mysql" | "aurora-mysql" | "aurora" => Some(Adapter::Mysql),
         "mariadb" => Some(Adapter::Mariadb),
+        // RDS lists DocumentDB clusters and instances under this engine.
+        "docdb" => Some(Adapter::Documentdb),
         REDSHIFT_ENGINE | REDSHIFT_SERVERLESS_ENGINE => Some(Adapter::Redshift),
         _ => None,
     }
@@ -881,9 +891,14 @@ fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
         notes.push(format!("It has no endpoint yet ({status})."));
     }
     if let Some(readers) = found.readers {
-        notes.push(format!(
-            "Aurora cluster: connects to the writer. Readers are at {readers}."
-        ));
+        notes.push(if adapter == Some(Adapter::Documentdb) {
+            format!(
+                "DocumentDB cluster: connects to the primary. For reads only, which may \
+                 lag a little, its reader endpoint is {readers}."
+            )
+        } else {
+            format!("Aurora cluster: connects to the writer. Readers are at {readers}.")
+        });
     }
     if found.public {
         notes.push(found.service.verified_note().into());
@@ -1223,7 +1238,8 @@ mod tests {
             adapter_for_engine("redshift-serverless"),
             Some(Adapter::Redshift)
         );
-        for other in ["oracle-ee", "sqlserver-se", "db2-se", "docdb", "neptune"] {
+        assert_eq!(adapter_for_engine("docdb"), Some(Adapter::Documentdb));
+        for other in ["oracle-ee", "sqlserver-se", "db2-se", "neptune"] {
             assert_eq!(adapter_for_engine(other), None, "{other}");
         }
     }

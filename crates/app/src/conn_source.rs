@@ -72,7 +72,7 @@ impl Render for ConnSource {
                         self.render_choice(
                             "source-aws",
                             "Amazon Web Services",
-                            "Find it in RDS, Aurora or Redshift with your AWS profile.",
+                            "Find it in RDS, Aurora, DocumentDB or Redshift with your AWS profile.",
                             cx,
                         )
                         .on_click(cx.listener(|_, _, _, cx| cx.emit(ConnSourceEvent::Aws))),
