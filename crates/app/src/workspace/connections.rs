@@ -35,7 +35,7 @@ const TREE_INDENT: f32 = 18.;
 /// A connection's row in the tree.
 const ROW_HEIGHT: f32 = 38.;
 /// The pane that shows the selected connection.
-const DETAILS_WIDTH: f32 = 300.;
+const DETAILS_WIDTH: f32 = 340.;
 /// How many connections "Recent" keeps.
 const RECENT_COUNT: usize = 10;
 
@@ -66,8 +66,8 @@ pub(crate) fn key_bindings() -> [KeyBinding; 5] {
 /// smaller in a small window.
 pub(crate) fn dialog_size(viewport: gpui_kit::Size<Pixels>) -> gpui_kit::Size<Pixels> {
     size(
-        px(900.).min(viewport.width * 0.75),
-        px(620.).min(viewport.height * 0.82),
+        px(1040.).min(viewport.width * 0.85),
+        px(720.).min(viewport.height * 0.88),
     )
 }
 
@@ -1234,9 +1234,8 @@ impl ConnectionsDialog {
             .id("connection-details")
             .test_support()
             .flex_none()
+            .min_h_0()
             .w(px(DETAILS_WIDTH))
-            .p_5()
-            .gap(px(14.))
             .bg(background);
         let conn = match &self.cursor {
             Some(TreeRow::Connection(name)) => shown.config.find(name),
@@ -1244,6 +1243,7 @@ impl ConnectionsDialog {
         };
         let Some(conn) = conn else {
             return pane
+                .p_5()
                 .items_center()
                 .justify_center()
                 .text_sm()
@@ -1298,129 +1298,154 @@ impl ConnectionsDialog {
             conn.name.clone(),
             conn.name.clone(),
         );
-        pane.child(
-            h_flex()
-                .gap_3()
-                .child(logos::badge(conn.adapter, 40.))
-                .child(
-                    v_flex()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .id("details-name")
-                                .test_support()
-                                .truncate()
-                                .text_base()
-                                .font_semibold()
-                                .child(text(conn.name.clone())),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_sm()
-                                .text_color(muted)
-                                .child(text(folder)),
-                        ),
-                ),
-        )
-        .child(
-            v_flex()
-                .gap_2()
-                .text_sm()
-                .child(field(
-                    "Status",
-                    h_flex()
-                        .id("details-status")
-                        .test_support()
-                        .gap_1p5()
-                        .child(dot)
-                        .child(text(status))
-                        .into_any_element(),
-                ))
-                .child(field(
-                    "Engine",
-                    text(conn.adapter.label()).into_any_element(),
-                ))
-                .child(field(
-                    place_label,
-                    div()
-                        .id("details-host")
-                        .test_support()
-                        .child(text(place))
-                        .into_any_element(),
-                ))
-                .child(field("User", text(user).into_any_element()))
-                .child(field("Access", text(access).into_any_element())),
-        )
-        .child(div().flex_1())
-        .child(
-            Button::new("details-open")
-                .cursor_pointer()
-                .primary()
-                .w_full()
-                .label(if has_tab {
-                    "Go to tab ↵"
-                } else {
-                    "Connect ↵"
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_connection(opened.clone(), window, cx);
-                })),
-        )
-        .child(
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("details-edit")
-                        .cursor_pointer()
-                        .outline()
-                        .flex_1()
-                        .label("Edit")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let folder = edited.folder.clone();
-                            this.open_form(Some(edited.clone()), folder, window, cx);
-                        })),
-                )
-                // A connection with a tab can always be closed, connected or not.
-                .when(connected || has_tab, |row| {
-                    row.child(
-                        Button::new("details-disconnect")
+        let info = v_flex()
+            .id("details-info")
+            .test_support()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_5()
+            .pb_3()
+            .gap(px(14.))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(logos::badge(conn.adapter, 40.))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .id("details-name")
+                                    .test_support()
+                                    .truncate()
+                                    .text_base()
+                                    .font_semibold()
+                                    .child(text(conn.name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(text(folder)),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .text_sm()
+                    .child(field(
+                        "Status",
+                        h_flex()
+                            .id("details-status")
+                            .test_support()
+                            .gap_1p5()
+                            .child(dot)
+                            .child(text(status))
+                            .into_any_element(),
+                    ))
+                    .child(field(
+                        "Engine",
+                        text(conn.adapter.label()).into_any_element(),
+                    ))
+                    .child(field(
+                        place_label,
+                        // One line, so a long RDS host can't push the buttons out; the
+                        // whole value shows on hover.
+                        div()
+                            .id("details-host")
+                            .test_support()
+                            .truncate()
+                            .child(text(place.clone()))
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(place.clone())
+                                    .build(window, cx)
+                            })
+                            .into_any_element(),
+                    ))
+                    .child(field("User", text(user).into_any_element()))
+                    .child(field("Access", text(access).into_any_element())),
+            );
+        // Pinned at the pane's foot, inside it, whatever the info above holds.
+        let actions = v_flex()
+            .id("details-actions")
+            .test_support()
+            .flex_none()
+            .gap(px(14.))
+            .px_5()
+            .pb_5()
+            .child(
+                Button::new("details-open")
+                    .cursor_pointer()
+                    .primary()
+                    .w_full()
+                    .label(if has_tab {
+                        "Go to tab ↵"
+                    } else {
+                        "Connect ↵"
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_connection(opened.clone(), window, cx);
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("details-edit")
                             .cursor_pointer()
                             .outline()
                             .flex_1()
-                            .label("Disconnect")
+                            .label("Edit")
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                let closing = closing.clone();
-                                this.with_workspace(window, cx, |workspace, _, cx| {
-                                    workspace.close_tab(closing, cx)
-                                });
-                                // The button goes with the connection: the keys stay
-                                // in the dialog.
-                                this.tree_focus.focus(window, cx);
+                                let folder = edited.folder.clone();
+                                this.open_form(Some(edited.clone()), folder, window, cx);
                             })),
                     )
-                })
-                .child(
-                    Button::new("details-delete")
-                        .cursor_pointer()
-                        .outline()
-                        .icon(Icon::default().data(DELETE_ICON))
-                        .tooltip("Delete connection")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let deleted = deleted.clone();
-                            this.with_workspace(window, cx, |workspace, window, cx| {
-                                workspace.confirm_delete(deleted, window, cx)
-                            });
-                        })),
-                ),
-        )
-        .into_any_element()
+                    // A connection with a tab can always be closed, connected or not.
+                    .when(connected || has_tab, |row| {
+                        row.child(
+                            Button::new("details-disconnect")
+                                .cursor_pointer()
+                                .outline()
+                                .flex_1()
+                                .label("Disconnect")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let closing = closing.clone();
+                                    this.with_workspace(window, cx, |workspace, _, cx| {
+                                        workspace.close_tab(closing, cx)
+                                    });
+                                    // The button goes with the connection: the keys stay
+                                    // in the dialog.
+                                    this.tree_focus.focus(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("details-delete")
+                            .cursor_pointer()
+                            .outline()
+                            .icon(Icon::default().data(DELETE_ICON))
+                            .tooltip("Delete connection")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let deleted = deleted.clone();
+                                this.with_workspace(window, cx, |workspace, window, cx| {
+                                    workspace.confirm_delete(deleted, window, cx)
+                                });
+                            })),
+                    ),
+            );
+        pane.child(info).child(actions).into_any_element()
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, border) = (theme.muted_foreground, theme.border);
         h_flex()
+            .id("connections-footer")
+            .test_support()
             .flex_none()
             .gap_2p5()
             .px_5()
@@ -1707,18 +1732,49 @@ mod tests {
 
     #[test]
     fn the_dialog_is_as_designed_and_shrinks_with_the_window() {
-        assert_eq!(
-            dialog_size(size(px(1200.), px(760.))),
-            size(px(900.), px(620.))
-        );
+        let near = |a: gpui_kit::Size<gpui_kit::Pixels>, w: f32, h: f32| {
+            (a.width - px(w)).abs() < px(0.01) && (a.height - px(h)).abs() < px(0.01)
+        };
+        assert!(near(dialog_size(size(px(1200.), px(760.))), 1020., 668.8));
         assert_eq!(
             dialog_size(size(px(2400.), px(1600.))),
-            size(px(900.), px(620.))
+            size(px(1040.), px(720.))
         );
-        assert_eq!(
-            dialog_size(size(px(800.), px(500.))),
-            size(px(600.), px(410.))
-        );
+        assert!(near(dialog_size(size(px(800.), px(500.))), 680., 440.));
+    }
+
+    #[gpui_kit::test]
+    fn a_long_host_in_a_short_window_keeps_the_buttons_inside_the_details(cx: &mut TestAppContext) {
+        let mut config = config_with_connection();
+        config.connections[0].host =
+            "bearruecommercedb.cluster-ciiqcsqnjq9b.us-east-1.rds.amazonaws.com".into();
+        config.connections[0].port = 3306;
+        let (handle, _) = open(config, cx);
+        use gpui_kit::AppContext as _;
+        cx.update_window(handle, |_, window, _| {
+            window.resize(size(px(1000.), px(480.)))
+        })
+        .unwrap();
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, _| {
+            let pane = window.find("connection-details").bounds();
+            let footer = window.find("connections-footer").bounds();
+            let host = window.find("details-host").bounds();
+            // The host stays on one line.
+            assert!(host.size.height < px(30.), "{host:?}");
+            for id in ["details-open", "details-edit", "details-delete"] {
+                let button = window.find(id).bounds();
+                assert!(
+                    button.top() >= pane.top() && button.bottom() <= pane.bottom(),
+                    "{id} {button:?} outside {pane:?}"
+                );
+                assert!(
+                    button.bottom() <= footer.top(),
+                    "{id} {button:?} over {footer:?}"
+                );
+            }
+        });
     }
 
     #[gpui_kit::test]
