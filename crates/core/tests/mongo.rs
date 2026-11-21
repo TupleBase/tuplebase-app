@@ -242,6 +242,16 @@ async fn mongo_read_only_refuses_writes_before_they_reach_the_server() {
             format!("db.{coll}.aggregate([{{\"\\u0024out\": '{coll}_copy'}}])"),
             format!("db.{coll}.aggregate([{{$match: {{}}, $out: '{coll}_copy'}}])"),
             format!("db.{coll}.find({{$where: 'true'}})"),
+            // mapReduce's internal operator runs JavaScript: refused here, never sent.
+            format!(
+                "db.{coll}.aggregate([{{$project: {{x: {{$_internalJsEmit: \
+                 {{eval: 'function() {{ emit(1, 1) }}', this: '$$ROOT'}}}}}}}}])"
+            ),
+            format!(
+                "db.{coll}.findOne({{$expr: {{$_internalJsEmit: \
+                 {{eval: 'function() {{ emit(1, 1) }}', this: '$$ROOT'}}}}}})"
+            ),
+            format!("db.{coll}.aggregate([{{$match: {{}}}}], {{allowDiskUse: true}})"),
             // Two statements, the second a write, in one agent call.
             format!("db.{coll}.find()\ndb.{coll}.drop()"),
         ] {

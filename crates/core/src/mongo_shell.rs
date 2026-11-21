@@ -161,7 +161,9 @@ pub enum ReadOp {
 }
 
 /// Keys that write or run JavaScript wherever they appear. [`Command::as_read`] refuses
-/// any command holding one, a second check besides the guard's allowlist in `safety`.
+/// any command holding one, or any key starting with `$_` (the server's internal
+/// operators, such as `$_internalJsEmit`), a second check besides the guard's allowlist
+/// in `safety`.
 const NEVER_READ: [&str; 5] = ["$out", "$merge", "$where", "$function", "$accumulator"];
 
 impl Command {
@@ -265,7 +267,14 @@ fn read_is_clean(read: &ReadOp) -> bool {
             .into_iter()
             .flatten()
             .collect(),
-        ReadOp::Aggregate { pipeline, .. } => pipeline.iter().collect(),
+        ReadOp::Aggregate {
+            pipeline, options, ..
+        } => {
+            if options.allow_disk_use == Some(true) {
+                return false;
+            }
+            pipeline.iter().collect()
+        }
         ReadOp::CountDocuments { filter, .. } | ReadOp::Distinct { filter, .. } => vec![filter],
         ReadOp::Explain(inner) => return read_is_clean(inner),
     };
@@ -275,9 +284,9 @@ fn read_is_clean(read: &ReadOp) -> bool {
 
 fn bson_is_clean(value: &Bson) -> bool {
     match value {
-        Bson::Document(doc) => doc
-            .iter()
-            .all(|(key, value)| !NEVER_READ.contains(&key.as_str()) && bson_is_clean(value)),
+        Bson::Document(doc) => doc.iter().all(|(key, value)| {
+            !NEVER_READ.contains(&key.as_str()) && !key.starts_with("$_") && bson_is_clean(value)
+        }),
         Bson::Array(items) => items.iter().all(bson_is_clean),
         Bson::JavaScriptCode(_) | Bson::JavaScriptCodeWithScope(_) => false,
         _ => true,

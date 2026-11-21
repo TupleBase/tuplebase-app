@@ -508,7 +508,9 @@ const MONGO_READ_STAGES: [&str; 27] = [
     "$documents",
 ];
 
-/// Operators that run JavaScript on the server, refused anywhere in a read-only command.
+/// Operators that run JavaScript on the server, refused anywhere in a read-only command,
+/// as is any key starting with `$_` (the server's internal operators). A view's own
+/// stored pipeline is not checked: it runs as the server stores it.
 const MONGO_JAVASCRIPT: [&str; 3] = ["$where", "$function", "$accumulator"];
 
 /// Rejects any Mongo shell command that is not a plain read: only `find`, `findOne`,
@@ -550,7 +552,13 @@ fn check_mongo_op(op: &Op) -> Result<(), String> {
             check_mongo_values(filter)?;
             projection.iter().try_for_each(check_mongo_values)
         }
-        Op::Aggregate { pipeline, .. } => check_mongo_pipeline(pipeline),
+        Op::Aggregate { pipeline, options } => {
+            // Spilling to disk lets one read use the server's disk without bound.
+            if options.allow_disk_use == Some(true) {
+                return Err("read-only: allowDiskUse is not allowed".into());
+            }
+            check_mongo_pipeline(pipeline)
+        }
         Op::CountDocuments { filter } | Op::Distinct { filter, .. } => check_mongo_values(filter),
         Op::EstimatedDocumentCount | Op::GetIndexes => Ok(()),
         Op::Explain(inner) => match **inner {
@@ -635,6 +643,13 @@ fn check_mongo_key(key: &str) -> Result<(), String> {
     if MONGO_JAVASCRIPT.contains(&key) {
         return Err(format!(
             "read-only: \"{key}\" runs JavaScript on the server and is not allowed"
+        ));
+    }
+    // The server's internal operators, such as `$_internalJsEmit`, which runs JavaScript
+    // for mapReduce. None is for users, and new ones come with server versions.
+    if key.starts_with("$_") {
+        return Err(format!(
+            "read-only: \"{key}\" is one of the server's internal operators and is not allowed"
         ));
     }
     Ok(())
@@ -1394,6 +1409,64 @@ mod tests {
         ] {
             assert!(mongo(src).is_err(), "{src}");
         }
+    }
+
+    #[test]
+    fn mongo_read_only_refuses_internal_operators_everywhere() {
+        // `$_internalJsEmit` and `$_internalJsReduce` run JavaScript for mapReduce; any
+        // `$_` key is refused, wherever it is.
+        let js = "{$_internalJsEmit: {eval: 'function() { emit(1, 1) }', this: '$$ROOT'}}";
+        let reduce = "{$_internalJsReduce: {data: '$x', eval: 'function(k, v) { return 1 }'}}";
+        for src in [
+            format!("db.c.aggregate([{{$project: {{x: {js}}}}}])"),
+            format!("db.c.aggregate([{{$group: {{_id: 1, x: {{$push: {js}}}}}}}])"),
+            format!("db.c.aggregate([{{$group: {{_id: 1, x: {reduce}}}}}])"),
+            format!("db.c.find({{}}, {{x: {js}}})"),
+            format!("db.c.find().projection({{x: {js}}})"),
+            format!("db.c.find({{$expr: {js}}})"),
+            format!("db.c.find().sort({{x: {js}}})"),
+            format!("db.c.findOne({{$expr: {js}}})"),
+            format!("db.c.findOne({{}}, {{x: {js}}})"),
+            format!("db.c.countDocuments({{$expr: {js}}})"),
+            format!("db.c.distinct('a', {{$expr: {js}}})"),
+            format!("db.c.aggregate([{{$facet: {{a: [{{$project: {{x: {js}}}}}]}}}}])"),
+            format!(
+                "db.c.aggregate([{{$lookup: {{from: 'o', as: 'o', \
+                 pipeline: [{{$match: {{$expr: {js}}}}}]}}}}])"
+            ),
+            format!(
+                "db.c.aggregate([{{$unionWith: {{coll: 'o', \
+                 pipeline: [{{$project: {{x: {js}}}}}]}}}}])"
+            ),
+            format!(
+                "db.c.aggregate([{{$graphLookup: {{from: 'o', startWith: '$a', \
+                 connectFromField: 'a', connectToField: 'b', as: 'g', \
+                 restrictSearchWithMatch: {{$expr: {js}}}}}}}])"
+            ),
+            format!("db.c.aggregate([{{$redact: {{$cond: [{js}, '$$KEEP', '$$PRUNE']}}}}])"),
+            format!(
+                "db.c.aggregate([{{$bucket: {{groupBy: '$a', boundaries: [0, 10], \
+                 output: {{x: {{$push: {js}}}}}}}}}])"
+            ),
+            format!("db.c.find({{$expr: {js}}}).explain()"),
+            "db.c.aggregate([{$_internalInhibitOptimization: {}}])".to_owned(),
+            r#"db.c.find({"\u0024_internalJsEmit": 1})"#.to_owned(),
+        ] {
+            assert!(mongo(&src).is_err(), "{src}");
+            let command = mongo_shell::parse_command(&src).unwrap();
+            assert_eq!(command.as_read(), None, "{src}");
+        }
+    }
+
+    #[test]
+    fn mongo_read_only_refuses_spilling_to_disk() {
+        let src = "db.c.aggregate([{$match: {}}], {allowDiskUse: true})";
+        assert!(mongo(src).is_err());
+        assert_eq!(mongo_shell::parse_command(src).unwrap().as_read(), None);
+        assert_eq!(
+            mongo("db.c.aggregate([{$match: {}}], {allowDiskUse: false, maxTimeMS: 5})"),
+            Ok(())
+        );
     }
 
     #[test]

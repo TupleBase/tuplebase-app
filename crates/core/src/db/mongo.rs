@@ -8,14 +8,15 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryStreamExt;
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::options::{
-    AggregateOptions as AggregateOptionsDriver, AuthMechanism, ClientOptions, Credential,
-    FindOneOptions, FindOptions, IndexOptions, ReplaceOptions, Tls, TlsOptions, UpdateOptions,
+    AggregateOptions as AggregateOptionsDriver, AuthMechanism, ClientOptions, CountOptions,
+    Credential, DistinctOptions, EstimatedDocumentCountOptions, FindOneOptions, FindOptions,
+    IndexOptions, ReplaceOptions, Tls, TlsOptions, UpdateOptions,
 };
 use mongodb::results::CollectionType;
 use mongodb::{Client, Collection, IndexModel};
@@ -38,6 +39,11 @@ pub(super) struct MongoPool {
 
 /// Databases the server keeps for itself, left out of the schema.
 const SYSTEM_DATABASES: [&str; 3] = ["admin", "local", "config"];
+
+/// The longest the server may spend on one read-only find, aggregate, count or
+/// distinct: the default when none is given, and the most one may ask for. The SQL
+/// engines set no statement timeout, so this is a fixed minute.
+pub(super) const READ_ONLY_MAX_TIME: Duration = Duration::from_secs(60);
 
 /// How many documents [`fields`] samples.
 const SAMPLE_SIZE: i64 = 100;
@@ -293,7 +299,7 @@ pub(super) async fn run_reads(
     let total = reads.len();
     let mut shown = None;
     for (index, op) in reads.into_iter().enumerate() {
-        let result = read(pool, op, max_rows).await;
+        let result = read(pool, op, max_rows, Some(READ_ONLY_MAX_TIME)).await;
         shown = Some(numbered(result, index, total)?);
     }
     finish(pool, shown, total, false, started)
@@ -311,7 +317,7 @@ pub(super) async fn run(
     let mut changed = false;
     for (index, command) in commands.into_iter().enumerate() {
         let result = match command.as_read_unguarded() {
-            Some(op) => read(pool, op, max_rows).await,
+            Some(op) => read(pool, op, max_rows, None).await,
             None => {
                 changed = true;
                 write(pool, command).await
@@ -367,8 +373,22 @@ async fn collect(
     Ok((docs, false))
 }
 
-/// The one typed driver call for each read.
-async fn read(pool: &MongoPool, op: ReadOp, max_rows: usize) -> Result<QueryResult> {
+/// The shorter of two time limits, either of which may be unset.
+fn shorter(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The one typed driver call for each read. `max_time`, set for read-only work, caps
+/// how long the server may spend on it.
+async fn read(
+    pool: &MongoPool,
+    op: ReadOp,
+    max_rows: usize,
+    max_time: Option<Duration>,
+) -> Result<QueryResult> {
     let docs = match op {
         ReadOp::ListDatabases => {
             let databases = pool
@@ -412,6 +432,7 @@ async fn read(pool: &MongoPool, op: ReadOp, max_rows: usize) -> Result<QueryResu
             options.sort = sort;
             options.skip = skip;
             options.limit = Some(limit.map_or(cap, |n| n.min(cap)));
+            options.max_time = max_time;
             let cursor = pool
                 .collection(&target)
                 .find(filter)
@@ -426,6 +447,7 @@ async fn read(pool: &MongoPool, op: ReadOp, max_rows: usize) -> Result<QueryResu
         } => {
             let mut options = FindOneOptions::default();
             options.projection = projection;
+            options.max_time = max_time;
             let found = pool
                 .collection(&target)
                 .find_one(filter)
@@ -445,7 +467,7 @@ async fn read(pool: &MongoPool, op: ReadOp, max_rows: usize) -> Result<QueryResu
             } = options;
             let mut options = AggregateOptionsDriver::default();
             options.allow_disk_use = allow_disk_use;
-            options.max_time = max_time_ms.map(std::time::Duration::from_millis);
+            options.max_time = shorter(max_time_ms.map(Duration::from_millis), max_time);
             options.batch_size = batch_size;
             let cursor = pool
                 .collection(&target)
@@ -455,11 +477,23 @@ async fn read(pool: &MongoPool, op: ReadOp, max_rows: usize) -> Result<QueryResu
             collect(cursor, max_rows).await?
         }
         ReadOp::CountDocuments { target, filter } => {
-            let count = pool.collection(&target).count_documents(filter).await?;
+            let mut options = CountOptions::default();
+            options.max_time = max_time;
+            let count = pool
+                .collection(&target)
+                .count_documents(filter)
+                .with_options(options)
+                .await?;
             (vec![doc! {"count": count as i64}], false)
         }
         ReadOp::EstimatedDocumentCount { target } => {
-            let count = pool.collection(&target).estimated_document_count().await?;
+            let mut options = EstimatedDocumentCountOptions::default();
+            options.max_time = max_time;
+            let count = pool
+                .collection(&target)
+                .estimated_document_count()
+                .with_options(options)
+                .await?;
             (vec![doc! {"count": count as i64}], false)
         }
         ReadOp::Distinct {
@@ -467,7 +501,13 @@ async fn read(pool: &MongoPool, op: ReadOp, max_rows: usize) -> Result<QueryResu
             field,
             filter,
         } => {
-            let mut values = pool.collection(&target).distinct(&field, filter).await?;
+            let mut options = DistinctOptions::default();
+            options.max_time = max_time;
+            let mut values = pool
+                .collection(&target)
+                .distinct(&field, filter)
+                .with_options(options)
+                .await?;
             let truncated = values.len() > max_rows;
             values.truncate(max_rows);
             let docs = values.into_iter().map(|v| doc! {"value": v}).collect();
@@ -1354,6 +1394,22 @@ mod tests {
                 ("age".into(), "int32".into(), true),
             ]
         );
+    }
+
+    #[test]
+    fn read_only_time_is_capped() {
+        let minute = Some(READ_ONLY_MAX_TIME);
+        let second = Some(Duration::from_secs(1));
+        let hour = Some(Duration::from_secs(3600));
+        assert_eq!(shorter(None, minute), minute);
+        assert_eq!(shorter(second, minute), second);
+        assert_eq!(shorter(hour, minute), minute);
+        assert_eq!(
+            shorter(hour, None),
+            hour,
+            "a writable connection keeps its own"
+        );
+        assert_eq!(shorter(None, None), None);
     }
 
     #[test]

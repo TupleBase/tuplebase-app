@@ -136,6 +136,11 @@ Changing one of these needs the user's explicit agreement, not just a passing re
   the server enforces read-only only when the connection's user, endpoint or IAM policy is
   read-only, which TupleBase reports but cannot switch on.
 
+  A known limit of that guard, not a change to S2: it checks the command it is given, not
+  what a MongoDB view stores. Reading a view runs the view's own pipeline as the server
+  keeps it, which may run server-side JavaScript (`$function`). On these engines only the
+  server's permissions decide what a view does.
+
 ## Dependencies
 
 - **D1. Pin pre-1.0 UI dependencies exactly** (`gpui-kit = "=x.y.z"`) and upgrade them in
