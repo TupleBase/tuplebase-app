@@ -170,6 +170,13 @@ you run a version that reads it. A file that can't be opened at all, such as one
 program holds locked, is never moved and nothing is saved until TupleBase is restarted
 and can read it.
 
+From this version on, one connection this version doesn't understand, such as one a newer
+version added with an engine, sign-in or TLS mode this one doesn't know, no longer makes the
+whole file unreadable. That connection isn't shown, connected to or offered to agents; the
+Connections dialog counts it as needing a newer TupleBase. It is written back unchanged and in
+its place whenever this version saves, and its name stays taken. A file with a `version` this
+version doesn't know is still not read, as above.
+
 ### Verifying an RDS certificate
 
 With **Encryption** set to **Verified**, a database at an `*.rds.amazonaws.com` (or
