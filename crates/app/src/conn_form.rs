@@ -72,6 +72,10 @@ pub struct ConnForm {
     adapter: Adapter,
     /// A new connection asks for the database first and shows the rest once it is chosen.
     chosen: bool,
+    /// Once chosen, the engine shows in one line; this opens the list to change it.
+    picking: bool,
+    /// Narrows the list of engines by name or family.
+    engine_search: Entity<InputState>,
     pub(crate) folder: String,
     name: Entity<InputState>,
     host: Entity<InputState>,
@@ -133,6 +137,7 @@ impl ConnForm {
         let name = input("orders-db", field(|c| c.name.clone()));
         let host = input("localhost", field(|c| c.host.clone()));
         let port = input("Default", field(|c| c.port.to_string()));
+        let engine_search = input("Search engines", String::new());
         let database = input("Optional", field(|c| c.database.clone()));
         let adapter = existing.map_or(Adapter::Postgres, |c| c.adapter);
         let user = input(adapter.user_hint(), field(|c| c.user.clone()));
@@ -180,11 +185,27 @@ impl ConnForm {
             (None, None)
         };
         // The host decides whether Redshift Serverless names the user.
-        let subscriptions = vec![cx.subscribe(&host, |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })];
+        let subscriptions = vec![
+            cx.subscribe(&host, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            // Enter picks the only engine left, or the first.
+            cx.subscribe_in(
+                &engine_search,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::Change => cx.notify(),
+                    InputEvent::PressEnter { .. } => {
+                        if let Some(&adapter) = this.matching_engines(cx).first() {
+                            this.pick_engine(adapter, window, cx);
+                        }
+                    }
+                    _ => {}
+                },
+            ),
+        ];
         Self {
             start,
             _start_subscription: start_subscription,
@@ -198,6 +219,8 @@ impl ConnForm {
             previous: existing.map(|c| c.name.clone()),
             adapter,
             chosen: existing.is_some(),
+            picking: false,
+            engine_search,
             folder,
             name,
             host,
@@ -579,11 +602,48 @@ impl ConnForm {
             self.tls = TlsMode::Require;
         }
         self.adapter = adapter;
+        // A way to sign in the new engine doesn't take goes back to a password.
+        if !adapter.auth_kinds().contains(&self.auth_kind) {
+            self.auth_kind = AuthKind::Password;
+        }
         self.user.update(cx, |input, cx| {
             input.set_placeholder(adapter.user_hint(), window, cx);
         });
     }
 
+    /// The engines whose name or family holds what the search box holds.
+    fn matching_engines(&self, cx: &App) -> Vec<Adapter> {
+        let search = self.engine_search.read(cx).value().trim().to_lowercase();
+        Adapter::ALL
+            .into_iter()
+            .filter(|adapter| {
+                search.is_empty()
+                    || adapter.label().to_lowercase().contains(&search)
+                    || family_label(adapter.family())
+                        .to_lowercase()
+                        .contains(&search)
+            })
+            .collect()
+    }
+
+    fn pick_engine(&mut self, adapter: Adapter, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_adapter(adapter, window, cx);
+        self.picking = false;
+        // The first choice reveals the rest of the form, so move on to it.
+        if !self.chosen {
+            self.chosen = true;
+            let first = if adapter.is_file() {
+                &self.database
+            } else {
+                &self.host
+            };
+            first.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// One engine in the list: its logo and whole name, never cut short; a narrow form
+    /// wraps the list instead.
     fn render_adapter(&self, adapter: Adapter, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let selected = self.chosen && self.adapter == adapter;
@@ -595,28 +655,116 @@ impl ConnForm {
         h_flex()
             .id(SharedString::from(format!("adapter-{}", adapter.label())))
             .test_support()
-            .flex_1()
-            .min_w_0()
+            .flex_none()
+            .min_w(px(104.))
             .gap_2()
-            .p_2()
+            .px_3()
+            .py_2()
             .rounded(theme.radius)
             .border_1()
             .border_color(border)
             .cursor_pointer()
             .child(logos::icon(adapter, 18.))
-            .child(div().min_w_0().truncate().text_sm().child(adapter.label()))
+            .child(div().whitespace_nowrap().text_sm().child(adapter.label()))
             .on_click(cx.listener(move |this, _, window, cx| {
-                this.set_adapter(adapter, window, cx);
-                // The first choice reveals the rest of the form, so move on to it.
-                if !this.chosen {
-                    this.chosen = true;
-                    let first = if adapter.is_file() {
-                        &this.database
-                    } else {
-                        &this.host
-                    };
-                    first.update(cx, |input, cx| input.focus(window, cx));
-                }
+                this.pick_engine(adapter, window, cx);
+            }))
+    }
+
+    /// Every engine, grouped by family, with a search box above.
+    fn render_engine_list(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let matching = self.matching_engines(cx);
+        let groups = [Family::Sql, Family::Document, Family::KeyValue]
+            .into_iter()
+            .filter_map(|family| {
+                let engines: Vec<Adapter> = matching
+                    .iter()
+                    .copied()
+                    .filter(|a| a.family() == family)
+                    .collect();
+                (!engines.is_empty()).then(|| {
+                    v_flex()
+                        .id(SharedString::from(format!(
+                            "engines-{}",
+                            family_label(family)
+                        )))
+                        .test_support()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_medium()
+                                .text_color(muted)
+                                .child(family_label(family)),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .children(engines.into_iter().map(|a| self.render_adapter(a, cx))),
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        let none = groups.is_empty();
+        v_flex()
+            .gap_3()
+            .child(
+                Input::new(&self.engine_search)
+                    .id("engine-search")
+                    .prefix(Icon::new(IconName::Search).small()),
+            )
+            .children(groups)
+            .when(none, |el| {
+                el.child(
+                    div()
+                        .id("engines-none")
+                        .test_support()
+                        .text_sm()
+                        .text_color(muted)
+                        .child("No engine matches the search."),
+                )
+            })
+    }
+
+    /// The chosen engine in one line, with a way to change it.
+    fn render_engine_current(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let adapter = self.adapter;
+        h_flex()
+            .id("engine-current")
+            .test_support()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.input)
+            .cursor_pointer()
+            .child(logos::icon(adapter, 18.))
+            .child(div().whitespace_nowrap().text_sm().child(adapter.label()))
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(family_label(adapter.family())),
+            )
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("Change")
+                    .child(Icon::new(IconName::ChevronDown).small()),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.picking = true;
+                this.engine_search
+                    .update(cx, |input, cx| input.focus(window, cx));
                 cx.notify();
             }))
     }
@@ -809,16 +957,21 @@ impl ConnForm {
     }
 
     fn render_database(&self, cx: &mut Context<Self>) -> Div {
+        // Until one is chosen, every engine is listed; then the chosen one shows in one
+        // line until asked to change it.
+        let list = !self.chosen || self.picking;
         v_flex()
             .gap_3()
             .when(!self.chosen, |el| {
                 el.child(hint("Choose the database you want to connect to.", cx))
             })
-            .child(
-                h_flex()
-                    .gap_2()
-                    .children(Adapter::ALL.map(|a| self.render_adapter(a, cx))),
-            )
+            .map(|el| {
+                if list {
+                    el.child(self.render_engine_list(cx))
+                } else {
+                    el.child(self.render_engine_current(cx))
+                }
+            })
             .when(self.chosen, |el| el.child(self.render_name(cx)))
     }
 
@@ -854,6 +1007,7 @@ impl ConnForm {
             .when(document, |el| {
                 el.child(
                     h_flex()
+                        .flex_wrap()
                         .gap_3()
                         .justify_between()
                         .child(
@@ -913,9 +1067,12 @@ impl ConnForm {
         v_flex()
             .gap_3()
             .child(
-                h_flex()
-                    .gap_2()
-                    .children(AuthKind::ALL.map(|k| self.render_auth(k, cx))),
+                h_flex().flex_wrap().gap_2().children(
+                    self.adapter
+                        .auth_kinds()
+                        .iter()
+                        .map(|&k| self.render_auth(k, cx)),
+                ),
             )
             .when(kind != AuthKind::Password, |el| {
                 el.child(self.render_aws(kind, cx))
@@ -944,6 +1101,7 @@ impl ConnForm {
                     "Encryption",
                     h_flex()
                         .gap_2()
+                        .flex_wrap()
                         .children(TlsMode::ALL.map(|mode| self.render_tls(mode, cx))),
                     cx,
                 ))
@@ -1022,8 +1180,12 @@ fn choice(
     div()
         .id(SharedString::from(format!("{group}-{label}")))
         .test_support()
+        // Shares the row, but wraps to the next line rather than cutting the label.
         .flex_1()
+        .min_w(px(128.))
+        .px_3()
         .py_1p5()
+        .whitespace_nowrap()
         .text_center()
         .text_sm()
         .rounded(theme.radius)
@@ -1031,6 +1193,15 @@ fn choice(
         .border_color(border)
         .cursor_pointer()
         .child(label)
+}
+
+/// How the list of engines names a family.
+fn family_label(family: Family) -> &'static str {
+    match family {
+        Family::Sql => "SQL",
+        Family::Document => "Document",
+        Family::KeyValue => "Key-value",
+    }
 }
 
 /// A labelled control. The label is quieter than its section's title.
@@ -1082,8 +1253,9 @@ fn section(step: usize, title: &'static str, body: Div, cx: &App) -> Div {
         .child(body)
 }
 
-/// The column the form is laid out in.
-const COLUMN_WIDTH: f32 = 600.;
+/// The widest the column the form is laid out in grows: 600 px of fields between 16 px
+/// gutters. A narrower window narrows it.
+const COLUMN_WIDTH: f32 = 632.;
 
 impl ConnForm {
     /// Typing the details in, or finding them in AWS: a new connection's two ways.
@@ -1235,7 +1407,9 @@ impl ConnForm {
             .border_color(cx.theme().border)
             .child(
                 v_flex()
-                    .w(px(COLUMN_WIDTH))
+                    .w_full()
+                    .max_w(px(COLUMN_WIDTH))
+                    .px_4()
                     .gap_2()
                     .when_some(self.error.clone(), |el, error| {
                         el.child(div().text_sm().text_color(cx.theme().danger).child(error))
@@ -1256,7 +1430,7 @@ impl Render for ConnForm {
         };
         let heading = div().text_xl().font_semibold().child(title);
         let switch = (new && self.start.is_none()).then(|| self.render_mode_switch(cx));
-        let column = || v_flex().w(px(COLUMN_WIDTH)).gap_4();
+        let column = || v_flex().w_full().max_w(px(COLUMN_WIDTH)).px_4().gap_4();
         let footer = self.render_footer(cx);
         // Finding it in AWS: the list scrolls in its own area, the rest stays put.
         if let (None, Mode::Aws, Some(picker)) = (&self.start, self.mode, self.picker.clone()) {
@@ -1327,7 +1501,7 @@ impl Render for ConnForm {
 #[cfg(test)]
 mod tests {
     // No glob from gpui_kit: its `test` macro would shadow the built-in `#[test]`.
-    use super::{ConnForm, ConnFormEvent, Mode};
+    use super::{AuthKind, ConnForm, ConnFormEvent, Mode};
     use crate::aws_picker::tests::{found, many};
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, px, size};
@@ -1556,6 +1730,150 @@ mod tests {
         cx.update(|cx| assert_eq!(form.read(cx).mode, Mode::Aws));
     }
 
+    /// Chooses an engine, opening the list first when one is already chosen.
+    fn pick(handle: AnyWindowHandle, engine: &str, cx: &mut TestAppContext) {
+        let id = gpui_kit::SharedString::from(format!("adapter-{engine}"));
+        act(handle, cx, |window, cx| {
+            if window.try_find("engine-current").is_some() {
+                window.click("engine-current", cx);
+            }
+        });
+        act(handle, cx, |window, cx| window.click(id, cx));
+    }
+
+    #[gpui_kit::test]
+    fn engines_are_listed_by_family_and_found_by_search(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        act(handle, cx, |window, cx| {
+            assert!(window.find("engines-SQL").visible());
+            assert!(window.find("engines-Document").visible());
+            // No key-value engine yet: an empty family isn't shown.
+            assert!(window.try_find("engines-Key-value").is_none());
+            assert!(window.find("adapter-Amazon DocumentDB").visible());
+            window.click("engine-search", cx);
+            window.input("mongo", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.find("adapter-MongoDB").visible());
+            assert!(window.try_find("adapter-PostgreSQL").is_none());
+            assert!(window.try_find("engines-SQL").is_none());
+            // Enter takes the first engine left.
+            window.press("enter", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert_eq!(form.read(cx).adapter, Adapter::Mongodb);
+            // Chosen, the engine shows in one line, and the rest of the form appears.
+            assert!(window.find("engine-current").visible());
+            assert!(window.try_find("engine-search").is_none());
+            assert!(window.find("conn-host").visible());
+        });
+        // A family's name finds its engines; nothing found says so.
+        act(handle, cx, |window, cx| window.click("engine-current", cx));
+        act(handle, cx, |window, cx| {
+            window.click("engine-search", cx);
+            window.press("secondary-a", cx);
+            window.input("document", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.find("adapter-MongoDB").visible());
+            assert!(window.find("adapter-Amazon DocumentDB").visible());
+            assert!(window.try_find("adapter-MySQL").is_none());
+            window.press("secondary-a", cx);
+            window.input("oracle", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.find("engines-none").visible());
+            window.press("secondary-a", cx);
+            window.input("my", cx);
+        });
+        act(handle, cx, |window, cx| window.click("adapter-MySQL", cx));
+        act(handle, cx, |window, cx| {
+            assert_eq!(form.read(cx).adapter, Adapter::Mysql);
+            assert!(window.try_find("engines-SQL").is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn editing_shows_the_engine_in_one_line_until_asked_to_change_it(cx: &mut TestAppContext) {
+        let (handle, form) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::workspace::bind_keys(cx);
+            let conn = Connection {
+                name: "orders".into(),
+                folder: String::new(),
+                adapter: Adapter::Postgres,
+                host: "db.example.com".into(),
+                port: 5432,
+                database: "app".into(),
+                user: "app".into(),
+                readonly: false,
+                color: String::new(),
+                tls: Default::default(),
+                ssh: None,
+                auth: Auth::Password,
+                source: None,
+                mongo: None,
+            };
+            gpui_kit::open_window(Default::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    ConnForm::new(
+                        Some(&conn),
+                        String::new(),
+                        CloudSearch::default(),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .expect("open test window")
+        });
+        // Narrow: nothing is cut short; the choices wrap instead.
+        cx.update_window(handle, |_, window, _| {
+            window.resize(size(px(420.), px(900.)))
+        })
+        .unwrap();
+        act(handle, cx, |window, cx| {
+            assert!(window.find("engine-current").visible());
+            assert!(window.try_find("engines-SQL").is_none());
+            assert!(window.find("auth-Secrets Manager").visible());
+            assert!(window.find("auth-IAM token").visible());
+            window.click("engine-current", cx);
+        });
+        act(handle, cx, |window, cx| {
+            assert!(window.find("engines-SQL").visible());
+            assert!(window.find("adapter-Amazon DocumentDB").visible());
+            window.click("adapter-PostgreSQL", cx);
+        });
+        // Choosing the same engine closes the list and changes nothing.
+        act(handle, cx, |window, cx| {
+            assert!(window.find("engine-current").visible());
+            assert_eq!(form.read(cx).adapter, Adapter::Postgres);
+        });
+    }
+
+    #[gpui_kit::test]
+    fn only_the_engines_ways_to_sign_in_are_offered(cx: &mut TestAppContext) {
+        let (handle, form) = open(cx);
+        act(handle, cx, |window, cx| window.click("source-manual", cx));
+        pick(handle, "PostgreSQL", cx);
+        act(handle, cx, |window, cx| {
+            for kind in AuthKind::ALL {
+                let id = gpui_kit::SharedString::from(format!("auth-{}", kind.label()));
+                assert!(window.find(id).visible(), "{kind:?}");
+            }
+            window.click("auth-IAM token", cx);
+        });
+        // MongoDB takes no IAM token: the choice goes, and the form goes back to a password.
+        pick(handle, "MongoDB", cx);
+        act(handle, cx, |window, cx| {
+            assert!(window.try_find("auth-IAM token").is_none());
+            assert!(window.find("auth-Parameter Store").visible());
+            assert!(window.find("conn-password").visible());
+            assert_eq!(form.read(cx).auth_kind, AuthKind::Password);
+        });
+    }
+
     #[gpui_kit::test]
     fn the_user_example_follows_the_engine(cx: &mut TestAppContext) {
         let (handle, _form) = open(cx);
@@ -1566,12 +1884,7 @@ mod tests {
             ("Redshift", "awsuser"),
             ("PostgreSQL", "postgres"),
         ] {
-            act(handle, cx, |window, cx| {
-                window.click(
-                    gpui_kit::SharedString::from(format!("adapter-{engine}")),
-                    cx,
-                )
-            });
+            pick(handle, engine, cx);
             act(handle, cx, |window, _| {
                 assert_eq!(
                     window.find("conn-user").placeholder(),
@@ -1581,7 +1894,7 @@ mod tests {
             });
         }
         // A file has no user to ask for.
-        act(handle, cx, |window, cx| window.click("adapter-SQLite", cx));
+        pick(handle, "SQLite", cx);
         act(handle, cx, |window, _| {
             assert!(window.try_find("conn-user").is_none());
         });

@@ -147,7 +147,20 @@ pub struct EngineInfo {
     pub user_hint: &'static str,
     pub quote: IdentQuote,
     pub script: ScriptFlavor,
+    /// The ways a connection to this engine may sign in, in the order the form offers them.
+    pub auth: &'static [AuthKind],
 }
+
+/// A server engine that takes RDS-style IAM tokens: every way to sign in.
+const SERVER_AUTH: &[AuthKind] = &AuthKind::ALL;
+/// A server engine without IAM sign-in: a password, typed or kept in AWS.
+const PASSWORD_AUTH: &[AuthKind] = &[
+    AuthKind::Password,
+    AuthKind::AwsSecret,
+    AuthKind::AwsParameter,
+];
+/// A file: no sign-in, so only the default, which asks for nothing.
+const FILE_AUTH: &[AuthKind] = &[AuthKind::Password];
 
 const POSTGRES: EngineInfo = EngineInfo {
     label: "PostgreSQL",
@@ -157,6 +170,7 @@ const POSTGRES: EngineInfo = EngineInfo {
     user_hint: "postgres",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Postgres,
+    auth: SERVER_AUTH,
 };
 
 const MARIADB: EngineInfo = EngineInfo {
@@ -167,6 +181,7 @@ const MARIADB: EngineInfo = EngineInfo {
     user_hint: "root",
     quote: IdentQuote::Backtick,
     script: ScriptFlavor::Mysql,
+    auth: SERVER_AUTH,
 };
 
 const MYSQL: EngineInfo = EngineInfo {
@@ -177,6 +192,7 @@ const MYSQL: EngineInfo = EngineInfo {
     user_hint: "root",
     quote: IdentQuote::Backtick,
     script: ScriptFlavor::Mysql,
+    auth: SERVER_AUTH,
 };
 
 const SQLITE: EngineInfo = EngineInfo {
@@ -187,6 +203,7 @@ const SQLITE: EngineInfo = EngineInfo {
     user_hint: "",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Sqlite,
+    auth: FILE_AUTH,
 };
 
 const REDSHIFT: EngineInfo = EngineInfo {
@@ -197,6 +214,7 @@ const REDSHIFT: EngineInfo = EngineInfo {
     user_hint: "awsuser",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Redshift,
+    auth: SERVER_AUTH,
 };
 
 const MONGODB: EngineInfo = EngineInfo {
@@ -208,6 +226,7 @@ const MONGODB: EngineInfo = EngineInfo {
     // No Mongo path quotes a name; this only keeps the field filled in.
     quote: IdentQuote::Double,
     script: ScriptFlavor::MongoShell,
+    auth: PASSWORD_AUTH,
 };
 
 const DOCUMENTDB: EngineInfo = EngineInfo {
@@ -218,6 +237,7 @@ const DOCUMENTDB: EngineInfo = EngineInfo {
     user_hint: "docdbadmin",
     quote: IdentQuote::Double,
     script: ScriptFlavor::MongoShell,
+    auth: PASSWORD_AUTH,
 };
 
 impl Adapter {
@@ -281,6 +301,11 @@ impl Adapter {
 
     pub fn user_hint(self) -> &'static str {
         self.info().user_hint
+    }
+
+    /// The ways a connection to this engine may sign in.
+    pub fn auth_kinds(self) -> &'static [AuthKind] {
+        self.info().auth
     }
 }
 
@@ -834,6 +859,16 @@ impl Connection {
             self.check_iam_encryption()?;
         }
         self.check_mongo()?;
+        // The checks above name the common cases; this one covers every engine.
+        let kind = self.auth.kind();
+        if !self.adapter.auth_kinds().contains(&kind) {
+            bail!(
+                "{} can't sign in with {} for \"{}\"",
+                self.adapter.label(),
+                kind.label(),
+                self.name
+            );
+        }
         let color_is_valid = self.color.is_empty()
             || (self.color.len() == 7
                 && self.color.starts_with('#')
@@ -2363,6 +2398,21 @@ mod tests {
         let mut wrong = pg("p");
         wrong.mongo = Some(MongoSettings::default());
         assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn each_engine_offers_only_the_sign_ins_it_takes() {
+        for adapter in Adapter::ALL {
+            let kinds = adapter.auth_kinds();
+            assert_eq!(kinds.first(), Some(&AuthKind::Password), "{adapter:?}");
+            let iam = kinds.contains(&AuthKind::AwsIam);
+            let expected = matches!(
+                adapter,
+                Adapter::Postgres | Adapter::Mariadb | Adapter::Mysql | Adapter::Redshift
+            );
+            assert_eq!(iam, expected, "{adapter:?}");
+        }
+        assert_eq!(Adapter::Sqlite.auth_kinds(), [AuthKind::Password]);
     }
 
     #[test]
