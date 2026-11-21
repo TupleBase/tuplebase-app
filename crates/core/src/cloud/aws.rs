@@ -1288,6 +1288,60 @@ mod tests {
     }
 
     #[test]
+    fn a_documentdb_cluster_is_listed_at_its_primary_with_its_reader_and_secret() {
+        let secret = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:docs-abc";
+        let cluster = DbCluster::builder()
+            .db_cluster_identifier("docs")
+            .engine("docdb")
+            .engine_version("5.0.0")
+            .endpoint("docs.cluster-abc.eu-west-1.docdb.amazonaws.com")
+            .reader_endpoint("docs.cluster-ro-abc.eu-west-1.docdb.amazonaws.com")
+            .port(27017)
+            .status("available")
+            .master_username("docdbadmin")
+            .master_user_secret(MasterUserSecret::builder().secret_arn(secret).build())
+            .db_cluster_members(
+                DbClusterMember::builder()
+                    .db_instance_identifier("docs-1")
+                    .build(),
+            )
+            .build();
+        let instances = [instance("docs-1", "docdb")
+            .db_cluster_identifier("docs")
+            .build()];
+        let found = found_in_region(&instances, &[cluster], "prod", "eu-west-1");
+        assert_eq!(found.len(), 1, "the cluster once, not its instance");
+        let docs = &found[0];
+        assert_eq!(docs.adapter, Some(Adapter::Documentdb));
+        assert_eq!(docs.port, 27017);
+        assert_eq!(docs.user, "docdbadmin");
+        assert!(is_docdb_host(&docs.host));
+        assert!(!is_rds_host(&docs.host));
+        let note = docs.note.as_deref().unwrap();
+        assert!(note.contains("DocumentDB cluster"), "{note}");
+        assert!(note.contains("cluster-ro-abc"), "{note}");
+        // Not reachable from outside its VPC: the tunnel note.
+        assert!(note.contains("SSH tunnel"), "{note}");
+        assert!(
+            matches!(&docs.auth, Auth::AwsSecret(s) if s.name == secret),
+            "{:?}",
+            docs.auth
+        );
+    }
+
+    #[test]
+    fn documentdb_hosts_are_told_apart() {
+        assert!(is_docdb_host(
+            "docs.cluster-abc.eu-west-1.docdb.amazonaws.com"
+        ));
+        assert!(is_docdb_host(
+            "DOCS.cluster-abc.cn-north-1.docdb.amazonaws.com.cn."
+        ));
+        assert!(!is_docdb_host("docdb.amazonaws.com.example.com"));
+        assert!(!is_docdb_host("orders.abc.eu-west-1.rds.amazonaws.com"));
+    }
+
+    #[test]
     fn the_managed_secret_wins_then_iam_then_a_password() {
         let secret = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:rds!db-1";
         let managed = instance("a", "postgres")
@@ -1832,6 +1886,22 @@ mod tests {
         named.database = "reports".into();
         let (target, _) = Secret::parse(RDS).unwrap().apply(&named, true).unwrap();
         assert_eq!(target.database, "reports");
+    }
+
+    #[test]
+    fn a_documentdb_secret_fills_in_user_host_and_port() {
+        // The shape DocumentDB writes: no dbname, and fields the connection ignores.
+        let docdb = r#"{"username":"docdbadmin","password":"p","engine":"mongo",
+            "host":"docs.cluster-abc.eu-west-1.docdb.amazonaws.com","port":27017,
+            "ssl":true,"dbClusterIdentifier":"docs"}"#;
+        let (target, password) = Secret::parse(docdb).unwrap().apply(&conn(), true).unwrap();
+        assert_eq!(password, "p");
+        assert_eq!(target.user, "docdbadmin");
+        assert_eq!(
+            (target.host.as_str(), target.port),
+            ("docs.cluster-abc.eu-west-1.docdb.amazonaws.com", 27017)
+        );
+        assert_eq!(target.database, "");
     }
 
     #[test]
