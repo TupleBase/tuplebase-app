@@ -9,7 +9,7 @@ publish.workspace = true
 tuplebase-core = { path = "../core" }
 anyhow = "1.0.104"
 # Pre-1.0 and fast-moving: pin exactly, upgrade in a dedicated commit.
-gpui-kit = { version = "=0.9.0", features = ["tree-sitter-sql"] }
+gpui-kit = { version = "=0.9.0", features = ["tree-sitter-sql", "tree-sitter-javascript"] }
 # Same versions gpui-kit uses, for its completion API.
 lsp-types = { version = "0.97.0", features = ["proposed"] }
 ropey = "=2.0.0-beta.1"
