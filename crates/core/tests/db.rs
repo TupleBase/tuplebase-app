@@ -568,6 +568,47 @@ async fn a_transaction_left_open_ends_with_its_run() {
     .await;
 }
 
+/// Statements that don't start with a read keyword but return rows show them.
+#[tokio::test]
+async fn calls_and_returning_show_their_rows() {
+    each_adapter(async |db, conn| {
+        let setup: &[&str] = match conn.adapter {
+            Adapter::Postgres => &[
+                "DROP PROCEDURE IF EXISTS it_rows_proc(int, int)",
+                "CREATE PROCEDURE it_rows_proc(IN a int, INOUT b int) \
+                 LANGUAGE plpgsql AS $$ BEGIN b := a * 2; END $$",
+            ],
+            _ => &[
+                "DROP PROCEDURE IF EXISTS it_rows_proc",
+                "CREATE PROCEDURE it_rows_proc() \
+                 BEGIN SELECT 1 AS first; SELECT 'two' AS second, 3 AS third; END",
+            ],
+        };
+        for sql in setup {
+            db.execute(&conn, sql, WRITE).await.unwrap();
+        }
+        let (call, columns, rows) = match conn.adapter {
+            Adapter::Postgres => ("CALL it_rows_proc(21, NULL)", vec!["b"], json!([[42]])),
+            // The first result set: rows of another shape would not fit its columns.
+            _ => ("CALL it_rows_proc()", vec!["first"], json!([[1]])),
+        };
+        let r = db.execute(&conn, call, WRITE).await.unwrap();
+        assert_eq!(r.columns, columns, "{:?}", conn.adapter);
+        assert_eq!(json!(r.rows), rows, "{:?}", conn.adapter);
+        // The connection is still in step afterwards.
+        let r = db.execute(&conn, "SELECT 5 AS n", WRITE).await.unwrap();
+        assert_eq!(r.rows, [[json!(5)]]);
+        // RETURNING with no space before it, which both engines read.
+        let r = db
+            .execute(&conn, "DELETE FROM users WHERE id < 0 RETURNING*", WRITE)
+            .await
+            .unwrap();
+        assert!(r.rows.is_empty());
+        assert!(r.rows_affected.is_none(), "{:?}", conn.adapter);
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn postgres_shows_nan_infinity_and_numerics_of_any_size_exactly() {
     if !enabled() {

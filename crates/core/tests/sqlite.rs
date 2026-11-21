@@ -107,6 +107,22 @@ async fn a_transaction_left_open_ends_with_its_run() {
 }
 
 #[tokio::test]
+async fn a_pragma_shows_its_rows() {
+    let (_dir, conn) = database().await;
+    let r = Db::new()
+        .execute(&conn, "PRAGMA table_info(users)", WRITE)
+        .await
+        .unwrap();
+    assert!(r.columns.contains(&"name".to_owned()), "{:?}", r.columns);
+    assert_eq!(r.rows.len(), 4);
+    // One that sets a value still runs.
+    Db::new()
+        .execute(&conn, "PRAGMA foreign_keys = ON", WRITE)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn select_decodes_values() {
     let (_dir, conn) = database().await;
     let r = Db::new()

@@ -500,7 +500,9 @@ impl Db {
                         } else {
                             out?
                         };
-                        changed |= result.rows_affected.is_some();
+                        // A CALL or a RETURNING shows rows yet may have changed things.
+                        changed |= result.rows_affected.is_some()
+                            || !safety::starts_with_read(conn.adapter, sql);
                         if shown.is_none() || !result.columns.is_empty() {
                             shown = Some(result);
                         }
@@ -770,11 +772,24 @@ macro_rules! run {
                     elapsed_ms: 0,
                 });
             }
-            let mut stream = query.fetch($conn);
+            // One statement; its results and the end of each result set.
+            let mut stream = Executor::fetch_many($conn, query);
             let mut columns = Vec::new();
             let mut rows = Vec::new();
             let mut truncated = false;
-            while let Some(row) = stream.try_next().await? {
+            // A MySQL procedure can return several result sets, of different shapes: the
+            // first one with rows is shown. The rest are still read, not left behind:
+            // stopping right after a result set leaves sqlx-mysql waiting for it forever.
+            let mut shown_set = false;
+            while let Some(item) = stream.try_next().await? {
+                let row = match item {
+                    sqlx::Either::Right(_) if shown_set => continue,
+                    sqlx::Either::Right(row) => row,
+                    sqlx::Either::Left(_) => {
+                        shown_set = !rows.is_empty();
+                        continue;
+                    }
+                };
                 if rows.len() == $max {
                     truncated = true;
                     break;
