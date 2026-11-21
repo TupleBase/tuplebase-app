@@ -82,6 +82,7 @@ scripts/                   install, packaging, release helpers
 | -------------------- | ----------------------------------------------------------- |
 | `main`               | startup, window, key bindings                               |
 | `workspace`          | the main window: connection sidebar, SQL editor, results    |
+| `connection_tab`     | one open connection: SQL editor, schema, results, status    |
 | `workspace/settings` | the Settings dialog                                         |
 | `conn_form`          | the add and edit connection form                            |
 | `conn_source`        | the first step of adding one: where the database is         |

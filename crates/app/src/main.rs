@@ -6,6 +6,7 @@ mod chat;
 mod completions;
 mod conn_form;
 mod conn_source;
+mod connection_tab;
 mod dialogs;
 mod logos;
 mod results;

@@ -1,23 +1,19 @@
-//! Main window: connection sidebar, SQL editor, results table.
+//! Main window: connection sidebar and the open connections, one tab each.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use gpui_kit::component::button::*;
-use gpui_kit::component::input::{Editor, EditorState, Input, InputEvent, InputState};
-use gpui_kit::component::menu::{
-    AppMenuBar, ContextMenuExt, DropdownMenu, PopupMenu, PopupMenuItem,
-};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{AppMenuBar, ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{
-    ResizablePanel, ResizableState, h_resizable, resizable_panel, v_resizable,
+    ResizablePanel, ResizableState, h_resizable, resizable_panel,
 };
-use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -26,22 +22,19 @@ use tuplebase_core::config::{
     Adapter, Appearance, Config, Connection, DEFAULT_FONT_SIZE, FolderNode, folder_name,
     kept_unreadable_message, parent_of, rebase_folder,
 };
-use tuplebase_core::db::{Db, ExecOptions, ROLLED_BACK_NOTE, ScriptResult};
+use tuplebase_core::db::Db;
 use tuplebase_core::secrets::{ConnectionSecrets, Secret};
 use tuplebase_core::state::SessionState;
-use tuplebase_core::{app_status, mcp_status, safety, secrets, updates};
+use tuplebase_core::{app_status, mcp_status, secrets, updates};
 
 use crate::chat::{ChatEvent, ChatPanel};
-use crate::completions::{self, SchemaNames, SqlCompletions};
+use crate::completions;
 use crate::conn_form::{ConnForm, ConnFormEvent};
+use crate::connection_tab::{self, ConnectionTab, HISTORY_MENU_SIZE, Status, TabEvent};
 use crate::dialogs;
 use crate::logos;
-use crate::results::ResultsDelegate;
-use crate::row_detail::{RowDetail, RowDetailEvent};
-use crate::run_button::{RunButton, RunStatement};
 use crate::runtime::{blocking, io};
 use crate::saving::{Save, Saves};
-use crate::schema::{SchemaEvent, SchemaPanel};
 use crate::theme;
 use crate::tree_nav::{self, TreeCollapse, TreeDown, TreeExpand, TreeOpen, TreeUp};
 
@@ -65,9 +58,9 @@ actions!(
 );
 
 #[cfg(target_os = "macos")]
-const RUN_KEY: &str = "cmd-enter";
+pub(crate) const RUN_KEY: &str = "cmd-enter";
 #[cfg(not(target_os = "macos"))]
-const RUN_KEY: &str = "ctrl-enter";
+pub(crate) const RUN_KEY: &str = "ctrl-enter";
 #[cfg(target_os = "macos")]
 const SETTINGS_KEY: &str = "cmd-,";
 #[cfg(not(target_os = "macos"))]
@@ -76,16 +69,6 @@ const SETTINGS_KEY: &str = "ctrl-,";
 const RUN_ALL_KEY: &str = "cmd-shift-enter";
 #[cfg(not(target_os = "macos"))]
 const RUN_ALL_KEY: &str = "ctrl-shift-enter";
-#[cfg(target_os = "macos")]
-const RUN_HINT: &str = "Run the selection or the statement at the cursor (⌘↵). Run all: ⌘⇧↵";
-#[cfg(not(target_os = "macos"))]
-const RUN_HINT: &str =
-    "Run the selection or the statement at the cursor (Ctrl+Enter). Run all: Ctrl+Shift+Enter";
-#[cfg(target_os = "macos")]
-const NO_STATEMENT: &str = "No statement at the cursor. Select some SQL, or run all with ⌘⇧↵";
-#[cfg(not(target_os = "macos"))]
-const NO_STATEMENT: &str =
-    "No statement at the cursor. Select some SQL, or run all with Ctrl+Shift+Enter";
 
 /// A key held with Cmd on macOS and Ctrl elsewhere.
 #[cfg(target_os = "macos")]
@@ -168,13 +151,10 @@ pub fn register_menu_actions(workspace: &Entity<Workspace>, window: AnyWindowHan
 const STATUS_POLL: Duration = Duration::from_secs(5);
 
 const UNPLUG_ICON: &[u8] = include_bytes!("../../../assets/icons/unplug.svg");
-const EDIT_ICON: &[u8] = include_bytes!("../../../assets/icons/square-pen.svg");
 const DELETE_ICON: &[u8] = include_bytes!("../../../assets/icons/trash.svg");
 const NEW_FOLDER_ICON: &[u8] = include_bytes!("../../../assets/icons/folder-plus.svg");
-const HISTORY_ICON: &[u8] = include_bytes!("../../../assets/icons/clock.svg");
 const RENAME_ICON: &[u8] = include_bytes!("../../../assets/icons/pencil.svg");
 
-const HISTORY_MENU_SIZE: usize = 20;
 /// The least room the sidebar leaves beside it. It fits the schema panel at its widest
 /// next to an editor that is still usable.
 const MAIN_MIN_WIDTH: f32 = 480.;
@@ -182,16 +162,6 @@ const MAIN_MIN_WIDTH: f32 = 480.;
 const TREE_INDENT: f32 = 16.;
 /// Empty space at the top of the window, where the traffic lights sit on macOS.
 const WINDOW_TOP_STRIP: f32 = 40.;
-
-/// Rows shown per query in the app; agents get their own cap in the MCP server.
-const MAX_ROWS: usize = 1000;
-
-enum Status {
-    Idle,
-    Busy(SharedString),
-    Done(SharedString),
-    Failed(SharedString),
-}
 
 /// One visible line of the connection tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,7 +245,7 @@ enum UpdateState {
 
 /// A panel whose edge can be dragged. Its size is kept between launches.
 #[derive(Clone, Copy)]
-enum Panel {
+pub(crate) enum Panel {
     Sidebar,
     Schema,
     Editor,
@@ -324,33 +294,67 @@ impl Panel {
             _ => 0,
         }
     }
+
+    /// A panel that opens at the size it was last dragged to, as kept in `saved`, and
+    /// keeps that size when the window resizes.
+    pub(crate) fn sized(self, saved: &BTreeMap<String, u32>) -> ResizablePanel {
+        let saved = saved.get(self.key());
+        resizable_panel()
+            .size(px(saved.map_or(self.default_size(), |size| *size as f32)))
+            .size_range(self.size_range())
+            .fixed()
+    }
+
+    /// The sizes these panels of one group were dragged to, by the name each is saved
+    /// under. One that is not shown keeps the size it had, so it is left out.
+    pub(crate) fn dragged_sizes(
+        panels: &[Panel],
+        state: &Entity<ResizableState>,
+        cx: &App,
+    ) -> Vec<(&'static str, u32)> {
+        let sizes = state.read(cx).sizes();
+        panels
+            .iter()
+            .filter_map(|panel| {
+                let size = sizes.get(panel.index())?;
+                Some((panel.key(), size.as_f32().round() as u32))
+            })
+            .collect()
+    }
+}
+
+/// A connection the form is saving.
+struct Saving {
+    form: Entity<ConnForm>,
+    connection: Connection,
+    /// Its name before an edit.
+    previous: Option<String>,
+}
+
+/// An open connection's tab.
+struct OpenTab {
+    /// The tab's connection, kept in step with its own on a rename.
+    name: String,
+    tab: Entity<ConnectionTab>,
+    _subscription: Subscription,
 }
 
 pub struct Workspace {
     db: Arc<Db>,
     config: Config,
-    selected: Option<String>,
+    /// One per open connection, in the order they were opened.
+    tabs: Vec<OpenTab>,
+    /// The name of the tab on screen.
+    active: Option<String>,
     form: Option<Entity<ConnForm>>,
-    editor: Entity<EditorState>,
-    run_button: Entity<RunButton>,
-    _run_button_subscription: Subscription,
-    results: Entity<TableState<ResultsDelegate>>,
-    row_detail: Entity<RowDetail>,
-    _row_detail_subscriptions: [Subscription; 2],
+    /// The status line of the empty screen, shown when no tab is open.
     status: Status,
-    /// The query run whose result is still to show; an earlier one's is dropped.
-    run: u64,
     session: SessionState,
-    /// SQL to show once the next frame has a window to apply it with.
-    pending_editor_text: Option<String>,
-    _editor_subscription: Subscription,
     _session_save: Option<Task<()>>,
     /// A change to the session waits for `_session_save`.
     session_unsaved: bool,
     session_saves: Saves<SessionState>,
     config_saves: Saves<Config>,
-    schema: Entity<SchemaPanel>,
-    _schema_subscription: Subscription,
     chat: Entity<ChatPanel>,
     chat_open: bool,
     _chat_subscription: Subscription,
@@ -465,6 +469,7 @@ impl Workspace {
             this.update(cx, |this, cx| {
                 if this.connected != open {
                     this.connected = open;
+                    this.show_connected_tabs(cx);
                     cx.notify();
                 }
             })
@@ -473,23 +478,18 @@ impl Workspace {
         .detach();
     }
 
-    /// Closes a connection. The open one also leaves the screen: staying on it would let
-    /// the next query quietly connect again.
-    fn disconnect(&mut self, name: String, cx: &mut Context<Self>) {
-        if self.selected.as_deref() == Some(name.as_str()) {
-            if self.pending_editor_text.is_none() {
-                self.remember_draft(cx);
-            }
-            self.selected = None;
-            self.status = Status::Idle;
-            self.schema
-                .update(cx, |schema, cx| schema.set_connection(None, cx));
-            self.close_row_detail(cx);
-            self.results.update(cx, |table, cx| {
-                table.delegate_mut().clear();
-                table.refresh(cx);
-            });
+    fn show_connected_tabs(&self, cx: &mut Context<Self>) {
+        for open in &self.tabs {
+            let connected = self.connected.contains(&open.name);
+            open.tab
+                .update(cx, |tab, cx| tab.set_connected(connected, cx));
         }
+    }
+
+    /// Closes a connection, and its tab with it: keeping the tab would let its next query
+    /// quietly connect again.
+    fn close_tab(&mut self, name: String, cx: &mut Context<Self>) {
+        self.remove_tab(&name);
         self.connected.remove(&name);
         cx.notify();
         let db = self.db.clone();
@@ -505,19 +505,20 @@ impl Workspace {
         .detach();
     }
 
-    /// A failed query can mean the server has gone: if so, stop showing it as connected.
-    fn check_still_connected(&self, conn: Connection, cx: &mut Context<Self>) {
-        let db = self.db.clone();
-        cx.spawn(async move |this, cx| {
-            io(async move {
-                db.check(&conn).await.ok();
-                Ok(())
-            })
-            .await
-            .ok();
-            this.update(cx, |this, cx| this.refresh_connected(cx)).ok();
-        })
-        .detach();
+    /// Takes `name`'s tab off the screen; the one to its right shows instead, else the
+    /// one to its left.
+    fn remove_tab(&mut self, name: &str) {
+        let Some(ix) = self.tab_index(name) else {
+            return;
+        };
+        self.tabs.remove(ix);
+        if self.active.as_deref() == Some(name) {
+            self.active = self
+                .tabs
+                .get(ix)
+                .or_else(|| ix.checked_sub(1).and_then(|ix| self.tabs.get(ix)))
+                .map(|open| open.name.clone());
+        }
     }
 
     fn watch_mcp_servers(&self, cx: &mut Context<Self>) {
@@ -714,7 +715,7 @@ impl Workspace {
     /// Shows in the status line why saving failed, or where it moved a connections file
     /// this version can't read; says nothing after an ordinary save.
     fn show_saved(&mut self, saved: anyhow::Result<Option<PathBuf>>, cx: &mut Context<Self>) {
-        self.status = match saved {
+        let status = match saved {
             Ok(None) => return,
             Ok(Some(kept)) => {
                 let note = SharedString::from(kept_unreadable_message(&kept));
@@ -723,21 +724,31 @@ impl Workspace {
             }
             Err(e) => Status::Failed(format!("{e:#}").into()),
         };
+        self.report(status, cx);
+    }
+
+    /// Shows a message that belongs to no connection on the status line in view: the
+    /// open tab's, or the empty screen's.
+    fn report(&mut self, status: Status, cx: &mut Context<Self>) {
+        match self.active_tab() {
+            Some(tab) => tab.update(cx, |tab, cx| tab.set_status(status, cx)),
+            None => self.status = status,
+        }
         cx.notify();
     }
 
     /// The status once connecting to `name` is done; a note about a kept connections
     /// file stays in it rather than being replaced.
-    fn show_connected(&mut self, name: &str, result: anyhow::Result<()>) {
+    fn connected_status(&mut self, name: &str, result: &Result<(), SharedString>) -> Status {
         let note = self.kept_note.take();
         let with_note = |text: String| match &note {
             Some(note) => format!("{text}. {note}"),
             None => text,
         };
-        self.status = match result {
+        match result {
             Ok(()) => Status::Done(with_note(format!("Connected to {name}")).into()),
-            Err(e) => Status::Failed(with_note(format!("{e:#}")).into()),
-        };
+            Err(e) => Status::Failed(with_note(e.to_string()).into()),
+        }
     }
 
     fn begin_folder_edit(
@@ -808,8 +819,9 @@ impl Workspace {
                 }
                 self.save_config(cx);
             }
-            Err(e) => self.status = Status::Failed(format!("{e:#}").into()),
+            Err(e) => self.report(Status::Failed(format!("{e:#}").into()), cx),
         }
+        self.sync_tabs(cx);
     }
 
     /// Keeps folders closed after they, or a folder above them, get a new path.
@@ -825,6 +837,7 @@ impl Workspace {
         self.config.remove_folder(folder);
         self.collapsed.remove(folder);
         self.save_config(cx);
+        self.sync_tabs(cx);
         cx.notify();
     }
 
@@ -869,8 +882,9 @@ impl Workspace {
                 self.rebase_collapsed(path, &new_path);
                 self.collapsed.remove(new_parent);
                 self.save_config(cx);
+                self.sync_tabs(cx);
             }
-            Err(e) => self.status = Status::Failed(format!("{e:#}").into()),
+            Err(e) => self.report(Status::Failed(format!("{e:#}").into()), cx),
         }
         cx.notify();
     }
@@ -879,6 +893,7 @@ impl Workspace {
         if self.config.move_connection(name, folder) {
             self.collapsed.remove(folder);
             self.save_config(cx);
+            self.sync_tabs(cx);
             cx.notify();
         }
     }
@@ -891,60 +906,6 @@ impl Workspace {
     ) -> Self {
         theme::set_font_size(config.font_size, cx);
         let db = Arc::new(Db::new());
-        let names = SchemaNames::default();
-        let editor = cx.new(|cx| {
-            let mut state = EditorState::new(window, cx)
-                .language("sql")
-                .line_number(true)
-                .default_value("SELECT 1;");
-            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(names.clone())));
-            state
-        });
-        let run_button = cx.new(|cx| RunButton::new(editor.clone(), cx));
-        let _run_button_subscription =
-            cx.subscribe(&run_button, |this, _, RunStatement(sql), cx| {
-                this.run_sql(sql.clone(), cx);
-            });
-        let _editor_subscription = cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                this.remember_draft(cx);
-                // A definition still loading must not replace what was typed.
-                this.schema.update(cx, |schema, _| schema.forget_lookup());
-            }
-        });
-        let schema = cx.new(|cx| SchemaPanel::new(db.clone(), names, window, cx));
-        let _schema_subscription = cx.subscribe_in(
-            &schema,
-            window,
-            |this, _, event: &SchemaEvent, window, cx| match event {
-                // Ignored while a query runs: it would replace the SQL and not run.
-                SchemaEvent::Preview(_) if !this.can_run() => {}
-                SchemaEvent::Preview(sql) => {
-                    this.editor
-                        .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
-                    this.remember_draft(cx);
-                    this.run_sql(sql.clone(), cx);
-                }
-                // Not run: the user reads it, fills it in, and presses Run.
-                SchemaEvent::Insert(sql) => {
-                    this.editor
-                        .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
-                    this.remember_draft(cx);
-                    // An earlier error is about SQL the editor no longer shows.
-                    if matches!(this.status, Status::Failed(_)) {
-                        this.status = Status::Idle;
-                        cx.notify();
-                    }
-                }
-                // A running query's status stays until its result arrives.
-                SchemaEvent::Failed(message) => {
-                    if !matches!(this.status, Status::Busy(_)) {
-                        this.status = Status::Failed(message.clone().into());
-                        cx.notify();
-                    }
-                }
-            },
-        );
         let chat = cx.new(|cx| ChatPanel::new(window, cx));
         let _chat_subscription =
             cx.subscribe(&chat, |this, _, event: &ChatEvent, cx| match event {
@@ -953,29 +914,6 @@ impl Workspace {
                     cx.notify();
                 }
             });
-        let results = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
-        let row_detail = cx.new(|cx| RowDetail::new(window, cx));
-        let _row_detail_subscriptions = [
-            cx.subscribe_in(
-                &results,
-                window,
-                |this, results, event: &TableEvent, window, cx| {
-                    if let TableEvent::SelectRow(row_ix) = event
-                        && let Some(row) = results.read(cx).delegate().row(*row_ix)
-                    {
-                        this.row_detail
-                            .update(cx, |detail, cx| detail.show(row, window, cx));
-                        cx.notify();
-                    }
-                },
-            ),
-            cx.subscribe(
-                &row_detail,
-                |this, _, event: &RowDetailEvent, cx| match event {
-                    RowDetailEvent::Close => this.close_row_detail(cx),
-                },
-            ),
-        ];
         // Quitting, or closing the window, must not lose a save still waiting.
         cx.on_app_quit(|this, _| this.flush_saves()).detach();
         cx.on_release(|this, cx| {
@@ -993,10 +931,6 @@ impl Workspace {
         .detach();
         Self {
             db,
-            row_detail,
-            _row_detail_subscriptions,
-            schema,
-            _schema_subscription,
             chat,
             chat_open: false,
             _chat_subscription,
@@ -1005,21 +939,15 @@ impl Workspace {
             mcp_servers: Vec::new(),
             agents: None,
             config,
-            selected: None,
+            tabs: Vec::new(),
+            active: None,
             form: None,
-            editor,
-            run_button,
-            _run_button_subscription,
             session: SessionState::default(),
-            pending_editor_text: None,
-            _editor_subscription,
             _session_save: None,
             session_unsaved: false,
             session_saves: Saves::default(),
             config_saves: Saves::default(),
-            results,
             status,
-            run: 0,
             tree_focus: cx.focus_handle(),
             tree_scroll: ScrollHandle::new(),
             cursor: None,
@@ -1033,64 +961,128 @@ impl Workspace {
         }
     }
 
-    fn selected_connection(&self) -> Option<Connection> {
-        let name = self.selected.as_deref()?;
-        self.config.find(name).cloned()
+    fn tab_index(&self, name: &str) -> Option<usize> {
+        self.tabs.iter().position(|open| open.name == name)
     }
 
-    /// A click on a connection, or Enter on it in the tree. The open one stays as it is,
-    /// with its running query and its rows, unless it failed and this tries again.
-    fn open_connection(&mut self, name: String, cx: &mut Context<Self>) {
-        let is_open = self.selected.as_deref() == Some(name.as_str()) && self.form.is_none();
-        if is_open && !matches!(self.status, Status::Failed(_)) {
+    fn tab(&self, name: &str) -> Option<&Entity<ConnectionTab>> {
+        Some(&self.tabs[self.tab_index(name)?].tab)
+    }
+
+    /// The tab on screen.
+    fn active_tab(&self) -> Option<&Entity<ConnectionTab>> {
+        self.tab(self.active.as_deref()?)
+    }
+
+    /// A click on a connection, or Enter on it in the tree: shows its tab, opening one
+    /// first if needed. An open tab stays as it is, with its running query and its
+    /// rows, unless connecting failed and this tries again.
+    fn open_connection(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.form = None;
+        if let Some(tab) = self.tab(&name).cloned() {
+            self.active = Some(name);
+            tab.update(cx, |tab, cx| {
+                if matches!(tab.status, Status::Failed(_)) {
+                    tab.connect(cx);
+                }
+            });
+            cx.notify();
             return;
         }
-        self.select(name, cx);
-    }
-
-    fn select(&mut self, name: String, cx: &mut Context<Self>) {
-        self.form = None;
-        if self.pending_editor_text.is_none() {
-            self.remember_draft(cx);
-        }
-        self.pending_editor_text =
-            Some(self.session.drafts.get(&name).cloned().unwrap_or_default());
-        self.db.allow_connecting(&name);
-        if let Some(conn) = self.config.find(&name) {
-            let adapter = conn.adapter;
-            self.run_button
-                .update(cx, |button, cx| button.set_adapter(adapter, cx));
-        }
-        self.selected = Some(name);
-        self.close_row_detail(cx);
-        self.results.update(cx, |table, cx| {
-            table.delegate_mut().clear();
-            table.refresh(cx);
-        });
-        let Some(conn) = self.selected_connection() else {
+        let Some(conn) = self.config.find(&name).cloned() else {
             return;
         };
-        let shown = conn.clone();
-        self.schema
-            .update(cx, |schema, cx| schema.set_connection(Some(shown), cx));
-        self.status = Status::Busy(format!("Connecting to {}…", conn.name).into());
+        self.db.allow_connecting(&name);
+        let draft = self.session.drafts.get(&name).cloned().unwrap_or_default();
+        let (db, history, panels) = (
+            self.db.clone(),
+            self.history(&name),
+            self.session.panels.clone(),
+        );
+        let tab = cx.new(|cx| ConnectionTab::new(db, conn, draft, history, panels, window, cx));
+        let _subscription = cx.subscribe_in(&tab, window, Self::on_tab_event);
+        let connected = self.connected.contains(&name);
+        tab.update(cx, |tab, cx| {
+            tab.set_connected(connected, cx);
+            tab.connect(cx);
+        });
+        self.tabs.push(OpenTab {
+            name: name.clone(),
+            tab,
+            _subscription,
+        });
+        self.active = Some(name);
         cx.notify();
-        let db = self.db.clone();
-        cx.spawn(async move |this, cx| {
-            let name = conn.name.clone();
-            let result = io(async move { db.check(&conn).await }).await;
-            this.update(cx, |this, cx| {
-                this.refresh_connected(cx);
-                // The user may have moved on to another connection by now.
-                if this.selected.as_deref() != Some(name.as_str()) {
-                    return;
+    }
+
+    fn on_tab_event(
+        &mut self,
+        tab: &Entity<ConnectionTab>,
+        event: &TabEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = tab.read(cx).name().to_owned();
+        match event {
+            TabEvent::DraftChanged(sql) => {
+                self.session.set_draft(&name, sql);
+                self.schedule_session_save(cx);
+            }
+            TabEvent::Ran(sql) => {
+                self.session.record(&name, sql);
+                self.schedule_session_save(cx);
+                let history = self.history(&name);
+                tab.update(cx, |tab, cx| tab.set_history(history, cx));
+            }
+            TabEvent::Resized(sizes) => {
+                for (key, size) in sizes {
+                    self.session.panels.insert((*key).into(), *size);
                 }
-                this.show_connected(&name, result);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+                self.schedule_session_save(cx);
+                let panels = self.session.panels.clone();
+                for open in &self.tabs {
+                    let panels = panels.clone();
+                    open.tab
+                        .update(cx, |tab, cx| tab.set_panel_sizes(panels, cx));
+                }
+            }
+            TabEvent::Edit => {
+                let conn = tab.read(cx).connection().clone();
+                self.edit_connection(conn, window, cx);
+            }
+            TabEvent::Delete => self.confirm_delete(name, window, cx),
+            TabEvent::Close => self.close_tab(name, cx),
+            TabEvent::Connected(result) => {
+                self.refresh_connected(cx);
+                let status = self.connected_status(&name, result);
+                tab.update(cx, |tab, cx| tab.set_status(status, cx));
+            }
+            TabEvent::ConnectionChanged => self.refresh_connected(cx),
+        }
+    }
+
+    /// The newest queries run on `name`, for its history menu.
+    fn history(&self, name: &str) -> Vec<String> {
+        self.session
+            .history_for(name)
+            .take(HISTORY_MENU_SIZE)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Gives each tab its connection as the config now has it, after a change such as a
+    /// new folder, so a tab never runs on settings that are out of date.
+    fn sync_tabs(&self, cx: &mut Context<Self>) {
+        for open in &self.tabs {
+            let Some(conn) = self.config.find(&open.name).cloned() else {
+                continue;
+            };
+            open.tab.update(cx, |tab, cx| {
+                if *tab.connection() != conn {
+                    tab.set_connection(conn, cx);
+                }
+            });
+        }
     }
 
     fn edit_connection(&mut self, conn: Connection, window: &mut Window, cx: &mut Context<Self>) {
@@ -1108,42 +1100,50 @@ impl Workspace {
     ) {
         let last_aws = self.session.aws_search.clone();
         let form = cx.new(|cx| ConnForm::new(existing.as_ref(), folder, last_aws, window, cx));
-        self._form_subscription = Some(cx.subscribe(&form, |this, form, event, cx| match event {
-            ConnFormEvent::Save {
-                connection,
-                password,
-                ssh_password,
-                previous,
-            } => this.save_connection(
-                form,
-                connection.clone(),
-                password.clone(),
-                ssh_password.clone(),
-                previous.clone(),
-                cx,
-            ),
-            ConnFormEvent::Cancel => {
-                this.form = None;
-                cx.notify();
-            }
-            ConnFormEvent::SearchedAws(search) => {
-                this.session.aws_search = search.clone();
-                this.schedule_session_save(cx);
-            }
-        }));
+        self._form_subscription =
+            Some(
+                cx.subscribe_in(&form, window, |this, form, event, window, cx| match event {
+                    ConnFormEvent::Save {
+                        connection,
+                        password,
+                        ssh_password,
+                        previous,
+                    } => {
+                        let saving = Saving {
+                            form: form.clone(),
+                            connection: connection.clone(),
+                            previous: previous.clone(),
+                        };
+                        let passwords = (password.clone(), ssh_password.clone());
+                        this.save_connection(saving, passwords, window, cx);
+                    }
+                    ConnFormEvent::Cancel => {
+                        this.form = None;
+                        cx.notify();
+                    }
+                    ConnFormEvent::SearchedAws(search) => {
+                        this.session.aws_search = search.clone();
+                        this.schedule_session_save(cx);
+                    }
+                }),
+            );
         self.form = Some(form);
         cx.notify();
     }
 
+    /// Saves the form's connection, with its password and SSH password when changed.
     fn save_connection(
         &mut self,
-        form: Entity<ConnForm>,
-        connection: Connection,
-        password: Option<String>,
-        ssh_password: Option<String>,
-        previous: Option<String>,
+        saving: Saving,
+        (password, ssh_password): (Option<String>, Option<String>),
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Saving {
+            form,
+            connection,
+            previous,
+        } = saving;
         let mut config = self.config.clone();
         if let Err(e) = config.upsert(connection.clone(), previous.as_deref()) {
             form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx));
@@ -1152,7 +1152,7 @@ impl Workspace {
         let db = self.db.clone();
         let save = self.config_saves.save(config.clone());
         let (conn, prev) = (connection.clone(), previous.clone());
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = blocking(move || {
                 let password = match &password {
                     // The credentials now come from AWS; don't keep an unused password.
@@ -1179,8 +1179,13 @@ impl Workspace {
                 .await
                 .ok();
             }
-            this.update(cx, |this, cx| {
-                this.finish_saving_connection(form, conn, prev, config, result, cx);
+            this.update_in(cx, |this, window, cx| {
+                let saving = Saving {
+                    form,
+                    connection: conn,
+                    previous: prev,
+                };
+                this.finish_saving_connection(saving, config, result, window, cx);
             })
             .ok();
         })
@@ -1190,13 +1195,17 @@ impl Workspace {
     /// Once the connection form's save is written.
     fn finish_saving_connection(
         &mut self,
-        form: Entity<ConnForm>,
-        connection: Connection,
-        previous: Option<String>,
+        saving: Saving,
         config: Config,
         result: anyhow::Result<Option<PathBuf>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Saving {
+            form,
+            connection,
+            previous,
+        } = saving;
         let kept = match result {
             Ok(kept) => kept,
             Err(e) => {
@@ -1215,22 +1224,39 @@ impl Workspace {
         if self.config != config {
             self.save_config(cx);
         }
-        let was_open = self.selected.as_deref() == Some(previous.as_deref().unwrap_or(&name));
         let renamed_from = previous.filter(|old| *old != name);
         if let Some(old) = &renamed_from {
             self.session.rename_connection(old, &name);
             self.schedule_session_save(cx);
-        }
-        self.collapsed.remove(&folder);
-        if renamed_from.is_some() && !was_open {
-            // The editor holds the open connection's SQL: leave it there.
-            self.form = None;
-            cx.notify();
-        } else {
-            if was_open {
-                self.selected = Some(name.clone());
+            if let Some(ix) = self.tab_index(old) {
+                self.tabs[ix].name = name.clone();
             }
-            self.select(name, cx);
+            if self.active.as_deref() == Some(old.as_str()) {
+                self.active = Some(name.clone());
+            }
+        }
+        self.sync_tabs(cx);
+        self.collapsed.remove(&folder);
+        match self.tab(&name).cloned() {
+            // Its new settings take effect: it connects again.
+            Some(tab) => {
+                self.form = None;
+                self.active = Some(name.clone());
+                self.db.allow_connecting(&name);
+                let conn = self.config.find(&name).cloned();
+                tab.update(cx, |tab, cx| {
+                    if let Some(conn) = conn {
+                        tab.reconnect(conn, cx);
+                    }
+                });
+                cx.notify();
+            }
+            // Renaming one that is not open leaves the open tab on screen.
+            None if renamed_from.is_some() => {
+                self.form = None;
+                cx.notify();
+            }
+            None => self.open_connection(name, window, cx),
         }
         self.show_saved(Ok(kept), cx);
     }
@@ -1256,12 +1282,7 @@ impl Workspace {
     }
 
     fn delete_connection(&mut self, name: String, cx: &mut Context<Self>) {
-        if self.selected.as_deref() == Some(name.as_str()) {
-            self.selected = None;
-            self.status = Status::Idle;
-            self.schema
-                .update(cx, |schema, cx| schema.set_connection(None, cx));
-        }
+        self.remove_tab(&name);
         if self
             .form
             .as_ref()
@@ -1321,144 +1342,21 @@ impl Workspace {
         self.config_saves.save(self.config.clone());
     }
 
-    /// Runs the selected text, or else the statement at the cursor, split as a script
-    /// would be.
-    fn run_query(&mut self, cx: &mut Context<Self>) {
-        let Some(conn) = self.selected_connection() else {
-            return;
-        };
-        let editor = self.editor.read(cx);
-        let selected = editor.selected_value();
-        let sql = if selected.trim().is_empty() {
-            let text = editor.value();
-            safety::statement_at(conn.adapter, &text, editor.cursor())
-                .map(|statement| text[statement].to_owned())
-        } else {
-            Some(selected.to_string())
-        };
-        match sql {
-            Some(sql) => self.run_sql(sql, cx),
-            None if self.can_run() => {
-                self.status = Status::Done(NO_STATEMENT.into());
-                cx.notify();
-            }
-            None => {}
-        }
+    #[cfg(test)]
+    pub(crate) fn session(&self) -> &SessionState {
+        &self.session
     }
 
-    /// Runs everything in the editor.
-    fn run_all(&mut self, cx: &mut Context<Self>) {
-        let sql = self.editor.read(cx).value().to_string();
-        self.run_sql(sql, cx);
+    #[cfg(test)]
+    pub(crate) fn session_mut(&mut self) -> &mut SessionState {
+        &mut self.session
     }
 
-    /// Whether a query may start: not while one runs or the connection form is open.
-    fn can_run(&self) -> bool {
-        self.form.is_none() && !matches!(self.status, Status::Busy(_))
-    }
-
-    /// Runs `sql` as a script on the selected connection and records it in its history.
-    fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
-        let Some(conn) = self.selected_connection() else {
-            return;
-        };
-        if !self.can_run() {
-            return;
-        }
-        self.session.record(&conn.name, &sql);
-        self.schedule_session_save(cx);
-        self.status = Status::Busy("Running…".into());
-        self.run += 1;
-        let run = self.run;
-        cx.notify();
-        let db = self.db.clone();
-        let opts = ExecOptions {
-            read_only: false,
-            max_rows: MAX_ROWS,
-        };
-        cx.spawn(async move |this, cx| {
-            let checked = conn.clone();
-            let result = io(async move { db.execute_script(&conn, &sql, opts).await }).await;
-            this.update(cx, |this, cx| this.finish_query(run, checked, result, cx))
-                .ok();
-        })
-        .detach();
-    }
-
-    /// Shows the result of query run `run` on `conn`.
-    fn finish_query(
-        &mut self,
-        run: u64,
-        conn: Connection,
-        result: anyhow::Result<ScriptResult>,
-        cx: &mut Context<Self>,
-    ) {
-        let name = conn.name.clone();
-        if result.is_err() {
-            self.check_still_connected(conn, cx);
-        }
-        // Rows from a connection the user has left must not show under another, and an
-        // earlier run that finishes late must not replace a later one's.
-        if self.selected.as_deref() != Some(name.as_str()) || self.run != run {
-            return;
-        }
-        self.status = match &result {
-            Ok(run) => {
-                let done = summary(&run.result, run.statements);
-                // What the run changed in its open transaction was not kept: say so.
-                Status::Done(if run.rolled_back {
-                    format!("{done} · {ROLLED_BACK_NOTE}").into()
-                } else {
-                    done.into()
-                })
-            }
-            Err(e) => Status::Failed(format!("{e:#}").into()),
-        };
-        if let Ok(run) = &result {
-            // A statement that changed something may have changed the schema too.
-            if run.changed {
-                self.schema.update(cx, |schema, cx| schema.refresh(cx));
-            }
-            self.close_row_detail(cx);
-            self.results.update(cx, |table, cx| {
-                let font_size = cx.theme().font_size;
-                table.delegate_mut().set(&run.result, font_size);
-                table.refresh(cx);
-                cx.notify();
-            });
-        }
-        cx.notify();
-    }
-
-    /// Keeps what's in the editor for the selected connection.
-    fn remember_draft(&mut self, cx: &mut Context<Self>) {
-        if let Some(name) = self.selected.clone() {
-            let sql = self.editor.read(cx).value().to_string();
-            self.session.set_draft(&name, &sql);
-            self.schedule_session_save(cx);
-        }
-    }
-
-    /// Closes the row detail panel and drops the selection that opened it.
-    fn close_row_detail(&mut self, cx: &mut Context<Self>) {
-        self.row_detail.update(cx, |detail, cx| detail.clear(cx));
-        self.results
-            .update(cx, |table, cx| table.clear_selection(cx));
-        cx.notify();
-    }
-
-    /// A panel that opens where it was last dragged to and keeps that size when the
-    /// window resizes.
     fn sized_panel(&self, panel: Panel) -> ResizablePanel {
-        let saved = self.session.panels.get(panel.key());
-        resizable_panel()
-            .size(px(saved.map_or(panel.default_size(), |size| *size as f32)))
-            .size_range(panel.size_range())
-            .fixed()
+        panel.sized(&self.session.panels)
     }
 
-    /// Keeps the sizes these panels of one group were dragged to. One that is not shown
-    /// keeps the size it had.
+    /// Keeps the sizes these panels of one group were dragged to.
     fn remember_panel_sizes(
         &self,
         panels: &'static [Panel],
@@ -1466,13 +1364,10 @@ impl Workspace {
     ) -> impl Fn(&Entity<ResizableState>, &mut Window, &mut App) + 'static {
         let this = cx.entity().downgrade();
         move |state, _, cx| {
-            let sizes = state.read(cx).sizes().clone();
+            let sizes = Panel::dragged_sizes(panels, state, cx);
             this.update(cx, |this, cx| {
-                for panel in panels {
-                    if let Some(size) = sizes.get(panel.index()) {
-                        let size = size.as_f32().round() as u32;
-                        this.session.panels.insert(panel.key().into(), size);
-                    }
+                for (key, size) in sizes {
+                    this.session.panels.insert(key.into(), size);
                 }
                 this.schedule_session_save(cx);
             })
@@ -1526,13 +1421,6 @@ impl Workspace {
                 saved.await.ok();
             }
         }
-    }
-
-    fn show_history_query(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.editor
-            .update(cx, |editor, cx| editor.set_value(sql, window, cx));
-        self.remember_draft(cx);
-        cx.notify();
     }
 
     /// Every row currently showing in the tree, top to bottom.
@@ -1590,19 +1478,19 @@ impl Workspace {
     }
 
     /// Right arrow: opens a closed folder, otherwise moves into it or opens the connection.
-    fn tree_expand(&mut self, cx: &mut Context<Self>) {
+    fn tree_expand(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.cursor.clone() {
             Some(TreeRow::Folder(path)) if self.collapsed.remove(&path) => cx.notify(),
             Some(TreeRow::Folder(_)) => self.move_cursor(1, cx),
-            Some(TreeRow::Connection(name)) => self.open_connection(name, cx),
+            Some(TreeRow::Connection(name)) => self.open_connection(name, window, cx),
             None => {}
         }
     }
 
-    fn tree_open(&mut self, cx: &mut Context<Self>) {
+    fn tree_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.cursor.clone() {
             Some(TreeRow::Folder(path)) => self.toggle_folder(path, cx),
-            Some(TreeRow::Connection(name)) => self.open_connection(name, cx),
+            Some(TreeRow::Connection(name)) => self.open_connection(name, window, cx),
             None => {}
         }
     }
@@ -1833,8 +1721,14 @@ impl Workspace {
                     .on_action(cx.listener(|this, _: &TreeUp, _, cx| this.move_cursor(-1, cx)))
                     .on_action(cx.listener(|this, _: &TreeDown, _, cx| this.move_cursor(1, cx)))
                     .on_action(cx.listener(|this, _: &TreeCollapse, _, cx| this.tree_collapse(cx)))
-                    .on_action(cx.listener(|this, _: &TreeExpand, _, cx| this.tree_expand(cx)))
-                    .on_action(cx.listener(|this, _: &TreeOpen, _, cx| this.tree_open(cx)))
+                    .on_action(
+                        cx.listener(|this, _: &TreeExpand, window, cx| {
+                            this.tree_expand(window, cx)
+                        }),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &TreeOpen, window, cx| this.tree_open(window, cx)),
+                    )
                     .flex_1()
                     .min_h_0()
                     .px_2()
@@ -2184,7 +2078,7 @@ impl Workspace {
             theme.radius,
             theme.ring,
         );
-        let selected = self.selected.as_deref() == Some(conn.name.as_str());
+        let selected = self.active.as_deref() == Some(conn.name.as_str());
         let connected = self.connected.contains(&conn.name);
         let success = cx.theme().success;
         let row_group = SharedString::from(format!("conn-row-{}", conn.name));
@@ -2253,7 +2147,7 @@ impl Workspace {
                                 .tooltip("Disconnect")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.disconnect(closing.clone(), cx);
+                                    this.close_tab(closing.clone(), cx);
                                 })),
                         ),
                 )
@@ -2274,7 +2168,7 @@ impl Workspace {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.cursor = Some(TreeRow::Connection(name.clone()));
                 this.tree_focus.focus(window, cx);
-                this.open_connection(name.clone(), cx);
+                this.open_connection(name.clone(), window, cx);
             }))
             .context_menu(self.connection_menu(conn, cx))
     }
@@ -2294,7 +2188,7 @@ impl Workspace {
                 menu.item(
                     PopupMenuItem::new("Disconnect")
                         .on_click(menu_click(&this, move |this, _, cx| {
-                            this.disconnect(closing.clone(), cx)
+                            this.close_tab(closing.clone(), cx)
                         })),
                 )
                 .separator()
@@ -2363,243 +2257,6 @@ impl Workspace {
         }
     }
 
-    fn render_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (text, color) = match &self.status {
-            Status::Idle => (SharedString::default(), theme.muted_foreground),
-            Status::Busy(s) | Status::Done(s) => (s.clone(), theme.muted_foreground),
-            Status::Failed(s) => (s.clone(), theme.danger),
-        };
-        div()
-            .id("status-line")
-            .test_support()
-            .flex_none()
-            .min_h(px(28.))
-            .px_3()
-            .py_1()
-            .border_t_1()
-            .border_color(theme.border)
-            .text_xs()
-            .text_color(color)
-            .child(text)
-    }
-
-    fn render_query_view(
-        &self,
-        conn: &Connection,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let (border, radius, muted, muted_bg) = (
-            theme.border,
-            theme.radius,
-            theme.muted_foreground,
-            theme.muted,
-        );
-        let busy = matches!(self.status, Status::Busy(_));
-        let placeholder = self.results.read(cx).delegate().placeholder();
-        let ran = self.results.read(cx).delegate().ran();
-        let chip = |text: String, fg: Hsla, bg: Hsla| {
-            div()
-                .flex_none()
-                .px_1p5()
-                .rounded(radius)
-                .text_xs()
-                .font_medium()
-                .text_color(fg)
-                .bg(bg)
-                .child(text)
-        };
-        let folder_label = (!conn.folder.is_empty()).then(|| conn.folder.replace('/', " / "));
-        let editor_and_results = v_resizable("editor-panels")
-            .on_resize(self.remember_panel_sizes(&[Panel::Editor], cx))
-            .child(
-                self.sized_panel(Panel::Editor).child(
-                    completions::handle_keys(div().id("sql-editor"), &self.editor, window)
-                        .test_support()
-                        .size_full()
-                        .child(Editor::new(&self.editor).appearance(false).h_full())
-                        .child(self.run_button.clone()),
-                ),
-            )
-            .child(
-                resizable_panel().child(
-                    h_resizable("results-panels")
-                        .on_resize(self.remember_panel_sizes(&[Panel::RowDetail], cx))
-                        .child(
-                            resizable_panel().child(
-                                div().size_full().min_w_0().child(match placeholder {
-                                    Some(text) => v_flex()
-                                        .size_full()
-                                        .justify_center()
-                                        .items_center()
-                                        .gap_2()
-                                        .text_sm()
-                                        .text_color(muted)
-                                        .child(text)
-                                        .when(!ran, |el| {
-                                            el.children(Keystroke::parse(RUN_KEY).ok().map(|key| {
-                                                h_flex()
-                                                    .gap_1p5()
-                                                    .text_xs()
-                                                    .child("Press")
-                                                    .child(gpui_kit::component::kbd::Kbd::new(key))
-                                                    .child("to run")
-                                            }))
-                                        })
-                                        .into_any_element(),
-                                    None => DataTable::new(&self.results)
-                                        .small()
-                                        .bordered(false)
-                                        .into_any_element(),
-                                }),
-                            ),
-                        )
-                        .when(self.row_detail.read(cx).is_open(), |el| {
-                            el.child(
-                                self.sized_panel(Panel::RowDetail)
-                                    .child(self.row_detail.clone()),
-                            )
-                        }),
-                ),
-            );
-        v_flex()
-            .size_full()
-            .child(
-                div()
-                    .id("connection-color")
-                    .test_support()
-                    .w_full()
-                    .h(px(3.))
-                    .flex_none()
-                    .bg(logos::color_of(conn.adapter, &conn.color)),
-            )
-            .child(
-                h_flex()
-                    .h(px(WINDOW_TOP_STRIP + 8.))
-                    .flex_none()
-                    .pl_3()
-                    .pr_2()
-                    .gap_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(logos::icon(conn.adapter, 20.))
-                    .child(div().font_semibold().child(conn.name.clone()))
-                    .when_some(folder_label, |el, name| {
-                        el.child(chip(name, muted, muted_bg))
-                    })
-                    .when(conn.readonly, |el| {
-                        el.child(chip("Read-only".into(), muted, muted_bg))
-                    })
-                    .child(drag_area().flex_1().h_full())
-                    .child({
-                        let items: Vec<String> = self
-                            .session
-                            .history_for(&conn.name)
-                            .take(HISTORY_MENU_SIZE)
-                            .map(str::to_owned)
-                            .collect();
-                        let this = cx.entity().downgrade();
-                        Button::new("history")
-                            .cursor_pointer()
-                            .ghost()
-                            .small()
-                            .icon(Icon::default().data(HISTORY_ICON))
-                            .tooltip("Query history")
-                            .dropdown_menu(move |mut menu, _, cx| {
-                                // Wide enough for a label at any text size; the menu
-                                // doesn't cut a label that is longer than it is.
-                                menu = menu.max_w(cx.theme().font_size * HISTORY_MENU_EMS);
-                                if items.is_empty() {
-                                    menu = menu.label("No queries yet");
-                                }
-                                for sql in &items {
-                                    let (this, query) = (this.clone(), sql.clone());
-                                    menu =
-                                        menu.item(PopupMenuItem::new(history_label(sql)).on_click(
-                                            move |_, window, cx| {
-                                                let query = query.clone();
-                                                this.update(cx, |this, cx| {
-                                                    this.show_history_query(query, window, cx);
-                                                })
-                                                .ok();
-                                            },
-                                        ));
-                                }
-                                menu
-                            })
-                    })
-                    .when(self.connected.contains(&conn.name), |el| {
-                        let name = conn.name.clone();
-                        el.child(
-                            Button::new("disconnect")
-                                .cursor_pointer()
-                                .ghost()
-                                .small()
-                                .icon(Icon::default().data(UNPLUG_ICON))
-                                .tooltip("Disconnect")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.disconnect(name.clone(), cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("edit")
-                            .cursor_pointer()
-                            .ghost()
-                            .small()
-                            .icon(Icon::default().data(EDIT_ICON))
-                            .tooltip("Edit connection")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(conn) = this.selected_connection() {
-                                    this.edit_connection(conn, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("delete")
-                            .cursor_pointer()
-                            .ghost()
-                            .small()
-                            .icon(Icon::default().data(DELETE_ICON))
-                            .tooltip("Delete connection")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(name) = this.selected.clone() {
-                                    this.confirm_delete(name, window, cx);
-                                }
-                            })),
-                    )
-                    .child(
-                        Button::new("run")
-                            .cursor_pointer()
-                            .primary()
-                            .small()
-                            .icon(IconName::Play)
-                            .label("Run")
-                            .tooltip(RUN_HINT)
-                            .loading(busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.run_query(cx))),
-                    ),
-            )
-            .child(
-                div().flex_1().min_h_0().child(
-                    h_resizable("query-panels")
-                        .on_resize(self.remember_panel_sizes(&[Panel::Schema], cx))
-                        .child(self.sized_panel(Panel::Schema).child(self.schema.clone()))
-                        .child(
-                            resizable_panel().child(
-                                v_flex()
-                                    .size_full()
-                                    .min_w_0()
-                                    .child(div().flex_1().min_h_0().child(editor_and_results))
-                                    .child(self.render_status(cx)),
-                            ),
-                        ),
-                ),
-            )
-    }
-
     fn render_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // A failure, or where an unreadable connections file was kept: both matter most
         // here, when no connections could be shown.
@@ -2630,7 +2287,9 @@ impl Workspace {
                             })),
                     ),
             )
-            .when(failed, |el| el.child(self.render_status(cx)))
+            .when(failed, |el| {
+                el.child(connection_tab::render_status(&self.status, cx))
+            })
     }
 }
 
@@ -2651,15 +2310,11 @@ fn drag_area() -> Div {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.tree_focused = self.tree_focus.is_focused(window);
-        if let Some(text) = self.pending_editor_text.take() {
-            self.editor
-                .update(cx, |editor, cx| editor.set_value(text, window, cx));
-        }
-        let has_toolbar = self.form.is_none() && self.selected_connection().is_some();
+        let has_toolbar = self.form.is_none() && self.active_tab().is_some();
         let main = if let Some(form) = self.form.clone() {
             div().size_full().child(form).into_any_element()
-        } else if let Some(conn) = self.selected_connection() {
-            self.render_query_view(&conn, window, cx).into_any_element()
+        } else if let Some(tab) = self.active_tab() {
+            tab.clone().into_any_element()
         } else {
             self.render_empty(cx).into_any_element()
         };
@@ -2674,8 +2329,16 @@ impl Render for Workspace {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_query(cx)))
-                    .on_action(cx.listener(|this, _: &RunAll, _, cx| this.run_all(cx)))
+                    .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
+                        if let Some(tab) = this.active_tab().filter(|_| this.form.is_none()) {
+                            tab.update(cx, |tab, cx| tab.run_query(cx));
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &RunAll, _, cx| {
+                        if let Some(tab) = this.active_tab().filter(|_| this.form.is_none()) {
+                            tab.update(cx, |tab, cx| tab.run_all(cx));
+                        }
+                    }))
                     .child(
                         h_resizable("workspace-panels")
                             .on_resize(
@@ -2759,47 +2422,13 @@ fn mcp_status_text(servers: &[Option<String>]) -> String {
     }
 }
 
-fn rows_text(count: usize) -> String {
-    if count == 1 {
-        "1 row".to_owned()
-    } else {
-        format!("{count} rows")
-    }
-}
-
-fn summary(r: &tuplebase_core::db::QueryResult, statements: usize) -> String {
-    let ms = r.elapsed_ms;
-    let outcome = match r.rows_affected {
-        Some(n) => format!("{} changed in {ms} ms", rows_text(n as usize)),
-        None if r.truncated => format!("First {} in {ms} ms", rows_text(r.rows.len())),
-        None => format!("{} in {ms} ms", rows_text(r.rows.len())),
-    };
-    if statements > 1 {
-        format!("{statements} statements. {outcome}")
-    } else {
-        outcome
-    }
-}
-
-/// The history menu's width, in ems, and the longest label that fits it.
-const HISTORY_MENU_EMS: f32 = 44.;
-const HISTORY_LABEL_CHARS: usize = 56;
-
-/// One line of a query, short enough for a menu.
-fn history_label(sql: &str) -> String {
-    let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    match flat.char_indices().nth(HISTORY_LABEL_CHARS) {
-        Some((end, _)) => format!("{}…", &flat[..end]),
-        None => flat,
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     // No globs from gpui_kit here: its `test` macro would shadow the built-in `#[test]`.
     use super::{
-        About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, OpenSettings,
-        SettingsPage, Status, TreeRow, UpdateState, Workspace, bind_keys, register_menu_actions,
+        About, AgentState, AgentStatus, Config, ConnFormEvent, Connection, ConnectionTab,
+        OpenSettings, SettingsPage, Status, TreeRow, UpdateState, Workspace, bind_keys,
+        register_menu_actions,
     };
     use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, WindowExt as _};
     use gpui_kit::test::TestWindowExt;
@@ -2807,12 +2436,12 @@ mod tests {
         AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds,
         WindowOptions, point, px, size,
     };
-    use serde_json::json;
-    use std::rc::Rc;
     use tuplebase_core::config::{Adapter, Appearance, Auth, AwsIamAuth, AwsSecretRef, TlsMode};
-    use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE};
 
-    fn open(config: Config, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
+    pub(crate) fn open(
+        config: Config,
+        cx: &mut TestAppContext,
+    ) -> (AnyWindowHandle, Entity<Workspace>) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             bind_keys(cx);
@@ -2833,7 +2462,7 @@ mod tests {
         })
     }
 
-    fn config_with_connection() -> Config {
+    pub(crate) fn config_with_connection() -> Config {
         let mut config = Config::default();
         let conn = Connection {
             name: "db".into(),
@@ -2962,127 +2591,12 @@ mod tests {
     }
 
     #[gpui_kit::test]
-    fn choosing_a_result_row_shows_its_fields_until_closed(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                this.results.update(cx, |table, cx| {
-                    table.delegate_mut().show(&QueryResult {
-                        columns: vec!["id".into(), "name".into()],
-                        rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!(null)]],
-                        truncated: false,
-                        rows_affected: None,
-                        elapsed_ms: 1,
-                        note: None,
-                    });
-                    table.refresh(cx);
-                });
-                cx.notify();
-            });
-        });
-        window_action(handle, cx, |window, cx| {
-            assert!(window.try_find("row-detail").is_none());
-            workspace.update(cx, |this, cx| {
-                this.results
-                    .update(cx, |table, cx| table.set_selected_row(0, cx));
-            });
-        });
-        window_action(handle, cx, |window, cx| {
-            assert!(window.find("row-detail").visible());
-            assert_eq!(
-                workspace.read(cx).row_detail.read(cx).shown(cx),
-                "{\n  id: 1\n  name: \"Ada\"\n}"
-            );
-            // Its text can be selected and copied like any editor's.
-            let text = workspace.read(cx).row_detail.read(cx).text().clone();
-            text.update(cx, |state, cx| state.focus(window, cx));
-            window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
-            window.dispatch_action(Box::new(gpui_kit::component::input::Copy), cx);
-        });
-        assert_eq!(
-            cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("{\n  id: 1\n  name: \"Ada\"\n}".to_owned())
-        );
-        window_action(handle, cx, |window, cx| {
-            window.click("row-detail-close", cx);
-        });
-        window_action(handle, cx, |window, cx| {
-            assert!(window.try_find("row-detail").is_none());
-            assert_eq!(workspace.read(cx).results.read(cx).selected_row(), None);
-        });
-    }
-
-    #[gpui_kit::test]
-    fn result_cells_and_rows_can_be_copied(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                this.results.update(cx, |table, cx| {
-                    table.delegate_mut().show(&QueryResult {
-                        columns: vec!["id".into(), "name".into()],
-                        rows: vec![
-                            vec![json!(1), json!("say \"hi\"")],
-                            vec![json!(2), json!(null)],
-                        ],
-                        truncated: false,
-                        rows_affected: None,
-                        elapsed_ms: 1,
-                        note: None,
-                    });
-                    table.refresh(cx);
-                });
-                cx.notify();
-            });
-        });
-        let copied = |cx: &mut TestAppContext| {
-            cx.read_from_clipboard()
-                .and_then(|item| item.text())
-                .unwrap_or_default()
-        };
-        let row_0 = "{\n  \"id\": 1,\n  \"name\": \"say \\\"hi\\\"\"\n}";
-
-        // Right click a cell: "Copy value", then "Copy row as JSON".
-        window_action(handle, cx, |window, cx| {
-            window.right_click("table-cell-0:1", cx)
-        });
-        window_action(handle, cx, |window, cx| window.click(0usize, cx));
-        assert_eq!(copied(cx), "say \"hi\"");
-        window_action(handle, cx, |window, cx| {
-            window.right_click("table-cell-1:1", cx)
-        });
-        window_action(handle, cx, |window, cx| window.click(0usize, cx));
-        assert_eq!(copied(cx), "NULL");
-        window_action(handle, cx, |window, cx| {
-            window.right_click("table-cell-0:0", cx)
-        });
-        window_action(handle, cx, |window, cx| window.click(1usize, cx));
-        assert_eq!(copied(cx), row_0);
-
-        // The row detail panel copies the whole row.
-        window_action(handle, cx, |_, cx| {
-            workspace.update(cx, |this, cx| {
-                this.results
-                    .update(cx, |table, cx| table.set_selected_row(0, cx));
-            });
-        });
-        window_action(handle, cx, |window, cx| window.click("row-detail-copy", cx));
-        assert_eq!(copied(cx), row_0);
-    }
-
-    #[gpui_kit::test]
     fn the_connection_color_shows_above_an_open_connection(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("connection-color").is_none());
         });
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                cx.notify();
-            });
-        });
+        open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, _| {
             assert!(window.find("connection-color").visible());
         });
@@ -3096,7 +2610,7 @@ mod tests {
         cx.update(|cx| {
             let this = workspace.read(cx);
             assert_eq!(this.form.as_ref().unwrap().read(cx).editing(), Some("db"));
-            assert_eq!(this.selected, None);
+            assert!(this.tabs.is_empty());
         });
     }
 
@@ -3147,16 +2661,18 @@ mod tests {
             ..config.find("db").unwrap().clone()
         };
         config.upsert(other, None).unwrap();
-        let (_, workspace) = open(config, cx);
+        let (handle, workspace) = open(config, cx);
+        let db = open_tab(handle, &workspace, "db", cx);
+        open_tab(handle, &workspace, "other", cx);
         cx.update(|cx| {
+            db.update(cx, |tab, _| tab.status = Status::Failed("kept".into()));
             workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                this.status = Status::Failed("kept".into());
                 this.delete_connection("other".into(), cx);
-                assert_eq!(this.selected.as_deref(), Some("db"));
-                assert!(matches!(this.status, Status::Failed(_)));
+                assert_eq!(this.active.as_deref(), Some("db"));
+                assert_eq!(this.tabs.len(), 1);
                 assert!(this.config.find("other").is_none());
             });
+            assert!(matches!(db.read(cx).status, Status::Failed(_)));
         });
     }
 
@@ -3168,34 +2684,6 @@ mod tests {
         cx.update(|cx| {
             workspace.update(cx, |this, cx| this.delete_connection("db".into(), cx));
             assert!(workspace.read(cx).form.is_none());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_short_result_shows_no_blank_rows(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                let result = QueryResult {
-                    columns: vec!["id".into()],
-                    rows: vec![vec![json!(1)], vec![json!(2)]],
-                    truncated: false,
-                    rows_affected: None,
-                    elapsed_ms: 1,
-                    note: None,
-                };
-                this.results.update(cx, |table, cx| {
-                    table.delegate_mut().show(&result);
-                    table.refresh(cx);
-                });
-                cx.notify();
-            });
-        });
-        window_action(handle, cx, |_, _| {});
-        window_action(handle, cx, |window, _| {
-            assert!(window.try_find(("row", 1usize)).is_some());
-            assert!(window.try_find(("row", 2usize)).is_none());
         });
     }
 
@@ -3219,10 +2707,11 @@ mod tests {
     #[gpui_kit::test]
     fn disconnecting_the_open_connection_leaves_it(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        open_tab(handle, &workspace, "db", cx);
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
                 this.connected.insert("db".into());
+                this.show_connected_tabs(cx);
                 cx.notify();
             });
         });
@@ -3230,7 +2719,8 @@ mod tests {
         window_action(handle, cx, |window, cx| window.click("disconnect", cx));
         cx.update(|cx| {
             let this = workspace.read(cx);
-            assert_eq!(this.selected, None);
+            assert_eq!(this.active, None);
+            assert!(this.tabs.is_empty());
             assert!(this.connected.is_empty());
         });
     }
@@ -3243,14 +2733,16 @@ mod tests {
             ..config.find("db").unwrap().clone()
         };
         config.upsert(other, None).unwrap();
-        let (_, workspace) = open(config, cx);
+        let (handle, workspace) = open(config, cx);
+        open_tab(handle, &workspace, "other", cx);
+        open_tab(handle, &workspace, "db", cx);
         cx.update(|cx| {
             workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
                 this.connected
                     .extend(["db".to_string(), "other".to_string()]);
-                this.disconnect("other".into(), cx);
-                assert_eq!(this.selected.as_deref(), Some("db"));
+                this.close_tab("other".into(), cx);
+                assert_eq!(this.active.as_deref(), Some("db"));
+                assert_eq!(this.tabs.len(), 1);
                 assert!(this.connected.contains("db"));
                 assert!(!this.connected.contains("other"));
             });
@@ -3275,13 +2767,7 @@ mod tests {
     #[gpui_kit::test]
     fn no_disconnect_button_without_a_connection(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                cx.notify();
-            });
-        });
-        window_action(handle, cx, |_, _| {});
+        open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, _| {
             assert!(window.try_find("disconnect").is_none());
         });
@@ -3368,27 +2854,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn summary_reads_naturally() {
-        let result = |rows: usize, affected, truncated| QueryResult {
-            columns: Vec::new(),
-            rows: vec![Vec::new(); rows],
-            truncated,
-            rows_affected: affected,
-            elapsed_ms: 5,
-            note: None,
-        };
-        assert_eq!(super::summary(&result(1, None, false), 1), "1 row in 5 ms");
-        assert_eq!(
-            super::summary(&result(2, None, true), 1),
-            "First 2 rows in 5 ms"
-        );
-        assert_eq!(
-            super::summary(&result(0, Some(3), false), 1),
-            "3 rows changed in 5 ms"
-        );
-    }
-
     #[gpui_kit::test]
     fn form_opens_validates_and_cancels(cx: &mut TestAppContext) {
         let (handle, workspace) = open(Config::default(), cx);
@@ -3446,8 +2911,10 @@ mod tests {
         .unwrap();
         cx.update(|cx| {
             let this = workspace.read(cx);
-            assert_eq!(this.selected.as_deref(), Some("db"));
-            assert!(matches!(this.status, Status::Busy(_)));
+            assert_eq!(this.active.as_deref(), Some("db"));
+            let tab = this.active_tab().unwrap().read(cx);
+            assert!(matches!(tab.status, Status::Busy(_)));
+            assert!(tab.connecting);
         });
     }
 
@@ -3524,7 +2991,7 @@ mod tests {
         .unwrap();
     }
 
-    fn window_action<R>(
+    pub(crate) fn window_action<R>(
         handle: AnyWindowHandle,
         cx: &mut TestAppContext,
         f: impl FnOnce(&mut gpui_kit::Window, &mut gpui_kit::App) -> R,
@@ -3535,6 +3002,42 @@ mod tests {
         });
         cx.run_until_parked();
         result.unwrap()
+    }
+
+    /// Opens `name`'s tab as a click on it does, done connecting, with "SELECT 1;" in its
+    /// editor.
+    pub(crate) fn open_tab(
+        handle: AnyWindowHandle,
+        workspace: &Entity<Workspace>,
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> Entity<ConnectionTab> {
+        window_action(handle, cx, |window, cx| {
+            workspace.update(cx, |this, cx| {
+                this.open_connection(name.into(), window, cx);
+                let tab = this.tab(name).expect("the tab opens").clone();
+                tab.update(cx, |tab, cx| {
+                    // Nothing listens at the test connection's port, and tests never
+                    // finish connecting: don't wait for it.
+                    tab.connecting = false;
+                    tab.status = Status::Idle;
+                    tab.editor
+                        .update(cx, |editor, cx| editor.set_value("SELECT 1;", window, cx));
+                });
+                tab
+            })
+        })
+    }
+
+    /// The tab on screen.
+    fn active(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> Entity<ConnectionTab> {
+        cx.update(|cx| {
+            workspace
+                .read(cx)
+                .active_tab()
+                .expect("a tab is open")
+                .clone()
+        })
     }
 
     /// Opens the form for a new connection and chooses PostgreSQL, which shows the rest.
@@ -3726,17 +3229,17 @@ mod tests {
         workspace.update(cx, |this, cx| {
             this.show_saved(Ok(Some(kept.clone())), cx);
             assert!(matches!(&this.status, Status::Done(s) if s.contains("connections.unreadable-1.json")));
-            // Saving a connection selects it, and connecting reports back.
-            this.show_connected("db", Ok(()));
-            let Status::Done(text) = &this.status else {
+            // Saving a connection opens it, and connecting reports back.
+            let Status::Done(text) = this.connected_status("db", &Ok(())) else {
                 panic!("done expected");
             };
             assert!(text.starts_with("Connected to db. "), "{text}");
             assert!(text.contains("connections.unreadable-1.json"), "{text}");
             // Said once: the next connect is reported as usual.
-            this.show_connected("db", Ok(()));
-            assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == "Connected to db"));
+            let status = this.connected_status("db", &Ok(()));
+            assert!(matches!(&status, Status::Done(s) if s.as_ref() == "Connected to db"));
             // A plain save leaves the status line alone.
+            this.status = status;
             this.show_saved(Ok(None), cx);
             assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == "Connected to db"));
         });
@@ -3946,24 +3449,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn summary_counts_statements_and_labels_stay_short() {
-        let result = QueryResult {
-            columns: Vec::new(),
-            rows: vec![Vec::new(); 2],
-            truncated: false,
-            rows_affected: None,
-            elapsed_ms: 5,
-            note: None,
-        };
-        assert_eq!(super::summary(&result, 3), "3 statements. 2 rows in 5 ms");
-        assert_eq!(super::history_label("select\n  1"), "select 1");
-        assert_eq!(
-            super::history_label(&"x".repeat(100)).chars().count(),
-            super::HISTORY_LABEL_CHARS + 1
-        );
-    }
-
     #[gpui_kit::test]
     fn running_records_history_and_switching_keeps_drafts(cx: &mut TestAppContext) {
         let mut config = config_with_connection();
@@ -3972,174 +3457,30 @@ mod tests {
         config.upsert(other, None).unwrap();
         let (handle, workspace) = open(config, cx);
         window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        let db = active(&workspace, cx);
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
             window.input("select 42", cx);
         });
         cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.status = Status::Idle;
-                this.run_query(cx);
+            db.update(cx, |tab, cx| {
+                tab.status = Status::Idle;
+                tab.run_query(cx);
             });
         });
         window_action(handle, cx, |window, cx| window.click("conn-other", cx));
+        // Each tab has its own editor, which starts with the connection's draft.
+        let other = active(&workspace, cx);
         window_action(handle, cx, |_, cx| {
-            assert_eq!(workspace.read(cx).editor.read(cx).value().as_str(), "");
-        });
-        cx.update(|cx| {
-            workspace.update(cx, |this, _| this.status = Status::Idle);
+            assert_eq!(other.read(cx).editor.read(cx).value().as_str(), "");
         });
         window_action(handle, cx, |window, cx| window.click("conn-db", cx));
         window_action(handle, cx, |_, cx| {
             let this = workspace.read(cx);
-            assert_eq!(this.editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.active_tab(), Some(&db));
+            assert_eq!(db.read(cx).editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.session.drafts["db"], "select 42");
             assert_eq!(this.session.history_for("db").next(), Some("select 42"));
-        });
-    }
-
-    /// Opens the editor of a connection, holding `text`.
-    fn open_editor(text: &str, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Workspace>) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
-        window_action(handle, cx, |window, cx| {
-            window.click("sql-editor", cx);
-            window.press("secondary-a", cx);
-            window.input(text, cx);
-        });
-        // Nothing listens at the test connection's port; don't wait for connecting to fail.
-        cx.update(|cx| workspace.update(cx, |this, _| this.status = Status::Idle));
-        (handle, workspace)
-    }
-
-    fn menu_open(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> bool {
-        cx.update(|cx| {
-            let editor = workspace.read(cx).editor.read(cx);
-            editor.completion_menu_state().open
-        })
-    }
-
-    #[gpui_kit::test]
-    fn tab_takes_the_suggestion(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor("SELE", cx);
-        assert!(menu_open(&workspace, cx));
-        window_action(handle, cx, |window, cx| window.press("tab", cx));
-        assert_eq!(editor_text(&workspace, cx), "SELECT");
-        assert!(!menu_open(&workspace, cx));
-        // With no menu, Tab indents as before.
-        window_action(handle, cx, |window, cx| window.press("tab", cx));
-        let text = editor_text(&workspace, cx);
-        assert!(
-            text.starts_with("SELECT") && text.len() > "SELECT".len(),
-            "{text:?}"
-        );
-    }
-
-    #[gpui_kit::test]
-    fn enter_starts_a_new_line_even_with_the_menu_open(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor("SELE", cx);
-        assert!(menu_open(&workspace, cx));
-        window_action(handle, cx, |window, cx| window.press("enter", cx));
-        assert_eq!(editor_text(&workspace, cx), "SELE\n");
-        assert!(!menu_open(&workspace, cx));
-    }
-
-    #[gpui_kit::test]
-    fn the_menu_waits_for_a_second_letter_or_ctrl_space(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor("S", cx);
-        assert!(!menu_open(&workspace, cx));
-        window_action(handle, cx, |window, cx| window.press("ctrl-space", cx));
-        assert!(menu_open(&workspace, cx));
-        window_action(handle, cx, |window, cx| window.press("escape", cx));
-        assert!(!menu_open(&workspace, cx));
-        assert_eq!(editor_text(&workspace, cx), "S");
-    }
-
-    const SCRIPT: &str = "select 1;\nselect 2;\nselect 3;";
-
-    /// Puts the cursor at the first `at` in the editor, or selects it.
-    fn place(
-        handle: AnyWindowHandle,
-        workspace: &Entity<Workspace>,
-        at: &str,
-        select: bool,
-        cx: &mut TestAppContext,
-    ) {
-        window_action(handle, cx, |_, cx| {
-            let editor = workspace.read(cx).editor.clone();
-            editor.update(cx, |editor, cx| {
-                let start = editor.value().find(at).expect("text to place at");
-                let end = if select { start + at.len() } else { start };
-                editor.set_selected_range(start..end, cx);
-            });
-        });
-        // The button follows the editor's layout, which the next frame paints.
-        window_action(handle, cx, |_, _| ());
-    }
-
-    fn last_run(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> Option<String> {
-        cx.update(|cx| {
-            let session = &workspace.read(cx).session;
-            session.history_for("db").next().map(str::to_owned)
-        })
-    }
-
-    #[gpui_kit::test]
-    fn run_key_runs_the_statement_at_the_cursor(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor(SCRIPT, cx);
-        place(handle, &workspace, "2", false, cx);
-        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
-        assert_eq!(last_run(&workspace, cx).as_deref(), Some("select 2"));
-        // The key runs; it never adds a line.
-        assert_eq!(editor_text(&workspace, cx), SCRIPT);
-    }
-
-    #[gpui_kit::test]
-    fn run_key_runs_the_selection(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor(SCRIPT, cx);
-        place(handle, &workspace, "2;\nselect 3", true, cx);
-        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
-        assert_eq!(last_run(&workspace, cx).as_deref(), Some("2;\nselect 3"));
-    }
-
-    #[gpui_kit::test]
-    fn run_all_key_runs_everything(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor(SCRIPT, cx);
-        place(handle, &workspace, "2", false, cx);
-        window_action(handle, cx, |window, cx| {
-            window.press("secondary-shift-enter", cx)
-        });
-        assert_eq!(last_run(&workspace, cx).as_deref(), Some(SCRIPT));
-    }
-
-    #[gpui_kit::test]
-    fn run_key_with_no_statement_at_the_cursor_says_so(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor("select 1;\n\n", cx);
-        window_action(handle, cx, |window, cx| window.press("secondary-enter", cx));
-        assert_eq!(last_run(&workspace, cx), None);
-        cx.update(|cx| {
-            let status = &workspace.read(cx).status;
-            assert!(matches!(status, Status::Done(s) if s.starts_with("No statement")));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn the_run_button_runs_its_statement(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor(SCRIPT, cx);
-        place(handle, &workspace, "3", false, cx);
-        window_action(handle, cx, |window, cx| window.click("run-statement", cx));
-        assert_eq!(last_run(&workspace, cx).as_deref(), Some("select 3"));
-    }
-
-    #[gpui_kit::test]
-    fn the_run_button_shows_only_at_a_statement(cx: &mut TestAppContext) {
-        let (handle, workspace) = open_editor("select 1;\n\n-- the end", cx);
-        place(handle, &workspace, "1", false, cx);
-        window_action(handle, cx, |window, _| {
-            assert!(window.find("run-statement").visible());
-        });
-        place(handle, &workspace, "the end", false, cx);
-        window_action(handle, cx, |window, _| {
-            assert!(window.try_find("run-statement").is_none());
         });
     }
 
@@ -4252,34 +3593,6 @@ mod tests {
             // The sidebar was not dragged, so it keeps its width.
             assert_eq!(panels["sidebar"], 300);
         });
-    }
-
-    #[gpui_kit::test]
-    fn panels_open_at_their_saved_size(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        workspace.update(cx, |this, cx| {
-            this.session.panels.insert("editor".into(), 400);
-            this.select("db".into(), cx);
-        });
-        window_action(handle, cx, |window, _| {
-            assert_eq!(window.find("sql-editor").bounds().size.height, px(400.));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn dragging_below_the_editor_resizes_it(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        workspace.update(cx, |this, cx| this.select("db".into(), cx));
-        let editor = window_action(handle, cx, |window, _| window.find("sql-editor").bounds());
-        let edge = point(editor.center().x, editor.bottom());
-        window_action(handle, cx, |window, cx| {
-            window.drag(edge, edge + point(px(0.), px(60.)), cx);
-        });
-        window_action(handle, cx, |window, _| {
-            let height = window.find("sql-editor").bounds().size.height;
-            assert_eq!(height, editor.size.height + px(60.));
-        });
-        cx.update(|cx| assert_eq!(workspace.read(cx).session.panels["editor"], 280));
     }
 
     #[gpui_kit::test]
@@ -4397,19 +3710,14 @@ mod tests {
     #[gpui_kit::test]
     fn the_run_shortcut_does_nothing_behind_the_settings_dialog(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                cx.notify();
-            });
-        });
+        let tab = open_tab(handle, &workspace, "db", cx);
         window_action(handle, cx, |window, cx| window.click("sql-editor", cx));
         window_action(handle, cx, |window, cx| window.click("open-settings", cx));
         window_action(handle, cx, |window, cx| {
             window.press("secondary-enter", cx);
         });
         cx.update(|cx| {
-            assert!(!matches!(workspace.read(cx).status, Status::Busy(_)));
+            assert!(!matches!(tab.read(cx).status, Status::Busy(_)));
         });
     }
 
@@ -4441,25 +3749,6 @@ mod tests {
             let this = workspace.read(cx);
             assert!(this.config.folders().contains(&"Local".to_owned()));
             assert!(this.collapsed.is_empty());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_filter_keeps_schemas_from_folding_unseen(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_tables(&workspace, &["users"], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("schema-filter", cx);
-            window.input("us", cx);
-        });
-        window_action(handle, cx, |window, cx| window.click("schema-public", cx));
-        window_action(handle, cx, |window, cx| {
-            window.click("schema-filter", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-        });
-        window_action(handle, cx, |window, _| {
-            assert!(window.find("table-public-users").visible());
         });
     }
 
@@ -4633,309 +3922,7 @@ mod tests {
         cx.update(|cx| assert_eq!(workspace.read(cx).config.connections[0].folder, "Local"));
     }
 
-    /// Opens the test connection with these tables of `public` in the schema panel.
-    fn show_tables(workspace: &Entity<Workspace>, tables: &[&str], cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                let conn = this.config.connections[0].clone();
-                this.selected = Some(conn.name.clone());
-                this.schema.update(cx, |schema, cx| {
-                    schema.set_connection(Some(conn), cx);
-                    schema.tables = tables
-                        .iter()
-                        .map(|name| tuplebase_core::db::TableInfo {
-                            schema: "public".into(),
-                            name: (*name).into(),
-                            kind: "BASE TABLE".into(),
-                        })
-                        .collect();
-                    schema.load = crate::schema::Load::Ready;
-                    cx.notify();
-                });
-                cx.notify();
-            });
-        });
-    }
-
-    #[gpui_kit::test]
-    fn arrow_keys_walk_the_schema_tree_once_it_is_clicked(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
-        show_tables(&workspace, &["orders", "users"], cx);
-        let schema_cursor = |cx: &mut TestAppContext| {
-            workspace.read_with(cx, |this, cx| this.schema.read(cx).cursor_name())
-        };
-        let press = |key: &str, cx: &mut TestAppContext| {
-            window_action(handle, cx, |window, cx| window.press(key, cx));
-        };
-
-        window_action(handle, cx, |window, cx| window.click("schema-public", cx));
-        assert_eq!(schema_cursor(cx).as_deref(), Some("public"));
-        window_action(handle, cx, |window, _| {
-            assert!(window.try_find("table-public-orders").is_none());
-        });
-
-        press("right", cx);
-        press("down", cx);
-        press("down", cx);
-        press("down", cx);
-        assert_eq!(schema_cursor(cx).as_deref(), Some("users"));
-        press("up", cx);
-        assert_eq!(schema_cursor(cx).as_deref(), Some("orders"));
-
-        press("right", cx);
-        cx.update(|cx| assert_eq!(workspace.read(cx).schema.read(cx).expanded.len(), 1));
-        press("left", cx);
-        cx.update(|cx| assert!(workspace.read(cx).schema.read(cx).expanded.is_empty()));
-        press("left", cx);
-        assert_eq!(schema_cursor(cx).as_deref(), Some("public"));
-
-        // The connection tree kept its own cursor through all of it.
-        workspace.read_with(cx, |this, _| {
-            assert_eq!(this.cursor, Some(TreeRow::Connection("db".into())));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn enter_on_a_table_shows_its_rows(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_tables(&workspace, &["users"], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("table-public-users", cx);
-            window.press("left", cx);
-            window.press("enter", cx);
-        });
-        cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert_eq!(
-                this.editor.read(cx).value().as_str(),
-                r#"SELECT * FROM "public"."users" LIMIT 100"#
-            );
-        });
-    }
-
-    /// Shows these objects of `public` in the schema panel. Their lookups answer at once,
-    /// naming what was asked for, except for an object named `broken`.
-    fn show_objects(
-        workspace: &Entity<Workspace>,
-        objects: &[(ObjectKind, &str)],
-        cx: &mut TestAppContext,
-    ) {
-        show_tables(workspace, &[], cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.schema.update(cx, |schema, cx| {
-                    schema.objects = objects
-                        .iter()
-                        .map(|(kind, name)| ObjectInfo {
-                            schema: "public".into(),
-                            kind: *kind,
-                            name: (*name).into(),
-                            detail: String::new(),
-                        })
-                        .collect();
-                    schema.fetch = Rc::new(|_, object, lookup| {
-                        Box::pin(async move {
-                            if object.name == "broken" {
-                                anyhow::bail!("no privilege");
-                            }
-                            Ok(format!("{lookup:?} of {}", object.name))
-                        })
-                    });
-                    cx.notify();
-                });
-            });
-        });
-    }
-
-    fn editor_text(workspace: &Entity<Workspace>, cx: &mut TestAppContext) -> String {
-        cx.update(|cx| workspace.read(cx).editor.read(cx).value().to_string())
-    }
-
-    #[gpui_kit::test]
-    fn clicking_a_procedure_puts_its_definition_in_the_editor_without_running_it(
-        cx: &mut TestAppContext,
-    ) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_objects(&workspace, &[(ObjectKind::Procedure, "start_job")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Procedures", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("object-public-Procedures-start_job", cx)
-        });
-        assert_eq!(editor_text(&workspace, cx), "Definition of start_job");
-        cx.update(|cx| assert!(matches!(workspace.read(cx).status, Status::Idle)));
-    }
-
-    #[gpui_kit::test]
-    fn right_clicking_a_procedure_inserts_a_call(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_objects(&workspace, &[(ObjectKind::Procedure, "start_job")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Procedures", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.right_click("object-public-Procedures-start_job", cx)
-        });
-        window_action(handle, cx, |window, cx| window.click(1usize, cx));
-        assert_eq!(editor_text(&workspace, cx), "Call of start_job");
-        cx.update(|cx| assert!(matches!(workspace.read(cx).status, Status::Idle)));
-    }
-
-    #[gpui_kit::test]
-    fn enter_on_a_function_shows_its_definition(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_objects(&workspace, &[(ObjectKind::Function, "total")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Functions", cx);
-            window.press("down", cx);
-            window.press("enter", cx);
-        });
-        assert_eq!(editor_text(&workspace, cx), "Definition of total");
-        let cursor = |cx: &mut TestAppContext| {
-            workspace.read_with(cx, |this, cx| this.schema.read(cx).cursor_name())
-        };
-        assert_eq!(cursor(cx).as_deref(), Some("total"));
-        window_action(handle, cx, |window, cx| window.press("left", cx));
-        assert_eq!(cursor(cx).as_deref(), Some("Functions"));
-    }
-
-    #[gpui_kit::test]
-    fn a_definition_that_cannot_be_read_shows_on_the_status_line(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_objects(&workspace, &[(ObjectKind::Trigger, "broken")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Triggers", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("object-public-Triggers-broken", cx)
-        });
-        assert_eq!(editor_text(&workspace, cx), "SELECT 1;");
-        cx.update(|cx| match &workspace.read(cx).status {
-            Status::Failed(message) => {
-                assert!(message.contains("broken"), "{message}");
-                assert!(message.contains("no privilege"), "{message}");
-            }
-            _ => panic!("the error must show on the status line"),
-        });
-
-        // A later definition that loads clears the error.
-        show_objects(&workspace, &[(ObjectKind::Trigger, "fine")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Triggers", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("object-public-Triggers-fine", cx)
-        });
-        assert_eq!(editor_text(&workspace, cx), "Definition of fine");
-        cx.update(|cx| assert!(matches!(workspace.read(cx).status, Status::Idle)));
-    }
-
-    #[gpui_kit::test]
-    fn objects_without_a_source_are_not_clickable(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_objects(&workspace, &[(ObjectKind::Sequence, "ids")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Sequences", cx)
-        });
-        window_action(handle, cx, |window, _| {
-            assert!(window.try_find("object-public-Sequences-ids").is_none());
-        });
-    }
-
-    #[gpui_kit::test]
-    fn a_view_shows_its_definition_from_its_row(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_objects(&workspace, &[], cx);
-        show_tables(&workspace, &["daily"], cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.schema.update(cx, |schema, cx| {
-                    schema.tables[0].kind = "VIEW".into();
-                    cx.notify();
-                });
-            });
-        });
-        window_action(handle, cx, |window, cx| {
-            window.hover("table-public-daily", cx);
-            window.click("definition-table-public-daily", cx);
-        });
-        assert_eq!(editor_text(&workspace, cx), "Definition of daily");
-        cx.update(|cx| assert!(workspace.read(cx).schema.read(cx).expanded.is_empty()));
-    }
-
-    #[gpui_kit::test]
-    fn previewing_a_table_runs_its_query(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_tables(&workspace, &["users"], cx);
-        window_action(handle, cx, |window, cx| {
-            window.hover("table-public-users", cx);
-            window.click("preview-table-public-users", cx);
-        });
-        cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert!(this.schema.read(cx).expanded.is_empty());
-            assert_eq!(
-                this.editor.read(cx).value().as_str(),
-                r#"SELECT * FROM "public"."users" LIMIT 100"#
-            );
-            assert!(matches!(this.status, Status::Busy(_)));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn query_view_renders_results(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                this.results.update(cx, |table, cx| {
-                    table.delegate_mut().show(&QueryResult {
-                        columns: vec!["id".into(), "name".into()],
-                        rows: vec![vec![json!(1), json!("Ada")], vec![json!(2), json!(null)]],
-                        truncated: false,
-                        rows_affected: None,
-                        elapsed_ms: 1,
-                        note: None,
-                    });
-                    table.refresh(cx);
-                });
-                cx.notify();
-            });
-        });
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            assert!(window.find("run").visible());
-            assert!(window.find("edit").visible());
-            assert!(window.find("sql-editor").visible());
-        })
-        .unwrap();
-    }
-
-    #[gpui_kit::test]
-    fn shortcut_runs_query_without_editing_the_sql(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                cx.notify();
-            });
-        });
-        cx.update_window(handle, |_, window, cx| {
-            window.render_frame(cx);
-            window.click("sql-editor", cx);
-            window.press("secondary-enter", cx);
-        })
-        .unwrap();
-        cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert!(matches!(this.status, Status::Busy(_)));
-            assert_eq!(this.editor.read(cx).value().as_str(), "SELECT 1;");
-        });
-    }
-
-    fn config_with_two_connections() -> Config {
+    pub(crate) fn config_with_two_connections() -> Config {
         let mut config = config_with_connection();
         let mut other = config.connections[0].clone();
         other.name = "other".into();
@@ -4973,20 +3960,27 @@ mod tests {
             window.input("select 42", cx);
         });
         let form = edit_form(handle, &workspace, "other", cx);
-        cx.update(|cx| {
+        window_action(handle, cx, |window, cx| {
             workspace.update(cx, |this, cx| {
                 let mut renamed = this.config.find("other").unwrap().clone();
                 renamed.name = "renamed".into();
                 let mut saved = this.config.clone();
                 saved.upsert(renamed.clone(), Some("other")).unwrap();
                 let previous = Some("other".into());
-                this.finish_saving_connection(form, renamed, previous, saved, Ok(None), cx);
+                let saving = super::Saving {
+                    form,
+                    connection: renamed,
+                    previous,
+                };
+                this.finish_saving_connection(saving, saved, Ok(None), window, cx);
             });
         });
         window_action(handle, cx, |_, cx| {
             let this = workspace.read(cx);
-            assert_eq!(this.selected.as_deref(), Some("db"));
-            assert_eq!(this.editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.active.as_deref(), Some("db"));
+            assert_eq!(this.tabs.len(), 1);
+            let editor = this.active_tab().unwrap().read(cx).editor.read(cx);
+            assert_eq!(editor.value().as_str(), "select 42");
             assert_eq!(this.session.drafts["db"], "select 42");
             assert_eq!(this.session.drafts["renamed"], "select 'other'");
             assert!(!this.session.drafts.contains_key("other"));
@@ -5003,20 +3997,27 @@ mod tests {
             window.input("select 42", cx);
         });
         let form = edit_form(handle, &workspace, "db", cx);
-        cx.update(|cx| {
+        window_action(handle, cx, |window, cx| {
             workspace.update(cx, |this, cx| {
                 let mut renamed = this.config.find("db").unwrap().clone();
                 renamed.name = "renamed".into();
                 let mut saved = this.config.clone();
                 saved.upsert(renamed.clone(), Some("db")).unwrap();
                 let previous = Some("db".into());
-                this.finish_saving_connection(form, renamed, previous, saved, Ok(None), cx);
+                let saving = super::Saving {
+                    form,
+                    connection: renamed,
+                    previous,
+                };
+                this.finish_saving_connection(saving, saved, Ok(None), window, cx);
             });
         });
         window_action(handle, cx, |_, cx| {
             let this = workspace.read(cx);
-            assert_eq!(this.selected.as_deref(), Some("renamed"));
-            assert_eq!(this.editor.read(cx).value().as_str(), "select 42");
+            assert_eq!(this.active.as_deref(), Some("renamed"));
+            let tab = this.active_tab().unwrap().read(cx);
+            assert_eq!(tab.name(), "renamed");
+            assert_eq!(tab.editor.read(cx).value().as_str(), "select 42");
             assert_eq!(this.session.drafts["renamed"], "select 42");
             assert!(!this.session.drafts.contains_key("db"));
         });
@@ -5026,7 +4027,7 @@ mod tests {
     fn a_change_made_while_a_connection_saves_is_kept(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_two_connections(), cx);
         let form = edit_form(handle, &workspace, "other", cx);
-        cx.update(|cx| {
+        window_action(handle, cx, |window, cx| {
             workspace.update(cx, |this, cx| {
                 let mut moved = this.config.find("other").unwrap().clone();
                 moved.folder = "Staging".into();
@@ -5035,7 +4036,12 @@ mod tests {
                 saved.upsert(moved.clone(), Some("other")).unwrap();
                 this.change_font_size(|config| config.resize_font(1), cx);
                 let previous = Some("other".into());
-                this.finish_saving_connection(form, moved, previous, saved, Ok(None), cx);
+                let saving = super::Saving {
+                    form,
+                    connection: moved,
+                    previous,
+                };
+                this.finish_saving_connection(saving, saved, Ok(None), window, cx);
                 assert_eq!(this.config.font_size, super::DEFAULT_FONT_SIZE + 1);
                 assert_eq!(this.config.find("other").unwrap().folder, "Staging");
                 // Neither save written so far holds both changes: one more does.
@@ -5051,7 +4057,7 @@ mod tests {
     fn quitting_after_a_failed_save_or_delete_writes_the_config_as_it_is(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_two_connections(), cx);
         let form = edit_form(handle, &workspace, "other", cx);
-        cx.update(|cx| {
+        window_action(handle, cx, |window, cx| {
             workspace.update(cx, |this, cx| {
                 let before = this.config.clone();
                 let mut renamed = this.config.find("other").unwrap().clone();
@@ -5062,7 +4068,12 @@ mod tests {
                 this.config_saves.save(saved.clone());
                 let failed = Err(anyhow::anyhow!("the keychain refused"));
                 let previous = Some("other".into());
-                this.finish_saving_connection(form, renamed, previous, saved, failed, cx);
+                let saving = super::Saving {
+                    form,
+                    connection: renamed,
+                    previous,
+                };
+                this.finish_saving_connection(saving, saved, failed, window, cx);
                 let newest = this.final_saves().1.expect("a config save was made");
                 let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
                 assert_eq!(written.as_ref(), Some(&before));
@@ -5077,101 +4088,6 @@ mod tests {
                 let newest = this.final_saves().1.expect("a config save was made");
                 let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
                 assert!(written.unwrap().find("other").is_some());
-            });
-        });
-    }
-
-    #[gpui_kit::test]
-    fn the_status_line_says_when_an_open_transaction_was_rolled_back(cx: &mut TestAppContext) {
-        let (_, workspace) = open(config_with_connection(), cx);
-        let run = |rolled_back| tuplebase_core::db::ScriptResult {
-            result: QueryResult {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                truncated: false,
-                rows_affected: Some(1),
-                elapsed_ms: 1,
-                note: None,
-            },
-            statements: 2,
-            changed: true,
-            rolled_back,
-        };
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                let conn = this.config.find("db").unwrap().clone();
-                for rolled_back in [true, false] {
-                    this.run_query(cx);
-                    this.finish_query(this.run, conn.clone(), Ok(run(rolled_back)), cx);
-                    let Status::Done(text) = &this.status else {
-                        panic!("not done");
-                    };
-                    assert!(
-                        text.starts_with(&super::summary(&run(false).result, 2)),
-                        "{text}"
-                    );
-                    assert_eq!(text.contains(ROLLED_BACK_NOTE), rolled_back, "{text}");
-                }
-            });
-        });
-    }
-
-    #[gpui_kit::test]
-    fn an_earlier_query_finishing_late_does_not_replace_a_later_one(cx: &mut TestAppContext) {
-        let (_, workspace) = open(config_with_connection(), cx);
-        let result = |rows: usize| tuplebase_core::db::ScriptResult {
-            result: QueryResult {
-                columns: vec!["n".into()],
-                rows: (0..rows).map(|n| vec![json!(n)]).collect(),
-                truncated: false,
-                rows_affected: None,
-                elapsed_ms: 1,
-                note: None,
-            },
-            statements: 1,
-            changed: false,
-            rolled_back: false,
-        };
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.selected = Some("db".into());
-                this.run_query(cx);
-                let earlier = this.run;
-                // Something else, such as a save, may have changed the status meanwhile.
-                this.status = Status::Idle;
-                this.run_query(cx);
-                let later = this.run;
-                let conn = this.config.find("db").unwrap().clone();
-                this.finish_query(later, conn.clone(), Ok(result(2)), cx);
-                this.finish_query(earlier, conn, Ok(result(5)), cx);
-                let expected = super::summary(&result(2).result, 1);
-                assert!(matches!(&this.status, Status::Done(s) if s.as_ref() == expected));
-            });
-        });
-    }
-
-    #[gpui_kit::test]
-    fn an_earlier_schema_load_does_not_replace_a_later_one(cx: &mut TestAppContext) {
-        let (_, workspace) = open(config_with_connection(), cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                let conn = this.config.connections[0].clone();
-                this.schema.update(cx, |schema, cx| {
-                    schema.set_connection(Some(conn), cx);
-                    let earlier = schema.loading;
-                    schema.refresh(cx);
-                    let later = schema.loading;
-                    let users = tuplebase_core::db::TableInfo {
-                        schema: "public".into(),
-                        name: "users".into(),
-                        kind: "BASE TABLE".into(),
-                    };
-                    schema.finish_loading(later, Ok((vec![users], Vec::new(), Vec::new())), cx);
-                    schema.finish_loading(earlier, Err(anyhow::anyhow!("timed out")), cx);
-                    assert!(schema.load == crate::schema::Load::Ready);
-                    assert_eq!(schema.tables.len(), 1);
-                });
             });
         });
     }
@@ -5216,112 +4132,12 @@ mod tests {
     #[gpui_kit::test]
     fn clicking_the_open_connection_again_leaves_a_running_query(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
+        let tab = open_tab(handle, &workspace, "db", cx);
+        tab.update(cx, |tab, cx| tab.run_sql("select 1".into(), cx));
         window_action(handle, cx, |window, cx| window.click("conn-db", cx));
         cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.status = Status::Idle;
-                this.run_sql("select 1".into(), cx);
-            });
+            let status = &tab.read(cx).status;
+            assert!(matches!(status, Status::Busy(s) if s.as_ref() == "Running…"));
         });
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
-        cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert!(matches!(&this.status, Status::Busy(s) if s.as_ref() == "Running…"));
-        });
-    }
-
-    #[gpui_kit::test]
-    fn previewing_while_a_query_runs_leaves_the_editor_alone(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_tables(&workspace, &["users"], cx);
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.run_query(cx);
-                assert!(matches!(this.status, Status::Busy(_)));
-            });
-        });
-        window_action(handle, cx, |window, cx| {
-            window.hover("table-public-users", cx);
-            window.click("preview-table-public-users", cx);
-        });
-        assert_eq!(editor_text(&workspace, cx), "SELECT 1;");
-        cx.update(|cx| {
-            let this = workspace.read(cx);
-            assert_eq!(this.session.history_for("db").count(), 1);
-            assert!(!this.session.drafts.contains_key("db"));
-        });
-    }
-
-    /// Objects whose lookup takes a second when they are named "slow".
-    fn show_slow_objects(
-        workspace: &Entity<Workspace>,
-        objects: &[(ObjectKind, &str)],
-        cx: &mut TestAppContext,
-    ) {
-        show_objects(workspace, objects, cx);
-        let executor = cx.executor();
-        cx.update(|cx| {
-            workspace.update(cx, |this, cx| {
-                this.schema.update(cx, |schema, _| {
-                    schema.fetch = Rc::new(move |_, object, lookup| {
-                        let executor = executor.clone();
-                        Box::pin(async move {
-                            if object.name == "slow" {
-                                executor.timer(std::time::Duration::from_secs(1)).await;
-                            }
-                            Ok(format!("{lookup:?} of {}", object.name))
-                        })
-                    });
-                });
-            });
-        });
-    }
-
-    fn wait_for_slow_lookups(cx: &mut TestAppContext) {
-        cx.executor()
-            .advance_clock(std::time::Duration::from_secs(2));
-        cx.run_until_parked();
-    }
-
-    #[gpui_kit::test]
-    fn a_slow_definition_does_not_replace_a_later_one(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        let objects = [
-            (ObjectKind::Function, "slow"),
-            (ObjectKind::Function, "fast"),
-        ];
-        show_slow_objects(&workspace, &objects, cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Functions", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("object-public-Functions-slow", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("object-public-Functions-fast", cx)
-        });
-        assert_eq!(editor_text(&workspace, cx), "Definition of fast");
-        wait_for_slow_lookups(cx);
-        assert_eq!(editor_text(&workspace, cx), "Definition of fast");
-    }
-
-    #[gpui_kit::test]
-    fn a_slow_definition_does_not_replace_what_was_typed_meanwhile(cx: &mut TestAppContext) {
-        let (handle, workspace) = open(config_with_connection(), cx);
-        show_slow_objects(&workspace, &[(ObjectKind::Function, "slow")], cx);
-        window_action(handle, cx, |window, cx| {
-            window.click("group-public-Functions", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("object-public-Functions-slow", cx)
-        });
-        window_action(handle, cx, |window, cx| {
-            window.click("sql-editor", cx);
-            window.input("select 42", cx);
-        });
-        let typed = editor_text(&workspace, cx);
-        assert!(typed.contains("select 42"), "{typed}");
-        wait_for_slow_lookups(cx);
-        assert_eq!(editor_text(&workspace, cx), typed);
     }
 }
