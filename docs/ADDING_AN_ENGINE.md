@@ -156,11 +156,11 @@ engine shares:
   range. Give it user `dev`, password `dev` and database `app`, a healthcheck that selects from
   `users`, and `dev/seed.sql`. The seed is written to run on every engine, so keep it portable.
   Demo data (`dev/demo-<engine>.sql`) is optional.
-- `crates/core/tests/db.rs`: add the engine to `connection()`. Its match has a catch-all arm for
+- `crates/core/tests/it/db.rs`: add the engine to `connection()`. Its match has a catch-all arm for
   MariaDB, so it won't ask for the new one. Then add the engine to `each_adapter`, and give its own
   features tests named `<engine>_...`. These tests run in parallel against shared databases, so
   give new fixtures new names and never rename existing ones.
-- **A file engine:** add a test file like `crates/core/tests/sqlite.rs`. It needs no server, so it
+- **A file engine:** add a module like `crates/core/tests/it/sqlite.rs` and list it in `it/main.rs`. It needs no server, so it
   always runs.
 - `crates/core/examples/add_test_connections.rs`: add the local database, so `make dev` shows it.
 - `docs/DEVELOPMENT.md`: add the port to the table of local databases.

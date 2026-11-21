@@ -14,3 +14,8 @@ publish = false
 # docs/DEVELOPMENT.md. `cargo test` inherits this; release builds are unchanged.
 [profile.dev]
 debug = "line-tables-only"
+
+# No debug info for dependencies: less to compile, link and keep in target/. A panic
+# inside a dependency still names its function, without file and line.
+[profile.dev.package."*"]
+debug = false
