@@ -117,11 +117,16 @@ built by `find` or `aggregate`) must parse as one `find`, `findOne`, `aggregate`
 `show collections`), with pipeline stages from a fixed list, no `$out` or `$merge` at any
 depth, no server-side JavaScript (`$where`, `$function`, `$accumulator`), no internal `$_`
 operators, no key holding a NUL, no `allowDiskUse`, and no `db.runCommand`. It then runs as
-one typed read call, limited to 60 seconds on the server. What this can't see is what a
+one typed read call, limited to 60 seconds on the server and, on MongoDB, told not to spill
+to disk (`allowDiskUse: false`; MongoDB 6.0 and later spill by default). What this can't see is what a
 view stores: reading a view runs its own pipeline, which may run JavaScript. The server
 refuses writes only for a user with read-only roles (or a direct connection to a
 secondary); TupleBase reports whether it found one (`server_read_only`), and otherwise
 shows the connection as guarded by TupleBase only.
+
+Reads go wherever the user's roles allow, system collections included: a root user's agent
+can read `admin.system.users` (password hashes) or `local.oplog.rs`. Give agents a user with
+the `read` role on the databases they need.
 
 ### Amazon DynamoDB
 
