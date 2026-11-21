@@ -1200,6 +1200,7 @@ impl Workspace {
         let kept = match result {
             Ok(kept) => kept,
             Err(e) => {
+                self.forget_unwritten_config_save();
                 form.update(cx, |form, cx| form.set_error(format!("{e:#}"), cx));
                 return;
             }
@@ -1289,18 +1290,35 @@ impl Workspace {
             .await
             .ok();
             this.update(cx, |this, cx| {
-                // Nothing was deleted: show the connection again, as it still is on disk.
-                if result.is_err()
-                    && let Some(conn) = removed
-                {
-                    this.config.upsert(conn, None).ok();
-                    cx.notify();
-                }
-                this.show_saved(result, cx);
+                this.finish_deleting_connection(removed, result, cx)
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Once deleting a connection is written, or failed and was undone.
+    fn finish_deleting_connection(
+        &mut self,
+        removed: Option<Connection>,
+        result: anyhow::Result<Option<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
+        if result.is_err() {
+            // Nothing was deleted: show the connection again, as it still is on disk.
+            if let Some(conn) = removed {
+                self.config.upsert(conn, None).ok();
+                cx.notify();
+            }
+            self.forget_unwritten_config_save();
+        }
+        self.show_saved(result, cx);
+    }
+
+    /// After a connection's save or delete failed and its keychain change was undone: the
+    /// config as it is becomes the newest save, so quitting doesn't write the failed one.
+    fn forget_unwritten_config_save(&mut self) {
+        self.config_saves.save(self.config.clone());
     }
 
     /// Runs the selected text, or else the statement at the cursor, split as a script
@@ -5010,6 +5028,41 @@ mod tests {
                 let newest = this.config_saves.latest().unwrap();
                 let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
                 assert_eq!(written.as_ref(), Some(&this.config));
+            });
+        });
+    }
+
+    /// A save that failed was undone in the keychain: quitting must not write it after all.
+    #[gpui_kit::test]
+    fn quitting_after_a_failed_save_or_delete_writes_the_config_as_it_is(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_two_connections(), cx);
+        let form = edit_form(handle, &workspace, "other", cx);
+        cx.update(|cx| {
+            workspace.update(cx, |this, cx| {
+                let before = this.config.clone();
+                let mut renamed = this.config.find("other").unwrap().clone();
+                renamed.name = "renamed".into();
+                // Taken at Save, as `save_connection` does, then never written.
+                let mut saved = this.config.clone();
+                saved.upsert(renamed.clone(), Some("other")).unwrap();
+                this.config_saves.save(saved.clone());
+                let failed = Err(anyhow::anyhow!("the keychain refused"));
+                let previous = Some("other".into());
+                this.finish_saving_connection(form, renamed, previous, saved, failed, cx);
+                let newest = this.final_saves().1.expect("a config save was made");
+                let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
+                assert_eq!(written.as_ref(), Some(&before));
+
+                // The same after a delete that failed.
+                let removed = this.config.find("other").cloned();
+                this.config.remove("other");
+                this.config_saves.save(this.config.clone());
+                let failed = Err(anyhow::anyhow!("the keychain refused"));
+                this.finish_deleting_connection(removed, failed, cx);
+                assert!(this.config.find("other").is_some(), "shown again");
+                let newest = this.final_saves().1.expect("a config save was made");
+                let written = newest.run(|config| Ok(Some(config.clone()))).unwrap();
+                assert!(written.unwrap().find("other").is_some());
             });
         });
     }

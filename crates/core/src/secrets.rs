@@ -203,9 +203,9 @@ fn apply<T>(
         }
         match failed {
             None => error,
-            Some(e) => error.context(format!(
-                "and putting the OS credential store back failed ({e:#})"
-            )),
+            Some(e) => anyhow::anyhow!(
+                "{error:#}; putting the OS credential store back as it was failed too ({e:#})"
+            ),
         }
     };
     for (i, step) in steps.iter().enumerate() {
@@ -497,6 +497,24 @@ mod tests {
             );
             assert_eq!(store.all(), entries(&before), "failing on {fail_on}");
         }
+    }
+
+    #[test]
+    fn a_failed_undo_is_reported_after_what_failed() {
+        // Writing "new" fails, and so does putting it back.
+        let store = Fake {
+            fail_on: Some("new"),
+            ..Fake::with(&[("old", "pw"), ("new", "stale")])
+        };
+        let renamed = secrets(Some("old"), "new", Secret::Keep);
+        let error = format!("{:#}", save_with(&store, &renamed, || Ok(())).unwrap_err());
+        assert!(
+            error.starts_with("the store refused new; putting"),
+            "{error}"
+        );
+        assert!(error.contains("back as it was failed too"), "{error}");
+        // What could be put back was.
+        assert_eq!(store.get("old").unwrap().as_deref(), Some("pw"));
     }
 
     #[test]
