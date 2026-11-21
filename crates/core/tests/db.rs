@@ -486,6 +486,65 @@ async fn sqlite_indexes_and_triggers_are_listed() {
 /// statement that asked for it: PostgreSQL drops the unnamed prepared statement whenever
 /// another query runs on the connection.
 #[tokio::test]
+async fn postgres_shows_nan_infinity_and_numerics_of_any_size_exactly() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    let conn = connection(Adapter::Postgres);
+    let db = Db::new();
+    let numerics = [
+        "1.50",
+        "0.00",
+        "-0.001",
+        "100",
+        "0",
+        "10000",
+        "-12345678.9",
+        "0.0001",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        // More digits than rust_decimal holds.
+        "1234567890123456789012345678901234567890",
+        "-98765432109876543210.123456789012345678901234567890",
+        "0.000000000000000000000000000000000000001",
+        "100000000000000000000000000000000000000000000",
+    ];
+    for opts in [READ, WRITE] {
+        let mut wrong = Vec::new();
+        for value in numerics {
+            let sql = format!("SELECT '{value}'::numeric AS n");
+            let r = db.execute(&conn, &sql, opts).await.unwrap();
+            if r.rows != [[json!(value)]] {
+                wrong.push(format!("{value} shown as {}", r.rows[0][0]));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let r = db
+            .execute(
+                &conn,
+                "SELECT 'NaN'::float8, 'Infinity'::float8, '-Infinity'::float4, \
+                 1.5::float8, 'NaN'::numeric(10, 2), 2.50::numeric(10, 2)",
+                opts,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r.rows,
+            [[
+                json!("NaN"),
+                json!("Infinity"),
+                json!("-Infinity"),
+                json!(1.5),
+                json!("NaN"),
+                json!("2.50")
+            ]]
+        );
+    }
+}
+
+#[tokio::test]
 async fn postgres_custom_types_can_be_read_on_a_fresh_connection() {
     if !enabled() {
         eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");

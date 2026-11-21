@@ -13,7 +13,7 @@ use sqlx::types::chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use sqlx::types::{Decimal, JsonValue};
 use sqlx::{AssertSqlSafe, Column, Executor, Row, TypeInfo, ValueRef};
 
-use super::decode::{bytes, decode_first, fallback, text, type_name_or_return};
+use super::decode::{bytes, decode_first, fallback, float, text, type_name_or_return};
 use super::{
     Dialect, ObjectInfo, ObjectKind, ParamMode, Parameter, Source, call_head, objects, parameters,
     sql_comment, unsupported,
@@ -251,8 +251,8 @@ pub(super) fn value(row: &MySqlRow, i: usize) -> Value {
     decode_first!(row, i;
         i64 => |v: i64| json!(v),
         u64 => |v: u64| json!(v),
-        f64 => |v: f64| json!(v),
-        f32 => |v: f32| json!(v),
+        f64 => float,
+        f32 => float,
         Decimal => text,
         String => Value::String,
         JsonValue => |v| v,

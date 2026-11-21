@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Row, TypeInfo, ValueRef};
 
-use super::decode::{bytes, decode_first, fallback, type_name_or_return};
+use super::decode::{bytes, decode_first, fallback, float, type_name_or_return};
 use super::{Dialect, ObjectInfo, ObjectKind, Source, objects, unsupported};
 
 /// Each query returns schema, name and detail.
@@ -149,7 +149,7 @@ pub(super) fn value(row: &SqliteRow, i: usize) -> Value {
     let type_name = type_name_or_return!(row, i);
     decode_first!(row, i;
         i64 => |v: i64| json!(v),
-        f64 => |v: f64| json!(v),
+        f64 => float,
         String => Value::String,
         Vec<u8> => bytes,
     );
