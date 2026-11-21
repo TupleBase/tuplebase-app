@@ -256,6 +256,10 @@ fn upgrade_command(
     let mut command = if cfg!(windows) {
         let mut c = Command::new("powershell");
         c.args(["-NoProfile", "-Command", WINDOWS_UPGRADE]);
+        // Started from PowerShell 7, the app passes on its module path, where Windows
+        // PowerShell finds no `Get-FileHash` and the installer stops. Without one it uses
+        // its own.
+        c.env_remove("PSModulePath");
         c
     } else {
         let mut c = Command::new("sh");
@@ -570,6 +574,7 @@ mod tests {
         fs::write(stage.join("tuplebase-app.exe"), "new app").unwrap();
         let zip = download.join(&file);
         let zipped = Command::new("powershell")
+            .env_remove("PSModulePath")
             .args(["-NoProfile", "-Command"])
             .arg(format!(
                 "Compress-Archive -Path '{}\\*' -DestinationPath '{}'",
@@ -584,7 +589,9 @@ mod tests {
 
         let install = || {
             let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.ps1");
+            // As the update runs it (`upgrade_command`).
             let output = Command::new("powershell")
+                .env_remove("PSModulePath")
                 .args(["-NoProfile", "-Command"])
                 .arg(format!("Get-Content -Raw '{}' | iex", script.display()))
                 .env("TUPLEBASE_INSTALL_DIR", &dir)
