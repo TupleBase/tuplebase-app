@@ -28,8 +28,20 @@ fn enabled() -> bool {
 /// server, can refuse a write.
 fn connection(adapter: Adapter, user: &str) -> Connection {
     let name = format!("it-mongo-{user}-{adapter:?}").to_lowercase();
-    // SAFETY: each test sets the same value for a name; nothing else reads it at once.
-    unsafe { std::env::set_var(tuplebase_core::secrets::env_var_name(&name), user) };
+    // Passwords come from the env override, never the keychain, in tests.
+    static SET_PASSWORDS: std::sync::Once = std::sync::Once::new();
+    SET_PASSWORDS.call_once(|| {
+        for adapter in ADAPTERS {
+            for user in ["dev", "reader", "nobody"] {
+                let name = format!("it-mongo-{user}-{adapter:?}").to_lowercase();
+                for name in [name.clone(), format!("{name}-direct")] {
+                    let var = tuplebase_core::secrets::env_var_name(&name);
+                    // SAFETY: runs once, before any connection reads the environment.
+                    unsafe { std::env::set_var(var, user) };
+                }
+            }
+        }
+    });
     Connection {
         name,
         folder: String::new(),
@@ -320,7 +332,6 @@ async fn mongo_server_read_only_is_detected_and_fails_closed() {
         let mut direct = connection(adapter, "dev");
         direct.name.push_str("-direct");
         direct.mongo.as_mut().unwrap().options = "authSource=admin&directConnection=true".into();
-        unsafe { std::env::set_var(tuplebase_core::secrets::env_var_name(&direct.name), "dev") };
         assert_eq!(db.server_read_only(&direct).await.unwrap(), Some(false));
         // Signed in as nobody, the server lists no privileges: unknown, not read-only.
         let mut nobody = connection(adapter, "nobody");

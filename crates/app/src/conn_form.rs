@@ -507,9 +507,10 @@ impl ConnForm {
     /// The engine, and the user its servers usually have as the User field's example.
     fn set_adapter(&mut self, adapter: Adapter, window: &mut Window, cx: &mut Context<Self>) {
         // DocumentDB accepts only encrypted connections unless its cluster was changed.
+        // Required, not Verified, until Amazon's authorities are given to the driver.
         if adapter == Adapter::Documentdb && self.adapter != adapter && self.tls == TlsMode::Prefer
         {
-            self.tls = TlsMode::Verify;
+            self.tls = TlsMode::Require;
         }
         self.adapter = adapter;
         self.user.update(cx, |input, cx| {

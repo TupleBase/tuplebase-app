@@ -96,8 +96,12 @@ fn apply(options: &mut ClientOptions, conn: &Connection, password: Option<&str>)
     options.connect_timeout = Some(ACQUIRE_TIMEOUT);
     options.max_pool_size = Some(POOL_SIZE);
     options.tls = Some(match conn.tls {
-        // Plain, as MongoDB serves by default; the form makes DocumentDB verify.
-        TlsMode::Prefer => Tls::Disabled,
+        // As the connection string says: TLS for an SRV address or `tls=true`, else
+        // plain, as MongoDB serves by default.
+        TlsMode::Prefer => match options.tls.take() {
+            Some(Tls::Enabled(tls)) => Tls::Enabled(tls),
+            _ => Tls::Disabled,
+        },
         TlsMode::Require => Tls::Enabled(
             TlsOptions::builder()
                 .allow_invalid_certificates(true)
@@ -1125,8 +1129,17 @@ mod tests {
             async move { self::options(&c, "h", 1, None).await.unwrap().tls }
         };
         assert!(matches!(
-            tls(TlsMode::Prefer, "tls=true").await,
+            tls(TlsMode::Prefer, "").await,
             Some(Tls::Disabled)
+        ));
+        // If available: as the options say.
+        assert!(matches!(
+            tls(TlsMode::Prefer, "tls=true").await,
+            Some(Tls::Enabled(_))
+        ));
+        assert!(matches!(
+            tls(TlsMode::Require, "tls=false").await,
+            Some(Tls::Enabled(_))
         ));
         let Some(Tls::Enabled(require)) = tls(TlsMode::Require, "").await else {
             panic!()

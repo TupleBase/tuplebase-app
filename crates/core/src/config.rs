@@ -507,9 +507,11 @@ pub struct MongoSettings {
     pub options: String,
 }
 
-/// Options that would put a secret into the saved, plain options string (S1). Compared
-/// lower-cased, after percent-decoding.
-const SECRET_OPTIONS: [&str; 3] = ["password", "pwd", "tlscertificatekeyfilepassword"];
+/// Whether an option would put a secret into the saved, plain options string (S1): any
+/// key naming a password. `key` is lower-cased and percent-decoded.
+fn is_secret_option(key: &str) -> bool {
+    key.contains("password") || key == "pwd"
+}
 
 impl MongoSettings {
     /// Each option as a lower-cased, percent-decoded key and its decoded value.
@@ -530,7 +532,7 @@ impl MongoSettings {
     /// Refuses options that would put a secret in the saved settings.
     pub fn check(&self) -> Result<()> {
         for (key, value) in self.pairs() {
-            if SECRET_OPTIONS.contains(&key.as_str()) {
+            if is_secret_option(&key) {
                 bail!(
                     "the password can't go in the connection options: they are saved as \
                      plain text. Leave it to the password field"
@@ -2212,6 +2214,7 @@ mod tests {
             "pass%77ord=x",
             "pwd=x",
             "tlsCertificateKeyFilePassword=x",
+            "proxyPassword=x",
             "authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN:abc",
             "authMechanismProperties=aws_session_token%3Aabc",
         ] {
