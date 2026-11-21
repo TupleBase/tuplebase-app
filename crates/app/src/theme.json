@@ -59,7 +59,9 @@
         "button.primary.background": "#0B7285",
         "button.primary.hover.background": "#0A6575",
         "button.primary.active.background": "#085866",
-        "button.primary.foreground": "#FFFFFF"
+        "button.primary.foreground": "#FFFFFF",
+        "success.background": "#2A7A4B",
+        "warning.background": "#A15C12"
       },
       "highlight": {
         "editor.foreground": "#0C1D21",
@@ -185,7 +187,9 @@
         "button.primary.background": "#3BC3D6",
         "button.primary.hover.background": "#5BCEDE",
         "button.primary.active.background": "#2BAABC",
-        "button.primary.foreground": "#0C1D21"
+        "button.primary.foreground": "#0C1D21",
+        "success.background": "#8FD19E",
+        "warning.background": "#F0B072"
       },
       "highlight": {
         "editor.foreground": "#E4E4E4",

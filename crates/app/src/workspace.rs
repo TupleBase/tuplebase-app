@@ -803,7 +803,7 @@ impl Workspace {
             session_saves: Saves::default(),
             config_saves: Saves::default(),
             status,
-            connections: cx.new(|cx| ConnectionsDialog::new(workspace, cx)),
+            connections: cx.new(|cx| ConnectionsDialog::new(workspace, window, cx)),
             connections_open: false,
             update_state: None,
             _form_subscription: None,
@@ -2142,10 +2142,10 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_a_connection_opens_and_connects_its_tab(cx: &mut TestAppContext) {
+    fn double_clicking_a_connection_opens_and_connects_its_tab(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         open_picker(handle, cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.double_click("conn-db", cx));
         window_action(handle, cx, |window, cx| {
             // The dialog has done its job.
             assert!(!window.has_active_dialog(cx));
@@ -2727,7 +2727,7 @@ pub(crate) mod tests {
     fn each_tab_keeps_its_own_editor_and_draft(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_two_connections(), cx);
         open_picker(handle, cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.double_click("conn-db", cx));
         let db = active(&workspace, cx);
         window_action(handle, cx, |window, cx| {
             window.click("sql-editor", cx);
@@ -2740,7 +2740,9 @@ pub(crate) mod tests {
             });
         });
         open_picker(handle, cx);
-        window_action(handle, cx, |window, cx| window.click("conn-other", cx));
+        window_action(handle, cx, |window, cx| {
+            window.double_click("conn-other", cx)
+        });
         // Its own editor, which starts with the connection's draft.
         let other = active(&workspace, cx);
         assert_ne!(other, db);
@@ -2767,9 +2769,14 @@ pub(crate) mod tests {
         };
         let collapsed =
             |cx: &mut TestAppContext| picker(&workspace, cx, |picker| picker.collapsed.clone());
-        // The tree has the keys as soon as the dialog opens.
+        // The search field has the keys as soon as the dialog opens, and passes Down on.
         open_picker(handle, cx);
         window_action(handle, cx, |window, cx| window.press("down", cx));
+        assert_eq!(cursor(cx), TreeRow::Folder("Production".into()));
+
+        // A click on a row gives the tree the keys, Left and Right among them.
+        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.press("left", cx));
         assert_eq!(cursor(cx), TreeRow::Folder("Production".into()));
 
         window_action(handle, cx, |window, cx| window.press("left", cx));
@@ -3451,7 +3458,7 @@ pub(crate) mod tests {
         for name in ["db", "other"] {
             open_picker(handle, cx);
             let id = gpui_kit::SharedString::from(format!("conn-{name}"));
-            window_action(handle, cx, |window, cx| window.click(id, cx));
+            window_action(handle, cx, |window, cx| window.double_click(id, cx));
         }
         assert_eq!(tab_names(&workspace, cx), ["db", "other"]);
         assert_eq!(active_name(&workspace, cx).as_deref(), Some("other"));
@@ -3462,7 +3469,7 @@ pub(crate) mod tests {
         });
         // Opening one that has a tab shows that tab, rather than another.
         open_picker(handle, cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.double_click("conn-db", cx));
         assert_eq!(tab_names(&workspace, cx), ["db", "other"]);
         assert_eq!(active_name(&workspace, cx).as_deref(), Some("db"));
     }
@@ -3536,7 +3543,9 @@ pub(crate) mod tests {
         let (handle, workspace) = open(config_with_two_connections(), cx);
         let db = open_tab(handle, &workspace, "db", cx);
         open_picker(handle, cx);
-        window_action(handle, cx, |window, cx| window.click("conn-other", cx));
+        window_action(handle, cx, |window, cx| {
+            window.double_click("conn-other", cx)
+        });
         let other = active(&workspace, cx);
         other.update(cx, |tab, cx| {
             tab.connecting = false;
@@ -3709,12 +3718,12 @@ pub(crate) mod tests {
     }
 
     #[gpui_kit::test]
-    fn clicking_the_open_connection_again_leaves_a_running_query(cx: &mut TestAppContext) {
+    fn double_clicking_the_open_connection_again_leaves_a_running_query(cx: &mut TestAppContext) {
         let (handle, workspace) = open(config_with_connection(), cx);
         let tab = open_tab(handle, &workspace, "db", cx);
         tab.update(cx, |tab, cx| tab.run_sql("select 1".into(), cx));
         open_picker(handle, cx);
-        window_action(handle, cx, |window, cx| window.click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.double_click("conn-db", cx));
         cx.update(|cx| {
             let status = &tab.read(cx).status;
             assert!(matches!(status, Status::Busy(s) if s.as_ref() == "Running…"));
