@@ -1141,10 +1141,24 @@ impl Workspace {
                 )
                 .confirm()
                 .footer(dialogs::confirm_footer("Delete connection"))
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
-                        .ok();
-                    true
+                .on_ok({
+                    let this = this.clone();
+                    move |_, _, cx| {
+                        this.update(cx, |this, cx| this.delete_connection(target.clone(), cx))
+                            .ok();
+                        true
+                    }
+                })
+                // Asked from the Connections dialog, which takes the keys back.
+                .on_close(move |_, window, cx| {
+                    let Some(this) = this.upgrade() else {
+                        return;
+                    };
+                    let this = this.read(cx);
+                    if this.connections_open {
+                        let connections = this.connections.clone();
+                        ConnectionsDialog::take_keys_back(&connections, window, cx);
+                    }
                 })
         });
     }
@@ -3384,6 +3398,27 @@ pub(crate) mod tests {
         assert!(workspace.read_with(cx, |this, _| !this.connections_open));
         window_action(handle, cx, |window, cx| window.click("empty-open", cx));
         assert_eq!(shown(cx), 1);
+    }
+
+    #[gpui_kit::test]
+    fn the_shortcut_leaves_a_question_asked_from_the_dialog(cx: &mut TestAppContext) {
+        let (handle, workspace) = open(config_with_connection(), cx);
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| window.right_click("conn-db", cx));
+        window_action(handle, cx, |window, cx| window.click(2usize, cx));
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            // Neither the question nor the dialog under it went.
+            assert!(alert_open(window));
+            assert!(window.find("connections-dialog").visible());
+            window.click("cancel", cx);
+        });
+        open_picker(handle, cx);
+        window_action(handle, cx, |window, cx| {
+            assert!(window.try_find("connections-dialog").is_none());
+            assert!(!window.has_active_dialog(cx));
+        });
+        assert!(workspace.read_with(cx, |this, _| !this.connections_open));
     }
 
     #[gpui_kit::test]

@@ -123,6 +123,8 @@ struct Shown {
 
 pub(crate) struct ConnectionsDialog {
     workspace: WeakEntity<Workspace>,
+    /// Holds the keys whenever the dialog is the one in front.
+    focus: FocusHandle,
     tree_focus: FocusHandle,
     tree_scroll: ScrollHandle,
     /// The row arrow keys act on.
@@ -138,6 +140,7 @@ impl ConnectionsDialog {
     pub(crate) fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         Self {
             workspace,
+            focus: cx.focus_handle(),
             tree_focus: cx.focus_handle(),
             tree_scroll: ScrollHandle::new(),
             cursor: None,
@@ -146,6 +149,18 @@ impl ConnectionsDialog {
             _folder_edit_subscription: None,
             collapsed: HashSet::new(),
         }
+    }
+
+    /// Gives the keys back to the tree once a question asked from it has closed: closing
+    /// returns them to the menu it was asked from, which is gone.
+    pub(crate) fn take_keys_back(this: &Entity<Self>, window: &mut Window, cx: &mut App) {
+        let focus = this.read(cx).tree_focus.clone();
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+    }
+
+    /// Whether the dialog is in front, with the keys, rather than under another one.
+    fn in_front(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
     }
 
     /// Shows what is inside `folder`, such as after a connection was saved into it.
@@ -314,10 +329,18 @@ impl ConnectionsDialog {
                 .description("What's inside moves up one level. No connections are deleted.")
                 .confirm()
                 .footer(dialogs::confirm_footer("Delete folder"))
-                .on_ok(move |_, _, cx| {
-                    this.update(cx, |this, cx| this.remove_folder(&name, cx))
-                        .ok();
-                    true
+                .on_ok({
+                    let this = this.clone();
+                    move |_, _, cx| {
+                        this.update(cx, |this, cx| this.remove_folder(&name, cx))
+                            .ok();
+                        true
+                    }
+                })
+                .on_close(move |_, window, cx| {
+                    if let Some(this) = this.upgrade() {
+                        Self::take_keys_back(&this, window, cx);
+                    }
                 })
         });
     }
@@ -857,6 +880,7 @@ impl Render for ConnectionsDialog {
         v_flex()
             .id("connections-dialog")
             .test_support()
+            .track_focus(&self.focus)
             .h(height)
             .child(
                 h_flex()
@@ -947,11 +971,13 @@ impl Render for ConnectionsDialog {
 
 impl Workspace {
     /// Opens the Connections dialog, or closes it when it is open. Does nothing while
-    /// another dialog is open.
+    /// another dialog is open, including one in front of it.
     pub(super) fn toggle_connections(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let has_dialog = window.has_active_dialog(cx);
         if self.connections_open && has_dialog {
-            self.close_connections(window, cx);
+            if self.connections.read(cx).in_front(window, cx) {
+                self.close_connections(window, cx);
+            }
             return;
         }
         // Closed some way that didn't say so.
