@@ -9,7 +9,7 @@ Linux, written in Rust. Works with PostgreSQL, MariaDB, MySQL and SQLite.
 
 [Website](https://tuplebase.app) · [Download the latest release](https://github.com/TupleBase/tuplebase-app/releases/latest) · [Install guide](docs/INSTALL.md)
 
-<img src="assets/readme/chat-demo.gif" alt="TupleBase with a PostgreSQL database open: the schema browser, a query and its results, and the chat panel, where Claude Code answers where customers drop out of the checkout funnel" width="100%">
+<img src="assets/readme/chat-demo.gif" alt="TupleBase opening a PostgreSQL connection from the Connections dialog (Ctrl+K) into a tab next to two others, then the schema browser, a query and its results, and the chat panel, where Claude Code answers where customers drop out of the checkout funnel" width="100%">
 
 Ask your own AI agent about your data, right next to your queries. It reaches your databases
 through TupleBase, read-only.
