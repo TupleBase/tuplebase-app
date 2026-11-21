@@ -20,8 +20,8 @@ Plan: nosql-plan.md (same folder). User said (2026-11-21): "be autonomous, use y
 - [x] Local servers: no docker daemon by default; start with `(dockerd >log 2>&1 &)`. Images mongo:8.0 and amazon/dynamodb-local:latest pulled and run fine (ports 57017, 58000 used in probe).
 - [x] PR 1 core refactor: #47 merged (cde7608). Note: integration test crates hit async "queries overflow the depth limit" when nesting another async fn under Db::run; try #![recursion_limit = "256"] in the test crate(s) first.
 - [x] PR 2 Mongo + DocumentDB core: #48 merged (51dcc27). Adversarial review: no writes; fixed $_internalJs* JS bypass ($_ keys refused), maxTimeMS 60s cap, allowDiskUse refused; view-stored $function documented as limit. Disk: tb-redesign target hit 45 GB -> run `cargo clean` there between big PRs if df shows < 10 GB.
-- [x] PR 3 Mongo UI polish: built, clippy and tests green; real app checked under Xvfb (completions, documents with absent vs null, row detail tree, indexes). Fresh containers need `scripts/ci-linux-deps.sh` plus `mesa-vulkan-drivers xdotool` for Xvfb runs; the sshd compose service can't install openssh here (no apk network), so the ssh IT tests fail locally only.
-- [ ] PR 4 DocumentDB AWS
-- [ ] PR 5 DynamoDB (min e2e)
-- [ ] PR 6 MCP
-- [ ] PR 7 docs + release 0.14.0
+- [x] PR 3 Mongo UI polish: #49 merged. Also merged: #50 build speed, #51 form engine picker, #52 Connections dialog fix.
+- [x] PR 4 DocumentDB AWS: #53 merged (untested against a real cluster).
+- [x] PR 5 DynamoDB: #54 merged. Adversarial review: no write; hardened (ASCII outside quotes, 8192 cap). The server accepts legacy `FROM … SET/REMOVE` DML: keep the allowlist.
+- [x] PR 6 MCP: #55 (find/aggregate, list_connections fields). Adversarial review: no write/JS; fixed MongoDB 6.0+ default disk spill (allowDiskUse:false on read-only reads).
+- [ ] PR 7 docs + release 0.14.0 (README, FEATURES, ADDING_AN_ENGINE, cask desc; real-app check of Mongo and DynamoDB under Xvfb).

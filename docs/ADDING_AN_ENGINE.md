@@ -169,6 +169,28 @@ engine shares:
   there. Windows and macOS build the driver and run the unit tests, which shows that it needs no
   system library.
 
+## Engines that aren't SQL
+
+MongoDB, DocumentDB and DynamoDB show what changes when an engine doesn't speak SQL:
+
+- **Family and place** in `EngineInfo` (`Family::Document`, `Family::KeyValue`;
+  `Place::AwsRegion` for a service reached by AWS profile and region) decide the editor
+  language, the result shape, the form's fields and which credentials apply. `auth` lists the
+  ways it signs in.
+- **The language** gets its own `ScriptFlavor` (`MongoShell`, `PartiQl`) for splitting, and the
+  guard its own check (`safety::check_mongo`, `safety::check_partiql`). With no server
+  read-only mode, S2 relies on an allowlist checked on the parsed command and on running one
+  typed read call per request; refuse whatever the server's behaviour isn't confirmed for.
+  Have an independent reviewer try to get a write past it against a real server before merging.
+- **Results** set `QueryResult.documents` beside the flattened `columns` and `rows`, so the
+  table, the row detail and `for_agent()` can show documents as they are.
+- **The driver** lives in the engine module (`db/mongo.rs`, `db/dynamo.rs`), including an AWS SDK
+  that is the engine's own driver (L6).
+- **`Db::run`** dispatches by family; `server_read_only` reports whether the server would refuse
+  writes (`None` when unknown, never guessed).
+- **MCP**: `list_connections` reports `family` and `query_language`; add structured tools only
+  when they spare agents a syntax, and build them into the same command and guard.
+
 ## 8. Docs
 
 - Add the engine where the supported ones are listed: `README.md`, `docs/FEATURES.md` (including
