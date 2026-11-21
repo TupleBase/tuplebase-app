@@ -9839,7 +9839,7 @@ dependencies = [
 
 [[package]]
 name = "tuplebase-app"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -9853,7 +9853,7 @@ dependencies = [
 
 [[package]]
 name = "tuplebase-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -9886,7 +9886,7 @@ dependencies = [
 
 [[package]]
 name = "tuplebase-mcp"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "rmcp",
