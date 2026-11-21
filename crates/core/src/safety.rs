@@ -489,6 +489,9 @@ pub fn check_read_only(adapter: Adapter, sql: &str) -> Result<(), String> {
 /// so no difference in reading quotes can hide a second statement or a comment.
 /// `db` then sends the statement alone, with `ExecuteStatement`, which takes exactly
 /// one; never `BatchExecuteStatement` or `ExecuteTransaction`.
+/// The longest PartiQL statement DynamoDB accepts.
+const PARTIQL_MAX_LEN: usize = 8192;
+
 pub fn check_partiql(adapter: Adapter, sql: &str) -> Result<(), String> {
     if adapter.info().script != ScriptFlavor::PartiQl {
         return Err(format!(
@@ -498,6 +501,22 @@ pub fn check_partiql(adapter: Adapter, sql: &str) -> Result<(), String> {
     }
     // Checked as it will be sent: `db` passes statements without their closing `;`.
     let statement = sql.trim();
+    // DynamoDB refuses longer statements anyway; refusing first keeps the check cheap.
+    if statement.len() > PARTIQL_MAX_LEN {
+        return Err(format!(
+            "read-only: a statement can be at most {PARTIQL_MAX_LEN} characters"
+        ));
+    }
+    // Outside strings and quoted names, only printable ASCII and plain line breaks: a
+    // Unicode separator or control character the server might read as a break between
+    // statements never reaches it.
+    let odd = |c: char| !(c.is_ascii_graphic() || matches!(c, ' ' | '\t' | '\r' | '\n'));
+    if tokens(adapter, statement).any(|(kind, text)| kind != Token::Quoted && text.chars().any(odd))
+    {
+        return Err(
+            "read-only: outside quotes, only plain ASCII text and line breaks are allowed".into(),
+        );
+    }
     if statement.contains(';') {
         return Err("read-only: run one statement at a time, with no ; in it".into());
     }
@@ -1621,9 +1640,23 @@ mod tests {
             "SELECTED FROM users",
             "SEL\u{a0}ECT * FROM users",
             "'SELECT' FROM users",
+            // Unicode separators and controls the server might read as a break.
+            "SELECT * FROM users\u{37e} DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users\u{ff1b} DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users\u{2028}DELETE FROM users WHERE pk = 'a'",
+            "SELECT * FROM users\u{200b}",
+            "SELECT * FROM users\u{feff}",
+            "SELECT * FROM users\u{85}WHERE a = 1",
+            "SELECT * FROM users\u{0}DELETE FROM users",
+            "SELECT * FROM users\u{b}WHERE a = 1",
         ] {
             assert!(refused(sql), "{sql:?}");
         }
+        // Too long, even if harmless.
+        let long = format!("SELECT * FROM users WHERE a = '{}'", "x".repeat(8200));
+        assert!(refused(&long));
+        // Unicode inside a string or a quoted name is fine.
+        assert!(!refused("SELECT * FROM \"café\" WHERE a = 'naïve\u{2028}'"));
         // Only for PartiQL.
         assert!(check_partiql(Adapter::Postgres, "SELECT 1").is_err());
     }
