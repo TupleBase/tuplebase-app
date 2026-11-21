@@ -982,14 +982,21 @@ impl Config {
 
     /// Adds `conn`, or replaces the connection currently named `previous` (a rename
     /// when the names differ).
+    ///
+    /// Names are unique ignoring case, since the OS credential store keys passwords by
+    /// name and Windows' ignores case. A rename may change only the case. A connection
+    /// whose name is unchanged still saves when a file from before this rule holds
+    /// another that differs only in case.
     pub fn upsert(&mut self, conn: Connection, previous: Option<&str>) -> Result<()> {
         conn.validate()?;
-        let clash = self
-            .connections
-            .iter()
-            .any(|c| c.name == conn.name && Some(c.name.as_str()) != previous);
-        if clash {
-            bail!("a connection named \"{}\" already exists", conn.name);
+        let unchanged = previous == Some(conn.name.as_str());
+        let lower = conn.name.to_lowercase();
+        let clash = self.connections.iter().find(|c| {
+            Some(c.name.as_str()) != previous
+                && (c.name == conn.name || (!unchanged && c.name.to_lowercase() == lower))
+        });
+        if let Some(existing) = clash {
+            bail!("a connection named \"{}\" already exists", existing.name);
         }
         match previous.and_then(|p| self.connections.iter().position(|c| c.name == p)) {
             Some(i) => self.connections[i] = conn,
@@ -1096,6 +1103,26 @@ mod tests {
         conn.name = "b".into();
         conn.color = "blue".into();
         assert!(config.upsert(conn, None).is_err());
+    }
+
+    /// The OS credential store keys passwords by name, and Windows' ignores case.
+    #[test]
+    fn names_are_unique_ignoring_case_and_can_change_only_case() {
+        let mut config = Config::default();
+        config.upsert(pg("prod"), None).unwrap();
+        let error = config.upsert(pg("PROD"), None).unwrap_err().to_string();
+        assert!(error.contains("already exists"), "{error}");
+        config.upsert(pg("other"), None).unwrap();
+        assert!(config.upsert(pg("Prod"), Some("other")).is_err());
+        // A rename only by case is allowed.
+        config.upsert(pg("Prod"), Some("prod")).unwrap();
+        let names: Vec<_> = config.connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Prod", "other"]);
+        // A file from before this rule may hold two such names: each still saves.
+        config.connections.push(pg("PROD"));
+        config.upsert(pg("PROD"), Some("PROD")).unwrap();
+        config.upsert(pg("Prod"), Some("Prod")).unwrap();
+        assert!(config.upsert(pg("prod"), Some("PROD")).is_err());
     }
 
     fn sqlite(file: &str) -> Connection {

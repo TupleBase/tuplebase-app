@@ -315,8 +315,14 @@ impl ConnForm {
         };
         let uses_ssh = ssh.is_some();
         let auth = self.auth(cx);
-        let password = visible(&self.password, auth.is_password(), cx);
-        let ssh_password = text(&self.ssh_password, cx);
+        // Secrets are kept exactly as typed: spaces can be part of a password.
+        let secret = |input: &Entity<InputState>, cx: &App| input.read(cx).value().to_string();
+        let password = if auth.is_password() {
+            secret(&self.password, cx)
+        } else {
+            String::new()
+        };
+        let ssh_password = secret(&self.ssh_password, cx);
         cx.emit(ConnFormEvent::Save {
             connection: Connection {
                 name: text(&self.name, cx),
