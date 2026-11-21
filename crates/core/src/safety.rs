@@ -36,9 +36,22 @@ enum Token {
     Other,
 }
 
+/// Where a backslash escapes a quote in MySQL and MariaDB strings. The server's
+/// `sql_mode` decides, and the guard can't know it, so a check that looks inside the code
+/// tries each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Escapes {
+    /// In `'...'` and `"..."`: the default.
+    Both,
+    /// In neither: `NO_BACKSLASH_ESCAPES`.
+    Neither,
+    /// In `'...'` only, as `"..."` quotes a name: `ANSI_QUOTES`.
+    Single,
+}
+
 /// The token at byte `i` of `sql`, which is on a character boundary, and its length in
-/// bytes.
-fn token(flavor: ScriptFlavor, sql: &str, i: usize) -> (Token, usize) {
+/// bytes. `escapes` only matters on MySQL and MariaDB.
+fn token(flavor: ScriptFlavor, escapes: Escapes, sql: &str, i: usize) -> (Token, usize) {
     let postgres = flavor == ScriptFlavor::Postgres;
     let mysql = flavor == ScriptFlavor::Mysql;
     let bytes = sql.as_bytes();
@@ -78,7 +91,13 @@ fn token(flavor: ScriptFlavor, sql: &str, i: usize) -> (Token, usize) {
                 && i > 0
                 && bytes[i - 1].eq_ignore_ascii_case(&b'e')
                 && (i == 1 || !is_word(bytes[i - 2]));
-            let backslashes = quote != b'`' && (mysql || escape_string);
+            let mysql_escapes = mysql
+                && match escapes {
+                    Escapes::Both => true,
+                    Escapes::Neither => false,
+                    Escapes::Single => quote == b'\'',
+                };
+            let backslashes = quote != b'`' && (mysql_escapes || escape_string);
             (
                 Token::Quoted,
                 quoted_len(rest.as_bytes(), quote, backslashes),
@@ -105,13 +124,22 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Each token of `sql` with the text it covers.
+/// Each token of `sql` with the text it covers, reading strings as a server with the
+/// default `sql_mode` does.
 fn tokens(adapter: Adapter, sql: &str) -> impl Iterator<Item = (Token, &str)> {
+    tokens_with(adapter, Escapes::Both, sql)
+}
+
+fn tokens_with(
+    adapter: Adapter,
+    escapes: Escapes,
+    sql: &str,
+) -> impl Iterator<Item = (Token, &str)> {
     let flavor = adapter.info().script;
     let mut i = 0;
     std::iter::from_fn(move || {
         (i < sql.len()).then(|| {
-            let (kind, len) = token(flavor, sql, i);
+            let (kind, len) = token(flavor, escapes, sql, i);
             let text = &sql[i..i + len];
             i += len;
             (kind, text)
@@ -311,7 +339,12 @@ pub fn check_read_only(adapter: Adapter, sql: &str) -> Result<(), String> {
     if adapter.info().script == ScriptFlavor::Mysql && has_executable_comment(adapter, sql) {
         return Err("read-only: executable comments (/*! ... */) are not allowed".into());
     }
-    if writes_a_file(&normalized(sql)) || writes_a_file(&normalized(&code(adapter, sql))) {
+    // Where a MySQL string ends depends on the server's `sql_mode`, so the code is read
+    // each way it might be.
+    let in_code = [Escapes::Both, Escapes::Neither, Escapes::Single]
+        .into_iter()
+        .any(|escapes| writes_a_file(&normalized(&code(adapter, escapes, sql))));
+    if in_code || writes_a_file(&normalized(sql)) {
         return Err("read-only: SELECT ... INTO OUTFILE/DUMPFILE is not allowed".into());
     }
     Ok(())
@@ -329,8 +362,8 @@ fn has_executable_comment(adapter: Adapter, sql: &str) -> bool {
 
 /// The code in `sql`, as the engine reads it: each comment becomes a space, and each
 /// string or quoted name a `?` between spaces.
-fn code(adapter: Adapter, sql: &str) -> String {
-    tokens(adapter, sql)
+fn code(adapter: Adapter, escapes: Escapes, sql: &str) -> String {
+    tokens_with(adapter, escapes, sql)
         .map(|(kind, text)| match kind {
             Token::Space | Token::Comment | Token::Executable => " ",
             Token::Quoted => " ? ",
@@ -490,6 +523,10 @@ mod tests {
                 "/*M!SET GLOBAL general_log=1, @a=*/ (SELECT 1)",
                 // With NO_BACKSLASH_ESCAPES the string ends at `\'`, so the comment runs.
                 r"select 'a\' /*! into outfile '/x' */ -- '",
+                // The same, for a check that reads past the string.
+                r"select 'a\' into/*x*/outfile '/x' -- '",
+                r#"select "a\" into/*x*/outfile '/x' -- ""#,
+                "select 'a\\' into -- x\n outfile '/x' -- '",
             ] {
                 assert!(check_read_only(adapter, sql).is_err(), "{adapter:?}: {sql}");
             }

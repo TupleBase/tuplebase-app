@@ -459,4 +459,35 @@ mod tests {
         assert!(!renewal.due(at(4 * 60 - 1)));
         assert!(renewal.due(at(4 * 60)));
     }
+
+    /// Part of the read-only guard (S2): whatever the statement check lets through, the
+    /// read-only pool's connections can't write, also after the options change.
+    #[tokio::test]
+    async fn sqlite_read_only_work_runs_on_connections_that_cannot_write() {
+        use sqlx::Executor;
+        let dir = tempfile::tempdir().unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(dir.path().join("app.sqlite"))
+            .create_if_missing(true);
+        let opened = open_pool(Options::Sqlite(options.clone())).await.unwrap();
+        let renewed = open_pool(Options::Sqlite(options.clone())).await.unwrap();
+        renewed.set_options(Options::Sqlite(options));
+        let (Pool::Sqlite(opened), Pool::Sqlite(renewed)) = (opened, renewed) else {
+            unreachable!()
+        };
+        opened
+            .main
+            .execute("CREATE TABLE t (a); INSERT INTO t VALUES (1)")
+            .await
+            .unwrap();
+        for pools in [&opened, &renewed] {
+            let write = "PRAGMA query_only = OFF; DELETE FROM t";
+            assert!(pools.read_only.execute(write).await.is_err());
+            let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+                .fetch_one(&pools.read_only)
+                .await
+                .unwrap();
+            assert_eq!(rows, 1);
+        }
+    }
 }

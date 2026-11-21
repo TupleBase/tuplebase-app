@@ -155,3 +155,38 @@ pub(super) fn value(row: &SqliteRow, i: usize) -> Value {
     );
     fallback(row, i, &type_name)
 }
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    use super::*;
+
+    /// Part of the read-only guard (S2): SQLite's own parser decides how many statements
+    /// there are, whatever the guard's splitter made of them.
+    #[tokio::test]
+    async fn only_one_statement_passes() {
+        let pool =
+            SqlitePoolOptions::new().connect_lazy_with(SqliteConnectOptions::new().in_memory(true));
+        for sql in [
+            "SELECT 1",
+            "SELECT 1;",
+            "SELECT 1; -- note",
+            "SELECT 1 /* ; */ ; /* end */",
+            "SELECT 1 AS [a;b], 'c;d'",
+        ] {
+            assert!(check_one_statement(&pool, sql).await.is_ok(), "{sql}");
+        }
+        for sql in [
+            "SELECT 1; SELECT 2",
+            "SELECT 1; VACUUM INTO 'copy.sqlite'",
+            "SELECT 1 AS [x'] ; PRAGMA query_only = OFF; SELECT 2 AS ['y]",
+            "SELECT 1; SELECT * FROM missing",
+            "SELECT * FROM missing",
+        ] {
+            assert!(check_one_statement(&pool, sql).await.is_err(), "{sql}");
+        }
+        let missing = check_one_statement(&pool, "SELECT * FROM missing").await;
+        assert!(missing.unwrap_err().to_string().contains("missing"));
+    }
+}
