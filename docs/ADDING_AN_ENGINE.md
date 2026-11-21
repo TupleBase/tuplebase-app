@@ -6,7 +6,7 @@ variant exists. The rules referred to by ID are in [ARCHITECTURE.md](../ARCHITEC
 
 Where an engine's code lives:
 
-- **Static facts** (name, default port, file or server, identifier quoting, script splitting):
+- **Static facts** (name, default port, family, place, identifier quoting, script splitting):
   one `EngineInfo` constant in `core/src/config.rs`, returned by `Adapter::info`. `config`
   imports no other module (L5), so `safety`, the connection form and the AWS code can all read it.
 - **Its SQL** (catalog queries, read-only statements, object sources, routine calls, value
@@ -16,8 +16,8 @@ Where an engine's code lives:
   `connect` and `renew`, and the `Pool` variant in `core/src/db.rs`. `core/src/db/connect.rs`
   keeps only what every engine shares (credentials, the SSH tunnel, renewing IAM tokens, the RDS
   authorities and the pool's size and timeout), so a new engine doesn't change it. Which
-  credentials and tunnels apply is decided by `is_file`, in `core/src/credentials.rs` and
-  `Connection::validate`.
+  credentials and tunnels apply is decided by the engine's `place` (`Adapter::is_file`), in
+  `core/src/credentials.rs` and `Connection::validate`.
 - **How it looks**: its logo and color in `app/src/logos.rs`.
 
 Engines that work alike share a module, as MySQL and MariaDB share `db/mysql.rs`. Branch on the
@@ -48,15 +48,17 @@ Engines that work alike share a module, as MySQL and MariaDB share `db/mysql.rs`
    connection form's buttons.
 2. Add an `EngineInfo` constant and its arm in `Adapter::info`. It holds the label shown to people
    (which also names the form's button, `adapter-<label>`), the default port (0 for a file),
-   `is_file`, the `IdentQuote` style and the `ScriptFlavor`.
+   the `family` (`Family::Sql` for an SQL engine), the `place` (`Place::Server` or
+   `Place::File`), the `IdentQuote` style and the `ScriptFlavor`.
 3. If the engine quotes names in a new way, such as `[name]` on SQL Server, add an `IdentQuote`
    variant. The compiler then asks for its arm in `Adapter::quote_ident`.
 4. If the first 100 rows can't be read with `LIMIT 100`, as on SQL Server, which uses `TOP 100`,
-   make `Adapter::preview_sql` depend on the engine through a new `EngineInfo` field.
-5. Add the variant to the `every_adapter_is_listed_once` test, and its facts to
-   `each_engine_has_its_own_facts`.
+   make `Adapter::preview_query` depend on the engine through a new `EngineInfo` field.
+5. Add the variant to the `every_adapter_is_listed_once` test, its facts to
+   `each_engine_has_its_own_facts` and `each_engine_has_its_family_and_place`, and its preview
+   to `preview_query_is_the_sql_it_always_was`.
 
-`Connection::validate` and `Connection::location` treat a file engine (`is_file`) like SQLite.
+`Connection::validate` and `Connection::location` treat a file engine (`Place::File`) like SQLite.
 That needs no change, unless the engine is neither a plain server nor a single file.
 
 ## 2. Splitting scripts (`core/src/safety.rs`)
@@ -101,8 +103,8 @@ that builds SQL text, such as call templates or quoting.
 Add one arm per `Db` method. Each arm calls the engine module, and `db.rs` keeps only the code every
 engine shares:
 
-- `Db::test`, `Db::run`
-  (`run_all!(pool, <engine>::DIALECT, <engine>::value, <engine>::end_transaction)`),
+- `Db::test`, `Db::run` (which picks the runner by `Family`; an SQL engine's arm in the SQL runner
+  is `run_all!(pool, <engine>::DIALECT, <engine>::value, <engine>::end_transaction)`),
   `list_column_names`, `list_tables`, `list_objects`, `describe_table`, `object_definition` and
   `call_template` (a `bail!` arm if the engine has no routines, as for SQLite).
 - In the tests at the bottom of `db.rs`, add an arm to `dialect` and add the engine to
@@ -127,7 +129,7 @@ engine shares:
 - `db/connect.rs` needs no change: it resolves the credentials, opens the tunnel and keeps the
   token fresh for every engine, through `Pool::open` and `Pool::renew`.
 - Credentials and SSH tunnels apply to every server engine and to no file engine, through
-  `is_file` in `credentials::resolve_with` and `Connection::validate`. An IAM token
+  `Adapter::is_file` in `credentials::resolve_with` and `Connection::validate`. An IAM token
   (`Auth::AwsIam`) needs the driver to send the token as the password. MySQL also needs
   `enable_cleartext_plugin`. Check the engine's equivalent, or have `Connection::validate` refuse
   IAM for it.
@@ -139,7 +141,7 @@ engine shares:
 - `app/src/logos.rs`: an arm in `logo` with the SVG and a brand color dark enough for a white
   mark. The test there checks that every engine has an SVG and a color of its own.
 - The connection form (`app/src/conn_form.rs`) reads `Adapter::ALL`, the label, the default port
-  and `is_file`, so it needs no change unless the engine asks for something new.
+  and `Adapter::is_file`, so it needs no change unless the engine asks for something new.
 - Finding databases in AWS: if RDS runs the engine, map its RDS engine names to the variant in
   `adapter_for_engine` in `core/src/cloud/aws.rs`, with a test there. Check the default database
   that discovery fills in, which is `postgres` for PostgreSQL. Until it's mapped, the AWS picker

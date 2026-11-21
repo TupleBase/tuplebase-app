@@ -17,7 +17,7 @@ use gpui_kit::component::table::{DataTable, TableEvent, TableState};
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use tuplebase_core::config::Connection;
+use tuplebase_core::config::{Connection, Family};
 use tuplebase_core::db::{Db, ExecOptions, ROLLED_BACK_NOTE, ScriptResult};
 use tuplebase_core::safety;
 
@@ -100,6 +100,8 @@ pub(crate) struct ConnectionTab {
     db: Arc<Db>,
     conn: Connection,
     pub(crate) editor: Entity<EditorState>,
+    /// The schema's names, which the editor's completions offer.
+    names: SchemaNames,
     run_button: Entity<RunButton>,
     pub(crate) results: Entity<TableState<ResultsDelegate>>,
     pub(crate) row_detail: Entity<RowDetail>,
@@ -136,10 +138,9 @@ impl ConnectionTab {
         let names = SchemaNames::default();
         let editor = cx.new(|cx| {
             let mut state = EditorState::new(window, cx)
-                .language("sql")
                 .line_number(true)
                 .default_value(draft);
-            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletions::new(names.clone())));
+            Self::configure_editor(&mut state, conn.adapter.family(), &names, cx);
             state
         });
         let run_button = cx.new(|cx| {
@@ -148,7 +149,7 @@ impl ConnectionTab {
             button
         });
         // Given its connection by `start`, as loading it opens a pool.
-        let schema = cx.new(|cx| SchemaPanel::new(db.clone(), names, window, cx));
+        let schema = cx.new(|cx| SchemaPanel::new(db.clone(), names.clone(), window, cx));
         let results = cx.new(|cx| TableState::new(ResultsDelegate::default(), window, cx));
         let row_detail = cx.new(|cx| RowDetail::new(window, cx));
         let _subscriptions = vec![
@@ -187,6 +188,7 @@ impl ConnectionTab {
             db,
             conn,
             editor,
+            names,
             run_button,
             results,
             row_detail,
@@ -199,6 +201,27 @@ impl ConnectionTab {
             history,
             panels,
             _subscriptions,
+        }
+    }
+
+    /// Sets the editor's language and completions for an engine of `family`.
+    fn configure_editor(
+        editor: &mut EditorState,
+        family: Family,
+        names: &SchemaNames,
+        cx: &mut Context<EditorState>,
+    ) {
+        match family {
+            Family::Sql => {
+                editor.set_highlighter("sql", cx);
+                editor.lsp_mut().completion_provider =
+                    Some(Rc::new(SqlCompletions::new(names.clone())));
+            }
+            // No engine of these families yet: plain text, with no completions.
+            Family::Document | Family::KeyValue => {
+                editor.set_highlighter("text", cx);
+                editor.lsp_mut().completion_provider = None;
+            }
         }
     }
 
@@ -253,6 +276,14 @@ impl ConnectionTab {
         let adapter = conn.adapter;
         self.run_button
             .update(cx, |button, cx| button.set_adapter(adapter, cx));
+        // An edit can change the engine's family, and with it the editor's language.
+        let family = adapter.family();
+        if family != self.conn.adapter.family() {
+            let names = self.names.clone();
+            self.editor.update(cx, |editor, cx| {
+                Self::configure_editor(editor, family, &names, cx)
+            });
+        }
         self.conn = conn;
         cx.notify();
     }
@@ -760,6 +791,7 @@ mod tests {
     use gpui_kit::{AnyWindowHandle, AppContext as _, Entity, TestAppContext, point, px};
     use serde_json::json;
     use std::rc::Rc;
+    use tuplebase_core::config::{Adapter, Family};
     use tuplebase_core::db::{ObjectInfo, ObjectKind, QueryResult, ROLLED_BACK_NOTE};
 
     /// The test connection's tab, open and done connecting, with "SELECT 1;" in its
@@ -791,6 +823,7 @@ mod tests {
                         rows_affected: None,
                         elapsed_ms: 1,
                         note: None,
+                        documents: None,
                     });
                     table.refresh(cx);
                 });
@@ -845,6 +878,7 @@ mod tests {
                         rows_affected: None,
                         elapsed_ms: 1,
                         note: None,
+                        documents: None,
                     });
                     table.refresh(cx);
                 });
@@ -898,6 +932,7 @@ mod tests {
                     rows_affected: None,
                     elapsed_ms: 1,
                     note: None,
+                    documents: None,
                 };
                 this.results.update(cx, |table, cx| {
                     table.delegate_mut().show(&result);
@@ -922,6 +957,7 @@ mod tests {
             rows_affected: affected,
             elapsed_ms: 5,
             note: None,
+            documents: None,
         };
         assert_eq!(summary(&result(1, None, false), 1), "1 row in 5 ms");
         assert_eq!(summary(&result(2, None, true), 1), "First 2 rows in 5 ms");
@@ -940,6 +976,7 @@ mod tests {
             rows_affected: None,
             elapsed_ms: 5,
             note: None,
+            documents: None,
         };
         assert_eq!(summary(&result, 3), "3 statements. 2 rows in 5 ms");
         assert_eq!(history_label("select\n  1"), "select 1");
@@ -993,6 +1030,43 @@ mod tests {
         window_action(handle, cx, |window, cx| window.press("enter", cx));
         assert_eq!(editor_text(&tab, cx), "SELE\n");
         assert!(!menu_open(&tab, cx));
+    }
+
+    #[gpui_kit::test]
+    fn editing_the_connection_keeps_the_sql_editor(cx: &mut TestAppContext) {
+        let (handle, _, tab) = open_db(cx);
+        cx.update(|cx| {
+            tab.update(cx, |this, cx| {
+                let mut conn = this.connection().clone();
+                conn.adapter = Adapter::Mysql;
+                conn.name = "renamed".into();
+                this.set_connection(conn, cx);
+            });
+        });
+        let sql_with_completions = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let editor = tab.read(cx).editor.read(cx);
+                editor.language_name() == "sql" && editor.lsp().completion_provider.is_some()
+            })
+        };
+        assert!(sql_with_completions(cx));
+        // Configuring it again for the same family changes nothing.
+        cx.update(|cx| {
+            let (editor, names) = {
+                let this = tab.read(cx);
+                (this.editor.clone(), this.names.clone())
+            };
+            editor.update(cx, |editor, cx| {
+                ConnectionTab::configure_editor(editor, Family::Sql, &names, cx)
+            });
+        });
+        assert!(sql_with_completions(cx));
+        window_action(handle, cx, |window, cx| {
+            window.click("sql-editor", cx);
+            window.press("secondary-a", cx);
+            window.input("SELE", cx);
+        });
+        assert!(menu_open(&tab, cx));
     }
 
     #[gpui_kit::test]
@@ -1396,6 +1470,7 @@ mod tests {
                         rows_affected: None,
                         elapsed_ms: 1,
                         note: None,
+                        documents: None,
                     });
                     table.refresh(cx);
                 });
@@ -1438,6 +1513,7 @@ mod tests {
                 rows_affected: Some(1),
                 elapsed_ms: 1,
                 note: None,
+                documents: None,
             },
             statements: 2,
             changed: true,
@@ -1470,6 +1546,7 @@ mod tests {
                 rows_affected: None,
                 elapsed_ms: 1,
                 note: None,
+                documents: None,
             },
             statements: 1,
             changed: false,

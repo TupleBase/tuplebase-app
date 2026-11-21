@@ -31,7 +31,7 @@ use sqlx::postgres::PgPool;
 use sqlx::{AssertSqlSafe, Column, Executor, Row, SqlSafeStr, Statement};
 use tokio::sync::Mutex;
 
-use crate::config::{Adapter, Connection};
+use crate::config::{Adapter, Connection, Family};
 use crate::safety;
 use crate::ssh::Tunnel;
 
@@ -51,6 +51,25 @@ pub struct QueryResult {
     /// [`Db::execute`], whose result is all an agent sees.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<&'static str>,
+    /// The exact documents a document or key-value engine returned, one per row;
+    /// `columns` and `rows` then hold them flattened for the table. Never set for SQL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub documents: Option<Vec<Value>>,
+}
+
+impl QueryResult {
+    /// The result as an agent gets it. Unchanged for SQL; with documents, the flattened
+    /// `columns` and `rows` are dropped, as the documents hold the same data exactly.
+    pub fn for_agent(self) -> Self {
+        match self.documents {
+            None => self,
+            Some(_) => Self {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                ..self
+            },
+        }
+    }
 }
 
 /// Said when a run left a transaction open and it was rolled back, so nothing it
@@ -507,6 +526,15 @@ impl Db {
         statements: &[&str],
         opts: ExecOptions,
     ) -> Result<ScriptResult> {
+        // Each family has its own runner. SQL's is the rest of this function rather than a
+        // second async fn: one more level of nested futures overflows the compiler's query
+        // depth limit in callers such as the integration tests.
+        match conn.adapter.family() {
+            Family::Sql => {}
+            Family::Document | Family::KeyValue => {
+                bail!("{} can't run queries yet", conn.adapter.label())
+            }
+        }
         let read_only = opts.read_only || conn.readonly;
         if read_only {
             for statement in statements {
@@ -862,6 +890,7 @@ macro_rules! run {
                     rows_affected: Some(done.rows_affected()),
                     elapsed_ms: 0,
                     note: None,
+                    documents: None,
                 });
             }
             // One statement; its results and the end of each result set.
@@ -912,6 +941,7 @@ macro_rules! run {
                 rows_affected: None,
                 elapsed_ms: 0,
                 note: None,
+                documents: None,
             })
         }
         .await
@@ -922,6 +952,43 @@ use run;
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    fn sql_result() -> QueryResult {
+        QueryResult {
+            columns: vec!["id".into(), "name".into()],
+            rows: vec![vec![1.into(), "a".into()]],
+            truncated: true,
+            rows_affected: None,
+            elapsed_ms: 3,
+            note: Some(ROLLED_BACK_NOTE),
+            documents: None,
+        }
+    }
+
+    #[test]
+    fn agents_get_sql_results_as_before() {
+        let result = sql_result();
+        let before = serde_json::to_string(&result).unwrap();
+        assert_eq!(serde_json::to_string(&result.for_agent()).unwrap(), before);
+        // The keys agents always got, and no `documents`.
+        assert_eq!(
+            before,
+            format!(
+                r#"{{"columns":["id","name"],"rows":[[1,"a"]],"truncated":true,"rows_affected":null,"elapsed_ms":3,"note":"{ROLLED_BACK_NOTE}"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn agents_get_documents_without_their_flattened_rows() {
+        let result = QueryResult {
+            documents: Some(vec![serde_json::json!({"_id": 1, "tags": ["a"]})]),
+            ..sql_result()
+        }
+        .for_agent();
+        assert!(result.columns.is_empty() && result.rows.is_empty());
+        assert_eq!(result.documents.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn a_connection_still_opening_does_not_hold_up_the_list() {
