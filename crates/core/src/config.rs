@@ -74,6 +74,7 @@ pub enum Adapter {
     Redshift,
     Mongodb,
     Documentdb,
+    Dynamodb,
 }
 
 /// How a database quotes an identifier such as a table name.
@@ -105,6 +106,10 @@ pub enum ScriptFlavor {
     /// `;` or at a line break outside brackets, unless the next line starts with `.`.
     /// Read by the same scanner as the parser, `mongo_shell::split`.
     MongoShell,
+    /// DynamoDB's PartiQL: `'...'` strings and `"..."` names with the quote doubled
+    /// inside and no backslash escapes, `--` and `/* */` comments that don't nest.
+    /// Backticks are not read as quotes, so a `;` after one still ends a statement.
+    PartiQl,
 }
 
 /// The kind of query language and data model an engine has. Decides which runner,
@@ -161,6 +166,8 @@ const PASSWORD_AUTH: &[AuthKind] = &[
 ];
 /// A file: no sign-in, so only the default, which asks for nothing.
 const FILE_AUTH: &[AuthKind] = &[AuthKind::Password];
+/// A service in an AWS region: signed by the AWS SDK with a profile's credentials.
+const AWS_REGION_AUTH: &[AuthKind] = &[AuthKind::AwsIam];
 
 const POSTGRES: EngineInfo = EngineInfo {
     label: "PostgreSQL",
@@ -240,8 +247,19 @@ const DOCUMENTDB: EngineInfo = EngineInfo {
     auth: PASSWORD_AUTH,
 };
 
+const DYNAMODB: EngineInfo = EngineInfo {
+    label: "Amazon DynamoDB",
+    default_port: 0,
+    family: Family::KeyValue,
+    place: Place::AwsRegion,
+    user_hint: "",
+    quote: IdentQuote::Double,
+    script: ScriptFlavor::PartiQl,
+    auth: AWS_REGION_AUTH,
+};
+
 impl Adapter {
-    pub const ALL: [Adapter; 7] = [
+    pub const ALL: [Adapter; 8] = [
         Adapter::Postgres,
         Adapter::Mariadb,
         Adapter::Mysql,
@@ -249,6 +267,7 @@ impl Adapter {
         Adapter::Redshift,
         Adapter::Mongodb,
         Adapter::Documentdb,
+        Adapter::Dynamodb,
     ];
 
     /// This engine's static facts. A new engine adds its constant here.
@@ -261,12 +280,19 @@ impl Adapter {
             Adapter::Redshift => &REDSHIFT,
             Adapter::Mongodb => &MONGODB,
             Adapter::Documentdb => &DOCUMENTDB,
+            Adapter::Dynamodb => &DYNAMODB,
         }
     }
 
     /// Whether the database is a local file, with no server, user or password.
     pub fn is_file(self) -> bool {
         self.info().place == Place::File
+    }
+
+    /// Whether the engine is a service in an AWS region, reached with an AWS profile
+    /// rather than a host, user and password.
+    pub fn is_aws_region(self) -> bool {
+        self.info().place == Place::AwsRegion
     }
 
     pub fn family(self) -> Family {
@@ -759,10 +785,22 @@ impl Connection {
             .all(|word| fields.iter().any(|field| field.contains(word)))
     }
 
-    /// Where it connects to, for display: the host, a database file's name, or the
-    /// secret that names the host.
+    /// Where it connects to, for display: the host, a database file's name, the
+    /// secret that names the host, or for a service in an AWS region its endpoint URL or
+    /// region.
     pub fn location(&self) -> String {
-        if self.adapter.is_file() {
+        if self.adapter.is_aws_region() {
+            if !self.host.trim().is_empty() {
+                self.host.clone()
+            } else {
+                let region = self.auth.aws_profile().map_or("", |(_, region)| region);
+                if region.is_empty() {
+                    "the AWS profile's region".to_owned()
+                } else {
+                    region.to_owned()
+                }
+            }
+        } else if self.adapter.is_file() {
             let name = Path::new(&self.database).file_name();
             name.map_or_else(
                 || self.database.clone(),
@@ -821,11 +859,56 @@ impl Connection {
         Ok(())
     }
 
+    /// The rules for a service in an AWS region, such as DynamoDB: it signs in with an
+    /// AWS profile only, has no tunnel or encryption setting (the SDK always uses
+    /// HTTPS to AWS), and its host, when set, is an endpoint URL.
+    fn check_aws_region(&self) -> Result<()> {
+        let label = self.adapter.label();
+        let Auth::AwsIam(iam) = &self.auth else {
+            bail!(
+                "{label} signs in with an AWS profile, not a password or a secret, for \"{}\"",
+                self.name
+            );
+        };
+        if self.ssh.is_some() {
+            bail!("SSH tunnels don't apply to {label}");
+        }
+        if self.tls != TlsMode::default() {
+            bail!(
+                "the encryption setting doesn't apply to {label}: AWS is always reached over HTTPS"
+            );
+        }
+        let endpoint = self.host.trim();
+        if endpoint.is_empty() {
+            return Ok(());
+        }
+        let rest = endpoint
+            .strip_prefix("https://")
+            .or_else(|| endpoint.strip_prefix("http://"));
+        match rest {
+            Some(rest) if !rest.is_empty() && !endpoint.contains(char::is_whitespace) => {}
+            _ => bail!(
+                "the endpoint URL must start with https:// or http://, such as http://localhost:8000"
+            ),
+        }
+        // Over plain HTTP a profile's session token would travel in the clear; DynamoDB
+        // Local takes any credentials, so it is reached without the profile's.
+        if endpoint.starts_with("http://") && !iam.profile.trim().is_empty() {
+            bail!(
+                "an http:// endpoint is for DynamoDB Local, which needs no AWS profile: \
+                 leave the profile empty, or use https://"
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         if self.name.trim().is_empty() {
             bail!("connection name is required");
         }
-        if self.adapter.is_file() {
+        if self.adapter.is_aws_region() {
+            self.check_aws_region()?;
+        } else if self.adapter.is_file() {
             if self.database.trim().is_empty() {
                 bail!("a database file is required for \"{}\"", self.name);
             }
@@ -1630,6 +1713,7 @@ mod tests {
             Adapter::Redshift => 4,
             Adapter::Mongodb => 5,
             Adapter::Documentdb => 6,
+            Adapter::Dynamodb => 7,
         };
         for (i, adapter) in Adapter::ALL.into_iter().enumerate() {
             assert_eq!(position(adapter), i);
@@ -1648,11 +1732,12 @@ mod tests {
                 "SQLite",
                 "Redshift",
                 "MongoDB",
-                "Amazon DocumentDB"
+                "Amazon DocumentDB",
+                "Amazon DynamoDB"
             ]
         );
         let ports = Adapter::ALL.map(Adapter::default_port);
-        assert_eq!(ports, [5432, 3306, 3306, 0, 5439, 27017, 27017]);
+        assert_eq!(ports, [5432, 3306, 3306, 0, 5439, 27017, 27017, 0]);
         let users = Adapter::ALL.map(Adapter::user_hint);
         assert_eq!(
             users,
@@ -1663,16 +1748,23 @@ mod tests {
                 "",
                 "awsuser",
                 "admin",
-                "docdbadmin"
+                "docdbadmin",
+                ""
             ]
         );
         for adapter in Adapter::ALL {
             // Only a server has a port, and a user.
             let info = adapter.info();
-            let is_file = info.place == Place::File;
-            assert_eq!(is_file, info.default_port == 0, "{}", info.label);
-            assert_eq!(is_file, info.user_hint.is_empty(), "{}", info.label);
+            let is_server = info.place == Place::Server;
+            assert_eq!(is_server, info.default_port != 0, "{}", info.label);
+            assert_eq!(is_server, !info.user_hint.is_empty(), "{}", info.label);
         }
+        assert_eq!(Adapter::Dynamodb.info().script, ScriptFlavor::PartiQl);
+        assert!(Adapter::Dynamodb.is_aws_region() && !Adapter::Dynamodb.is_file());
+        assert_eq!(
+            serde_json::to_string(&Adapter::Dynamodb).unwrap(),
+            r#""dynamodb""#
+        );
         assert!(Adapter::Sqlite.is_file());
         assert_eq!(Adapter::Sqlite.quote_ident(r#"a"b"#), r#""a""b""#);
         assert_eq!(Adapter::Mysql.quote_ident("a`b"), "`a``b`");
@@ -1716,7 +1808,8 @@ mod tests {
                 Family::Sql,
                 Family::Sql,
                 Family::Document,
-                Family::Document
+                Family::Document,
+                Family::KeyValue
             ]
         );
         let places = Adapter::ALL.map(|a| a.info().place);
@@ -1729,7 +1822,8 @@ mod tests {
                 Place::File,
                 Place::Server,
                 Place::Server,
-                Place::Server
+                Place::Server,
+                Place::AwsRegion
             ]
         );
         for adapter in Adapter::ALL {
@@ -1754,6 +1848,7 @@ mod tests {
                 r#"SELECT * FROM "my""s`c"."users" LIMIT 100"#,
                 r#"db.getSiblingDB("my\"s`c").getCollection("users").find({}).limit(100)"#,
                 r#"db.getSiblingDB("my\"s`c").getCollection("users").find({}).limit(100)"#,
+                r#"SELECT * FROM "users""#,
             ]
         );
     }
@@ -2402,7 +2497,7 @@ mod tests {
 
     #[test]
     fn each_engine_offers_only_the_sign_ins_it_takes() {
-        for adapter in Adapter::ALL {
+        for adapter in Adapter::ALL.into_iter().filter(|a| !a.is_aws_region()) {
             let kinds = adapter.auth_kinds();
             assert_eq!(kinds.first(), Some(&AuthKind::Password), "{adapter:?}");
             let iam = kinds.contains(&AuthKind::AwsIam);
@@ -2413,6 +2508,80 @@ mod tests {
             assert_eq!(iam, expected, "{adapter:?}");
         }
         assert_eq!(Adapter::Sqlite.auth_kinds(), [AuthKind::Password]);
+        // An AWS service signs in with a profile and nothing else.
+        assert_eq!(Adapter::Dynamodb.auth_kinds(), [AuthKind::AwsIam]);
+    }
+
+    fn dynamo(profile: &str, region: &str, endpoint: &str) -> Connection {
+        Connection {
+            adapter: Adapter::Dynamodb,
+            host: endpoint.into(),
+            port: 0,
+            database: String::new(),
+            user: String::new(),
+            auth: Auth::AwsIam(AwsIamAuth {
+                profile: profile.into(),
+                region: region.into(),
+            }),
+            ..pg("d")
+        }
+    }
+
+    #[test]
+    fn dynamodb_connections_are_validated() {
+        assert!(dynamo("prod", "eu-west-1", "").validate().is_ok());
+        assert!(dynamo("", "", "").validate().is_ok(), "the default profile");
+        assert!(dynamo("", "", "http://localhost:8000").validate().is_ok());
+        assert!(
+            dynamo("prod", "", "https://dynamodb.eu-west-1.amazonaws.com")
+                .validate()
+                .is_ok()
+        );
+        // A profile's session token would go in the clear.
+        let http = dynamo("prod", "", "http://localhost:8000").validate();
+        assert!(http.unwrap_err().to_string().contains("http://"));
+        for endpoint in ["localhost:8000", "ftp://x", "http://", "http://a b"] {
+            assert!(dynamo("", "", endpoint).validate().is_err(), "{endpoint}");
+        }
+        for auth in [
+            Auth::Password,
+            Auth::AwsSecret(AwsSecretRef::default()),
+            Auth::AwsParameter(AwsSecretRef::default()),
+        ] {
+            let conn = Connection {
+                auth,
+                ..dynamo("", "", "")
+            };
+            assert!(conn.validate().is_err(), "{:?}", conn.auth);
+        }
+        let tunneled = Connection {
+            ssh: Some(ssh()),
+            ..dynamo("", "", "")
+        };
+        assert!(tunneled.validate().unwrap_err().to_string().contains("SSH"));
+        for tls in [TlsMode::Require, TlsMode::Verify] {
+            let conn = Connection {
+                tls,
+                ..dynamo("", "", "")
+            };
+            assert!(conn.validate().is_err(), "{tls:?}");
+        }
+    }
+
+    #[test]
+    fn dynamodb_shows_its_endpoint_or_region() {
+        assert_eq!(dynamo("", "eu-west-1", "").location(), "eu-west-1");
+        assert_eq!(
+            dynamo("", "eu-west-1", "http://localhost:8000").location(),
+            "http://localhost:8000"
+        );
+        assert_eq!(dynamo("", "", "").location(), "the AWS profile's region");
+        let json = serde_json::to_value(dynamo("prod", "eu-west-1", "")).unwrap();
+        assert_eq!(json["adapter"], "dynamodb");
+        assert_eq!(
+            json["auth"],
+            serde_json::json!({"type": "aws_iam", "profile": "prod", "region": "eu-west-1"})
+        );
     }
 
     #[test]

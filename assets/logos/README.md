@@ -1,7 +1,7 @@
 # Database logos
 
 Used only to show which database a connection is. PostgreSQL, MariaDB, MySQL and SQLite names and
-logos, and the MongoDB, Amazon Redshift and Amazon DocumentDB names, are trademarks of their
+logos, and the MongoDB, Amazon Redshift, Amazon DocumentDB and Amazon DynamoDB names, are trademarks of their
 owners; TupleBase is not affiliated with or endorsed by them.
 
 Unmodified single marks, which the app draws in one color on a colored tile:
@@ -18,6 +18,8 @@ Drawn for TupleBase, not a vendor's logo:
 - `mongodb.svg`: a plain leaf drawn for MongoDB, not MongoDB's own logo
 - `documentdb.svg`: stacked documents drawn for Amazon DocumentDB, instead of AWS's own service
   icon
+- `dynamodb.svg`: a plain key drawn for Amazon DynamoDB, whose items are reached by key, instead
+  of AWS's own service icon
 
 # Agent logos
 

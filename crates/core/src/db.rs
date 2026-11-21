@@ -1,5 +1,5 @@
-//! Database access for PostgreSQL, MariaDB/MySQL, SQLite, Redshift, and MongoDB and
-//! Amazon DocumentDB.
+//! Database access for PostgreSQL, MariaDB/MySQL, SQLite, Redshift, MongoDB and
+//! Amazon DocumentDB, and Amazon DynamoDB.
 //!
 //! Async API; callers provide a Tokio runtime. One pool per connection, cached by
 //! name and rebuilt when the connection's settings change.
@@ -7,13 +7,15 @@
 //! This file holds the public API and what all engines share. Each [`Db`] method that
 //! needs engine-specific SQL picks the engine module by the pool and calls it:
 //! [`postgres`], [`mysql`] (MySQL and MariaDB), [`sqlite`], [`redshift`] and [`mongo`]
-//! (MongoDB and DocumentDB, which run shell commands rather than SQL). A feature only one engine
+//! (MongoDB and DocumentDB, which run shell commands rather than SQL) and [`dynamo`]
+//! (DynamoDB, which runs PartiQL through the AWS SDK). A feature only one engine
 //! has, such as MySQL events, lives only in that engine's module. So does connecting:
 //! [`Pool::open`] and [`Pool::renew`] call the engine module's `connect` and `renew`,
 //! and [`connect`] holds what every engine shares (credentials, tunnel, token renewal).
 
 mod connect;
 mod decode;
+mod dynamo;
 mod mongo;
 mod mysql;
 mod postgres;
@@ -331,6 +333,8 @@ enum Pool {
     Redshift(PgPool),
     /// MongoDB and DocumentDB: the driver's client, which keeps its own pool.
     Mongo(mongo::MongoPool),
+    /// DynamoDB: the AWS SDK's client.
+    Dynamo(dynamo::DynamoPool),
 }
 
 impl Pool {
@@ -354,6 +358,8 @@ impl Pool {
             Adapter::Mongodb | Adapter::Documentdb => {
                 Pool::Mongo(mongo::connect(conn, host, port, password).await?)
             }
+            // No host, port or password: an endpoint URL, if any, and an AWS profile.
+            Adapter::Dynamodb => Pool::Dynamo(dynamo::connect(conn).await?),
         })
     }
 
@@ -367,6 +373,20 @@ impl Pool {
             Pool::Redshift(p) => redshift::renew(p, conn, host, port, password),
             // Nothing renews a password on these: IAM sign-in isn't supported yet.
             Pool::Mongo(_) => {}
+            // The SDK signs each request; connecting again signs in afresh (`expired`).
+            Pool::Dynamo(_) => {}
+        }
+    }
+
+    /// Whether the credentials it signs requests with have run out, so it must be
+    /// opened again. Only DynamoDB's do: the others sign in once per connection, and a
+    /// [`Refresher`] renews what expires.
+    fn expired(&self) -> bool {
+        match self {
+            Pool::Pg(_) | Pool::My(_) | Pool::Sqlite(_) | Pool::Redshift(_) | Pool::Mongo(_) => {
+                false
+            }
+            Pool::Dynamo(p) => p.expired(),
         }
     }
 
@@ -377,6 +397,7 @@ impl Pool {
             Pool::Sqlite(p) => p.close().await,
             Pool::Redshift(p) => p.close().await,
             Pool::Mongo(p) => mongo::close(p).await,
+            Pool::Dynamo(_) => {}
         }
     }
 }
@@ -397,6 +418,7 @@ impl Open {
         same_target(&self.config, conn)
             && self.tunnel.as_ref().is_none_or(Tunnel::is_alive)
             && self.refresher.as_ref().is_none_or(|r| !r.expired())
+            && !self.pool.expired()
     }
 }
 
@@ -433,6 +455,7 @@ impl Db {
             Pool::Sqlite(p) => p.main.execute("SELECT 1").await.map(drop)?,
             Pool::Redshift(p) => p.execute("SELECT 1").await.map(drop)?,
             Pool::Mongo(p) => mongo::test(&p).await?,
+            Pool::Dynamo(p) => dynamo::test(&p).await?,
         }
         Ok(())
     }
@@ -446,6 +469,8 @@ impl Db {
         Ok(match self.pool(conn).await? {
             Pool::Pg(_) | Pool::My(_) | Pool::Sqlite(_) | Pool::Redshift(_) => None,
             Pool::Mongo(p) => p.server_read_only,
+            // Only the IAM policy could say, and reading it isn't cheap or certain.
+            Pool::Dynamo(_) => None,
         })
     }
 
@@ -562,7 +587,7 @@ impl Db {
         match conn.adapter.family() {
             Family::Sql => {}
             Family::Document => return self.run_mongo(conn, statements, opts).await,
-            Family::KeyValue => bail!("{} can't run queries yet", conn.adapter.label()),
+            Family::KeyValue => return self.run_dynamo(conn, statements, opts).await,
         }
         let read_only = opts.read_only || conn.readonly;
         if read_only {
@@ -685,6 +710,7 @@ impl Db {
             )
             .map_err(redshift::explain)?,
             Pool::Mongo(_) => bail!("MongoDB commands run in run_mongo"),
+            Pool::Dynamo(_) => bail!("DynamoDB statements run in run_dynamo"),
         }
 
         let mut result = shown.expect("callers pass at least one statement");
@@ -739,6 +765,34 @@ impl Db {
         }
     }
 
+    /// Runs PartiQL statements on DynamoDB, each alone with `ExecuteStatement`.
+    /// Read-only work is checked by the guard (S2) before the connection is opened:
+    /// one `SELECT` per statement, with no comment and no `;` in it.
+    async fn run_dynamo(
+        &self,
+        conn: &Connection,
+        statements: &[&str],
+        opts: ExecOptions,
+    ) -> Result<ScriptResult> {
+        let total = statements.len();
+        let read_only = opts.read_only || conn.readonly;
+        if read_only {
+            for (index, statement) in statements.iter().enumerate() {
+                safety::check_partiql(conn.adapter, statement).map_err(|e| {
+                    if total > 1 {
+                        anyhow!("statement {} of {total}: {e}", index + 1)
+                    } else {
+                        anyhow!(e)
+                    }
+                })?;
+            }
+        }
+        let Pool::Dynamo(pool) = self.pool(conn).await? else {
+            bail!("\"{}\" is not a DynamoDB connection", conn.name);
+        };
+        dynamo::run(&pool, conn.adapter, statements, read_only, opts.max_rows).await
+    }
+
     /// Column names across the connection's tables, for autocomplete.
     pub async fn list_column_names(&self, conn: &Connection) -> Result<Vec<String>> {
         let rows = match self.pool(conn).await? {
@@ -747,7 +801,7 @@ impl Db {
             Pool::Sqlite(p) => sqlite::column_names(&p.main).await?,
             Pool::Redshift(p) => redshift::column_names(&p).await?,
             // Fields are only known from samples, taken per collection.
-            Pool::Mongo(_) => Vec::new(),
+            Pool::Mongo(_) | Pool::Dynamo(_) => Vec::new(),
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
@@ -759,6 +813,7 @@ impl Db {
             Pool::Sqlite(p) => sqlite::tables(&p.main).await?,
             Pool::Redshift(p) => redshift::tables(&p).await?,
             Pool::Mongo(p) => return mongo::tables(&p).await,
+            Pool::Dynamo(p) => return dynamo::tables(&p).await,
         };
         Ok(rows
             .into_iter()
@@ -775,12 +830,14 @@ impl Db {
             Pool::Sqlite(p) => sqlite::list_objects(&p.main).await,
             Pool::Redshift(p) => redshift::list_objects(&p).await,
             Pool::Mongo(p) => mongo::list_objects(&p).await,
+            Pool::Dynamo(p) => dynamo::list_objects(&p).await,
         })
     }
 
     /// Columns of `table`; `schema` defaults to `public` (PostgreSQL, Redshift) or the
     /// connection's database (MariaDB/MySQL, MongoDB). On MongoDB and DocumentDB, the
-    /// fields of a sample of the collection's documents.
+    /// fields of a sample of the collection's documents; on DynamoDB, the table's keys
+    /// and the attributes of a sample of its items (`schema`, the region, is unused).
     pub async fn describe_table(
         &self,
         conn: &Connection,
@@ -794,6 +851,7 @@ impl Db {
             Pool::Redshift(p) => redshift::columns(&p, schema, table).await?,
             // An empty collection has no fields to show, and is still there.
             Pool::Mongo(p) => return mongo::fields(&p, schema, table).await,
+            Pool::Dynamo(p) => return dynamo::describe(&p, table).await,
         };
         if rows.is_empty() {
             bail!("table \"{table}\" not found");
@@ -821,6 +879,7 @@ impl Db {
             Pool::Sqlite(p) => sqlite::object_definition(&p.main, object).await?,
             Pool::Redshift(p) => redshift::object_definition(&p, object).await?,
             Pool::Mongo(p) => mongo::object_definition(&p, object).await?,
+            Pool::Dynamo(p) => dynamo::object_definition(&p, object).await?,
         };
         let what = format!(
             "{} {}.{}",
@@ -845,6 +904,7 @@ impl Db {
             Pool::Sqlite(_) => bail!("SQLite has no functions or procedures"),
             Pool::Redshift(p) => redshift::call_template(&p, object).await,
             Pool::Mongo(_) => bail!("MongoDB has no functions or procedures to call"),
+            Pool::Dynamo(_) => bail!("DynamoDB has no functions or procedures to call"),
         }
     }
 
@@ -1102,6 +1162,9 @@ pub(super) mod tests {
             Adapter::Redshift => &redshift::DIALECT,
             Adapter::Mongodb | Adapter::Documentdb => {
                 unreachable!("no SQL, so no SQL dialect: the guard is safety::check_mongo")
+            }
+            Adapter::Dynamodb => {
+                unreachable!("no read-only transaction: the guard is safety::check_partiql")
             }
         }
     }

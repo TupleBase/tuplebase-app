@@ -10,7 +10,7 @@
 use serde_json::json;
 use tuplebase_core::cloud::aws;
 use tuplebase_core::config::{
-    self, Adapter, Auth, AwsSecretRef, Config, Connection, MongoSettings, TlsMode,
+    self, Adapter, Auth, AwsIamAuth, AwsSecretRef, Config, Connection, MongoSettings, TlsMode,
 };
 
 const FOLDER: &str = "Local test databases";
@@ -85,6 +85,16 @@ async fn main() -> anyhow::Result<()> {
                 options: "authSource=admin".into(),
             }),
             ..connection("test-mongodb", Adapter::Mongodb, 57017, "dev")
+        },
+        // DynamoDB Local: its endpoint and no profile, so it gets dummy credentials.
+        Connection {
+            host: "http://127.0.0.1:58000".into(),
+            database: String::new(),
+            auth: Auth::AwsIam(AwsIamAuth {
+                profile: String::new(),
+                region: "us-east-1".into(),
+            }),
+            ..connection("test-dynamodb", Adapter::Dynamodb, 0, "")
         },
     ];
     if std::env::var("AWS_ENDPOINT_URL").is_ok() {

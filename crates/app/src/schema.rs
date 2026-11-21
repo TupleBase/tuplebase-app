@@ -443,12 +443,13 @@ impl SchemaPanel {
         self.looking_up += 1;
     }
 
-    /// Whether the connection is a document engine, such as MongoDB, whose tree nests
-    /// indexes under collections and samples their fields.
+    /// Whether the connection is a document or key-value engine, such as MongoDB or
+    /// DynamoDB, whose tree nests indexes under collections or tables and samples their
+    /// fields.
     fn is_document(&self) -> bool {
         self.connection
             .as_ref()
-            .is_some_and(|c| c.adapter.family() == Family::Document)
+            .is_some_and(|c| c.adapter.family() != Family::Sql)
     }
 
     /// Results can arrive after the user has moved to another connection.
@@ -621,6 +622,11 @@ impl SchemaPanel {
     {
         let this = cx.entity().downgrade();
         let key = key.clone();
+        let show = match self.connection.as_ref().map(|c| c.adapter.family()) {
+            // PartiQL has no LIMIT: as many items as a run shows.
+            Some(Family::KeyValue) => "Show items",
+            _ => "Show first 100 documents",
+        };
         move |menu, _, _| {
             let item =
                 |label: &'static str, action: fn(&mut Self, TableKey, &mut Context<Self>)| {
@@ -631,9 +637,7 @@ impl SchemaPanel {
                     })
                 };
             let menu = menu
-                .item(item("Show first 100 documents", |this, key, cx| {
-                    this.preview(&key, cx)
-                }))
+                .item(item(show, |this, key, cx| this.preview(&key, cx)))
                 .item(item("Resample fields", Self::resample));
             if is_view {
                 menu.item(item("Show definition", |this, key, cx| {

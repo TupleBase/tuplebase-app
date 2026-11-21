@@ -89,6 +89,7 @@ Local databases, user `dev`, password `dev`, database `app`:
 | SSH server | 52222 |
 | Fake AWS   | 54566 |
 | MongoDB    | 57017 |
+| DynamoDB   | 58000 |
 
 Besides the `users` table the tests use, both databases hold demo data to try lists, filters
 and paging: about 35 tables and half a million rows, up to 150,000 in one table. PostgreSQL
@@ -105,6 +106,11 @@ MongoDB runs as a single-node replica set, `rs0`, with the root user `dev` (pass
 `app`, whose writes the server refuses. The seed runs only when the database is first created.
 `crates/core/tests/it/mongo.rs` runs each test twice, as MongoDB and as DocumentDB, against this
 one server.
+
+DynamoDB Local listens on 58000, in memory, and takes any credentials: a connection to it
+has the endpoint URL `http://127.0.0.1:58000` and no AWS profile. It starts with no tables;
+`crates/core/tests/it/dynamo.rs` makes its own, one per test, with unique names. DynamoDB Local
+sends a whole scan as one page, so the page cap (`MAX_PAGES`) is tested beside the code.
 
 DocumentDB can't run locally. Before a release that changes `db/mongo.rs`, try a real cluster
 by hand: add a DocumentDB connection with its cluster endpoint, port 27017, Encryption

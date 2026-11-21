@@ -88,3 +88,12 @@ services:
           if (!db.hello().isWritablePrimary) quit(1)"
       interval: 2s
       retries: 60
+  # Amazon DynamoDB Local, in memory. It takes any credentials; the tests create their
+  # own uniquely named tables, so they can run in parallel.
+  dynamodb:
+    image: amazon/dynamodb-local:3.3.2
+    ports: ["58000:8000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8000"]
+      interval: 2s
+      retries: 30

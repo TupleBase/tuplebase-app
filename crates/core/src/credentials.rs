@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result, bail};
 
 use crate::cloud::aws;
-use crate::config::{Adapter, Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection};
+use crate::config::{Adapter, Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection, Place};
 use crate::secrets;
 
 /// How often a password that expires is made again, well before it does. An IAM token
@@ -131,7 +131,9 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
         password,
         refresh,
     };
-    if conn.adapter.is_file() {
+    // A file has no sign-in; a service in an AWS region signs each request with the
+    // profile's credentials, read by its own SDK client when it connects.
+    if conn.adapter.info().place != Place::Server {
         return Ok(unchanged(None, None));
     }
     match &conn.auth {
@@ -186,6 +188,8 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
                         conn.adapter.label()
                     )
                 }
+                // Returned above: the SDK signs DynamoDB's requests itself.
+                Adapter::Dynamodb => bail!("DynamoDB signs in with its AWS profile, not a token"),
                 Adapter::Postgres | Adapter::Mariadb | Adapter::Mysql | Adapter::Sqlite => {
                     // Signed for the database's own name, even when a tunnel carries the
                     // traffic.

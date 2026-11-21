@@ -46,6 +46,8 @@ aws-sdk-redshiftserverless = { version = "1.132.0", default-features = false, fe
 # rustls with ring and `dns-resolver` is hickory (for mongodb+srv), both pure Rust (D2).
 # Not `aws-auth`: it pulls aws-lc, a C library.
 mongodb = { version = "3.10", default-features = false, features = ["rustls-tls", "dns-resolver", "bson-3", "compat-3-3-0"] }
+# DynamoDB's driver: the AWS SDK client, set up like aws-sdk-rds above (no aws-lc).
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 # Windows only: a job object ends the chat agent with the app, even when the app
 # crashes. Pure Rust bindings, already in the tree through other crates.
