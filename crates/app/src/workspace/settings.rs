@@ -76,9 +76,8 @@ pub(super) struct SettingsDialog {
     scroll: Vec<ScrollHandle>,
     /// Scroll to `group` in the next frame, or to the top without one.
     jump: bool,
-    /// Set by the wheel: the list follows the page as it scrolls, until a row is clicked.
-    following: bool,
-    /// The page's scroll offset when last rendered, to follow only a real move.
+    /// The page's scroll offset when last rendered: the list follows it when it moves,
+    /// but not when the page moved itself, for a jump.
     seen_offset: Option<Pixels>,
     _subscriptions: [Subscription; 2],
 }
@@ -93,7 +92,6 @@ impl SettingsDialog {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search..."));
         let searched = cx.subscribe(&search, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                this.following = false;
                 this.jump = true;
                 cx.notify();
             }
@@ -108,7 +106,6 @@ impl SettingsDialog {
             open: HashSet::from([SettingsPage::General as usize]),
             scroll: Vec::new(),
             jump: false,
-            following: false,
             seen_offset: None,
             _subscriptions: [searched, changed],
         }
@@ -125,7 +122,6 @@ impl SettingsDialog {
         self.page = page;
         self.group = group;
         self.jump = group.is_some();
-        self.following = false;
         self.seen_offset = None;
         cx.notify();
     }
@@ -156,7 +152,7 @@ impl SettingsDialog {
         let offset = scroll.offset().y;
         let moved = self.seen_offset.is_some_and(|seen| seen != offset);
         self.seen_offset = Some(offset);
-        if !self.following || !moved || shown.is_empty() {
+        if !moved || shown.is_empty() {
             return;
         }
         let at_end = offset <= -scroll.max_offset().y + px(1.);
@@ -195,7 +191,7 @@ impl SettingsDialog {
                         },
                     ))
                 });
-                let row = list_row(format!("settings-page-{}", page.id), active, cx)
+                let row = list_row(format!("settings-page-{}", page.id), page.title, active, cx)
                     .child(Icon::new(page.icon.clone()))
                     .child(row_label(page.title))
                     .children(caret)
@@ -206,12 +202,17 @@ impl SettingsDialog {
                 let sub_rows = groups.into_iter().map(|group_ix| {
                     let title = page.groups[group_ix].title.unwrap_or_default();
                     let active = self.page == page_ix && self.group == Some(group_ix);
-                    list_row(format!("settings-group-{}-{group_ix}", page.id), active, cx)
-                        .child(row_label(title))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select(page_ix, Some(group_ix), cx);
-                        }))
-                        .test_support()
+                    list_row(
+                        format!("settings-group-{}-{group_ix}", page.id),
+                        title,
+                        active,
+                        cx,
+                    )
+                    .child(row_label(title))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select(page_ix, Some(group_ix), cx);
+                    }))
+                    .test_support()
                 });
                 v_flex()
                     .w_full()
@@ -257,7 +258,7 @@ impl SettingsDialog {
 }
 
 impl Render for SettingsDialog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(workspace) = self.workspace.upgrade() else {
             return div().into_any_element();
         };
@@ -269,9 +270,9 @@ impl Render for SettingsDialog {
         let page_ix = self.page;
         let scroll = self.scroll(page_ix);
         let groups = &shown[page_ix];
+        self.follow_scroll(&pages[page_ix], groups, &scroll);
         if self.jump {
             self.jump = false;
-            self.seen_offset = None;
             match self
                 .group
                 .and_then(|ix| groups.iter().position(|&g| g == ix))
@@ -279,15 +280,14 @@ impl Render for SettingsDialog {
                 Some(visible_ix) => scroll.scroll_to_top_of_item(visible_ix),
                 None => scroll.set_offset(Point::default()),
             }
+            // The page moves as this frame is laid out: the next frame takes where it
+            // lands as the start, rather than as a scroll to follow.
+            self.seen_offset = None;
+            window.request_animation_frame();
         }
-        self.follow_scroll(&pages[page_ix], groups, &scroll);
 
         let list = self.render_list(&pages, &shown, cx).into_any_element();
         let content = if !groups.is_empty() {
-            let wheel = cx.listener(|this, _: &ScrollEvent, _, cx| {
-                this.following = true;
-                cx.notify();
-            });
             let page = pages
                 .into_iter()
                 .nth(page_ix)
@@ -300,7 +300,6 @@ impl Render for SettingsDialog {
                     &query,
                     size.width <= STACKED_MAX_WIDTH,
                     &scroll,
-                    wheel,
                     cx,
                 )
             })
@@ -324,11 +323,17 @@ impl Render for SettingsDialog {
 }
 
 /// A row of the page list: the hand, the hover and the highlight of the chosen row.
-fn list_row(id: impl Into<ElementId>, active: bool, cx: &App) -> Stateful<Div> {
+fn list_row(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    active: bool,
+    cx: &App,
+) -> Stateful<Div> {
     let theme = cx.theme();
     h_flex()
         .id(id.into())
         .role(Role::TreeItem)
+        .aria_label(label)
         .aria_selected(active)
         .w_full()
         .h_7()
@@ -429,7 +434,6 @@ impl Page {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render(
         self,
         page_ix: usize,
@@ -437,7 +441,6 @@ impl Page {
         query: &str,
         stacked: bool,
         scroll: &ScrollHandle,
-        on_wheel: impl Fn(&ScrollEvent, &mut Window, &mut App) + 'static,
         cx: &App,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -477,7 +480,6 @@ impl Page {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(scroll)
-                        .on_scroll(on_wheel)
                         .children(groups)
                         .vertical_scrollbar(scroll),
                 ),
@@ -816,8 +818,14 @@ mod tests {
         let _ = open(Config::default(), cx);
         let hand = Some(CursorStyle::PointingHand);
         cx.update(|cx| {
-            assert_eq!(list_row("page", false, cx).style().mouse_cursor, hand);
-            assert_eq!(list_row("page", true, cx).style().mouse_cursor, hand);
+            assert_eq!(
+                list_row("page", "Page", false, cx).style().mouse_cursor,
+                hand
+            );
+            assert_eq!(
+                list_row("page", "Page", true, cx).style().mouse_cursor,
+                hand
+            );
         });
         let mut caret: Button = caret("general", "General", true);
         assert_eq!(caret.style().mouse_cursor, hand);
