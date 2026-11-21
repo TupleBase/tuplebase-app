@@ -431,7 +431,7 @@ impl SchemaPanel {
 
     fn preview(&mut self, key: &TableKey, cx: &mut Context<Self>) {
         if let Some(conn) = &self.connection {
-            let sql = conn.adapter.preview_sql(&key.schema, &key.table);
+            let sql = conn.adapter.preview_query(&key.schema, &key.table);
             cx.emit(SchemaEvent::Preview(sql));
         }
     }

@@ -100,6 +100,30 @@ pub enum ScriptFlavor {
     Sqlite,
 }
 
+/// The kind of query language and data model an engine has. Decides which runner,
+/// editor language and result shape apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// Tables of rows, queried with SQL.
+    Sql,
+    /// Collections of documents, such as MongoDB.
+    Document,
+    /// Tables of items reached by key, such as DynamoDB.
+    KeyValue,
+}
+
+/// Where an engine's data lives, which decides the fields a connection needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// A server reached by host and port, with a user and password.
+    Server,
+    /// A local file, with no server, user or password.
+    File,
+    /// A service in an AWS region, signed in with an AWS profile: no host, port, user
+    /// or password.
+    AwsRegion,
+}
+
 /// What every part of TupleBase may need to know about an engine without talking to it.
 /// One constant per engine, chosen by [`Adapter::info`]. The SQL that `db` runs on an
 /// engine lives in that engine's module under `db/` (ARCHITECTURE.md, L7).
@@ -109,8 +133,8 @@ pub struct EngineInfo {
     pub label: &'static str,
     /// The port a server listens on unless told otherwise; 0 for a file database.
     pub default_port: u16,
-    /// A local file, with no server, user or password.
-    pub is_file: bool,
+    pub family: Family,
+    pub place: Place,
     /// The user a new server usually has, shown as an example in an empty User field;
     /// empty for a file database.
     pub user_hint: &'static str,
@@ -121,7 +145,8 @@ pub struct EngineInfo {
 const POSTGRES: EngineInfo = EngineInfo {
     label: "PostgreSQL",
     default_port: 5432,
-    is_file: false,
+    family: Family::Sql,
+    place: Place::Server,
     user_hint: "postgres",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Postgres,
@@ -130,7 +155,8 @@ const POSTGRES: EngineInfo = EngineInfo {
 const MARIADB: EngineInfo = EngineInfo {
     label: "MariaDB",
     default_port: 3306,
-    is_file: false,
+    family: Family::Sql,
+    place: Place::Server,
     user_hint: "root",
     quote: IdentQuote::Backtick,
     script: ScriptFlavor::Mysql,
@@ -139,7 +165,8 @@ const MARIADB: EngineInfo = EngineInfo {
 const MYSQL: EngineInfo = EngineInfo {
     label: "MySQL",
     default_port: 3306,
-    is_file: false,
+    family: Family::Sql,
+    place: Place::Server,
     user_hint: "root",
     quote: IdentQuote::Backtick,
     script: ScriptFlavor::Mysql,
@@ -148,7 +175,8 @@ const MYSQL: EngineInfo = EngineInfo {
 const SQLITE: EngineInfo = EngineInfo {
     label: "SQLite",
     default_port: 0,
-    is_file: true,
+    family: Family::Sql,
+    place: Place::File,
     user_hint: "",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Sqlite,
@@ -157,7 +185,8 @@ const SQLITE: EngineInfo = EngineInfo {
 const REDSHIFT: EngineInfo = EngineInfo {
     label: "Redshift",
     default_port: 5439,
-    is_file: false,
+    family: Family::Sql,
+    place: Place::Server,
     user_hint: "awsuser",
     quote: IdentQuote::Double,
     script: ScriptFlavor::Redshift,
@@ -185,7 +214,11 @@ impl Adapter {
 
     /// Whether the database is a local file, with no server, user or password.
     pub fn is_file(self) -> bool {
-        self.info().is_file
+        self.info().place == Place::File
+    }
+
+    pub fn family(self) -> Family {
+        self.info().family
     }
 
     pub fn label(self) -> &'static str {
@@ -200,12 +233,13 @@ impl Adapter {
         }
     }
 
-    /// SQL showing the first rows of a table.
-    pub fn preview_sql(self, schema: &str, table: &str) -> String {
-        format!(
-            "SELECT * FROM {}.{} LIMIT 100",
-            self.quote_ident(schema),
-            self.quote_ident(table)
+    /// The query showing the first rows of a table, in the engine's own language.
+    pub fn preview_query(self, schema: &str, table: &str) -> String {
+        preview_query(
+            self.info().family,
+            |ident| self.quote_ident(ident),
+            schema,
+            table,
         )
     }
 
@@ -215,6 +249,29 @@ impl Adapter {
 
     pub fn user_hint(self) -> &'static str {
         self.info().user_hint
+    }
+}
+
+/// [`Adapter::preview_query`] for an engine of `family` that quotes names with `quote`.
+/// `schema` is the database or region for a non-SQL engine.
+fn preview_query(
+    family: Family,
+    quote: impl Fn(&str) -> String,
+    schema: &str,
+    table: &str,
+) -> String {
+    match family {
+        Family::Sql => format!("SELECT * FROM {}.{} LIMIT 100", quote(schema), quote(table)),
+        Family::Document => {
+            let string = |s: &str| Value::from(s).to_string();
+            format!(
+                "db.getSiblingDB({}).getCollection({}).find({{}}).limit(100)",
+                string(schema),
+                string(table)
+            )
+        }
+        // PartiQL has no LIMIT: the row cap is applied while paging.
+        Family::KeyValue => format!("SELECT * FROM {}", quote(table)),
     }
 }
 
@@ -1303,14 +1360,15 @@ mod tests {
         for adapter in Adapter::ALL {
             // Only a server has a port, and a user.
             let info = adapter.info();
-            assert_eq!(info.is_file, info.default_port == 0, "{}", info.label);
-            assert_eq!(info.is_file, info.user_hint.is_empty(), "{}", info.label);
+            let is_file = info.place == Place::File;
+            assert_eq!(is_file, info.default_port == 0, "{}", info.label);
+            assert_eq!(is_file, info.user_hint.is_empty(), "{}", info.label);
         }
         assert!(Adapter::Sqlite.is_file());
         assert_eq!(Adapter::Sqlite.quote_ident(r#"a"b"#), r#""a""b""#);
         assert_eq!(Adapter::Mysql.quote_ident("a`b"), "`a``b`");
         assert_eq!(
-            Adapter::Postgres.preview_sql("public", "users"),
+            Adapter::Postgres.preview_query("public", "users"),
             r#"SELECT * FROM "public"."users" LIMIT 100"#
         );
         assert_eq!(Adapter::Postgres.info().script, ScriptFlavor::Postgres);
@@ -1328,11 +1386,63 @@ mod tests {
     }
 
     #[test]
+    fn each_engine_has_its_family_and_place() {
+        let families = Adapter::ALL.map(Adapter::family);
+        assert_eq!(families, [Family::Sql; 5]);
+        let places = Adapter::ALL.map(|a| a.info().place);
+        assert_eq!(
+            places,
+            [
+                Place::Server,
+                Place::Server,
+                Place::Server,
+                Place::File,
+                Place::Server
+            ]
+        );
+        for adapter in Adapter::ALL {
+            assert_eq!(
+                adapter.is_file(),
+                adapter.info().place == Place::File,
+                "{adapter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_query_is_the_sql_it_always_was() {
+        let previews = Adapter::ALL.map(|a| a.preview_query(r#"my"s`c"#, "users"));
+        assert_eq!(
+            previews,
+            [
+                r#"SELECT * FROM "my""s`c"."users" LIMIT 100"#,
+                r#"SELECT * FROM `my"s``c`.`users` LIMIT 100"#,
+                r#"SELECT * FROM `my"s``c`.`users` LIMIT 100"#,
+                r#"SELECT * FROM "my""s`c"."users" LIMIT 100"#,
+                r#"SELECT * FROM "my""s`c"."users" LIMIT 100"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn preview_query_follows_the_family() {
+        let quote = |ident: &str| Adapter::Postgres.quote_ident(ident);
+        assert_eq!(
+            preview_query(Family::Document, quote, "app", r#"us"ers"#),
+            r#"db.getSiblingDB("app").getCollection("us\"ers").find({}).limit(100)"#
+        );
+        assert_eq!(
+            preview_query(Family::KeyValue, quote, "eu-west-1", r#"us"ers"#),
+            r#"SELECT * FROM "us""ers""#
+        );
+    }
+
+    #[test]
     fn identifiers_are_quoted_for_each_database() {
         assert_eq!(Adapter::Postgres.quote_ident(r#"a"b"#), r#""a""b""#);
         assert_eq!(Adapter::Mariadb.quote_ident("a`b"), "`a``b`");
         assert_eq!(
-            Adapter::Mysql.preview_sql("app", "users"),
+            Adapter::Mysql.preview_query("app", "users"),
             "SELECT * FROM `app`.`users` LIMIT 100"
         );
     }

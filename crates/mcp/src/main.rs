@@ -156,7 +156,9 @@ impl Server {
                     read_only: !self.allow_writes,
                     max_rows: self.max_rows,
                 };
-                Ok(json!(self.db.execute(&conn, &args.sql, opts).await?))
+                Ok(json!(
+                    self.db.execute(&conn, &args.sql, opts).await?.for_agent()
+                ))
             }
             .await,
         )
