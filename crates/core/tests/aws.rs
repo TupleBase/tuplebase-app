@@ -172,6 +172,15 @@ async fn a_missing_secret_is_reported_by_name() {
     assert!(error.contains("ResourceNotFoundException"), "{error}");
 }
 
+/// The errors besides Redshift Serverless's: the fake AWS (moto 5.1) doesn't serve it, so
+/// listing workgroups there always fails.
+fn serverless_aside(errors: &[cloud::DiscoverError]) -> Vec<&cloud::DiscoverError> {
+    errors
+        .iter()
+        .filter(|e| !e.message.contains("Redshift Serverless"))
+        .collect()
+}
+
 /// Accepts a database left in the fake RDS by an earlier run.
 fn created<T, E: aws_sdk_rds::error::ProvideErrorMetadata>(
     result: Result<T, aws_sdk_rds::error::SdkError<E>>,
@@ -242,7 +251,11 @@ async fn discovery_finds_instances_and_aurora_clusters_with_their_sign_in() {
 
     let regions = [REGION.to_owned(), EMPTY.to_owned()];
     let discovery = cloud::discover(Provider::Aws, "", &regions).await;
-    assert!(discovery.errors.is_empty(), "{:?}", discovery.errors);
+    assert!(
+        serverless_aside(&discovery.errors).is_empty(),
+        "{:?}",
+        discovery.errors
+    );
     assert_eq!(discovery.empty_regions, [EMPTY]);
     let find = |label: &str| {
         let found = discovery.found.iter().find(|d| d.label == label);
@@ -279,4 +292,48 @@ async fn discovery_finds_instances_and_aurora_clusters_with_their_sign_in() {
         "a cluster's instance is listed on its own"
     );
     assert!(shop.connection().is_some_and(|c| c.source.is_some()));
+}
+
+#[tokio::test]
+async fn discovery_asks_redshift_beside_rds_without_an_error() {
+    if !enabled() {
+        eprintln!("skipped: set TUPLEBASE_IT=1 and run `docker compose up -d`");
+        return;
+    }
+    // A region no other test uses.
+    const REGION: &str = "eu-north-1";
+    use_fake_aws();
+    let redshift = aws_sdk_redshift::Client::new(&aws::sdk_config("", REGION).await.unwrap());
+    let created = redshift
+        .create_cluster()
+        .cluster_identifier("it-disc-dw")
+        .node_type("ra3.xlplus")
+        .master_username("dw_admin")
+        .master_user_password("Not-used-123")
+        .db_name("sales")
+        .publicly_accessible(true)
+        // Without it the fake answers `<Encrypted></Encrypted>`, which the SDK can't read.
+        .encrypted(true)
+        .send()
+        .await;
+    // Left by an earlier run. The fake words this error so that the SDK can't read its
+    // code, so it is looked for in the whole response.
+    if let Err(e) = created {
+        let error = format!("{e:?}");
+        assert!(
+            error.contains("ClusterAlreadyExists"),
+            "creating failed: {error}"
+        );
+    }
+    // Redshift is asked, signed for the region, and answers without an error. The fake
+    // (moto 5.1) can't show more: it lists clusters as `<item>` where Redshift writes
+    // `<Cluster>`, so the SDK reads none, and it writes GetClusterCredentials' expiry in a
+    // form the SDK refuses. What a found cluster becomes, and the credentials request, are
+    // tested beside the code in `cloud::aws`.
+    let discovery = cloud::discover(Provider::Aws, "", &[REGION.to_owned()]).await;
+    assert!(
+        serverless_aside(&discovery.errors).is_empty(),
+        "{:?}",
+        discovery.errors
+    );
 }

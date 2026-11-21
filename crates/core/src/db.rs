@@ -1,11 +1,11 @@
-//! Database access for PostgreSQL, MariaDB/MySQL and SQLite.
+//! Database access for PostgreSQL, MariaDB/MySQL, SQLite and Redshift.
 //!
 //! Async API; callers provide a Tokio runtime. One pool per connection, cached by
 //! name and rebuilt when the connection's settings change.
 //!
 //! This file holds the public API and what all engines share. Each [`Db`] method that
 //! needs engine-specific SQL picks the engine module by the pool and calls it:
-//! [`postgres`], [`mysql`] (MySQL and MariaDB) and [`sqlite`]. A feature only one engine
+//! [`postgres`], [`mysql`] (MySQL and MariaDB), [`sqlite`] and [`redshift`]. A feature only one engine
 //! has, such as MySQL events, lives only in that engine's module. So does connecting:
 //! [`Pool::open`] and [`Pool::renew`] call the engine module's `connect` and `renew`,
 //! and [`connect`] holds what every engine shares (credentials, tunnel, token renewal).
@@ -14,6 +14,7 @@ mod connect;
 mod decode;
 mod mysql;
 mod postgres;
+mod redshift;
 mod sqlite;
 
 use std::collections::{HashMap, HashSet};
@@ -194,6 +195,11 @@ struct Dialect {
     read_only_end: &'static str,
     /// What [`Db::list_objects`] lists, with the query for each kind.
     objects: &'static [(ObjectKind, &'static str)],
+    /// Whether a statement that returned no rows is prepared again to read its column
+    /// names. The driver then also looks up which table each column came from, with a
+    /// query the engine must be able to run: a failed one would end a transaction the
+    /// user opened.
+    describe_empty: bool,
 }
 
 #[cfg(test)]
@@ -292,6 +298,9 @@ enum Pool {
     Pg(PgPool),
     My(MySqlPool),
     Sqlite(SqlitePools),
+    /// Redshift speaks PostgreSQL's protocol, so the pool is sqlx's PostgreSQL one; its
+    /// own variant sends every method to [`redshift`], whose catalog is not PostgreSQL's.
+    Redshift(PgPool),
 }
 
 impl Pool {
@@ -309,6 +318,9 @@ impl Pool {
                 Pool::My(mysql::connect(conn, host, port, password).await?)
             }
             Adapter::Sqlite => Pool::Sqlite(sqlite::connect(conn).await?),
+            Adapter::Redshift => {
+                Pool::Redshift(redshift::connect(conn, host, port, password).await?)
+            }
         })
     }
 
@@ -319,6 +331,7 @@ impl Pool {
             Pool::Pg(p) => postgres::renew(p, conn, host, port, password),
             Pool::My(p) => mysql::renew(p, conn, host, port, password),
             Pool::Sqlite(p) => sqlite::renew(p, conn),
+            Pool::Redshift(p) => redshift::renew(p, conn, host, port, password),
         }
     }
 
@@ -327,6 +340,7 @@ impl Pool {
             Pool::Pg(p) => p.close().await,
             Pool::My(p) => p.close().await,
             Pool::Sqlite(p) => p.close().await,
+            Pool::Redshift(p) => p.close().await,
         }
     }
 }
@@ -381,6 +395,7 @@ impl Db {
             Pool::Pg(p) => p.execute("SELECT 1").await.map(drop)?,
             Pool::My(p) => p.execute("SELECT 1").await.map(drop)?,
             Pool::Sqlite(p) => p.main.execute("SELECT 1").await.map(drop)?,
+            Pool::Redshift(p) => p.execute("SELECT 1").await.map(drop)?,
         }
         Ok(())
     }
@@ -509,6 +524,7 @@ impl Db {
                 let Dialect {
                     read_only_begin: begin,
                     read_only_end: end,
+                    describe_empty,
                     ..
                 } = $dialect;
                 let mut c = Lease::new($pool.acquire().await?);
@@ -520,7 +536,14 @@ impl Db {
                         if read_only {
                             c.execute(begin).await?;
                         }
-                        let mut out = run!(&mut **c, conn.adapter, sql, opts.max_rows, $decode);
+                        let mut out = run!(
+                            &mut **c,
+                            conn.adapter,
+                            sql,
+                            opts.max_rows,
+                            $decode,
+                            describe_empty
+                        );
                         // The statement never ran, and its types are known now: run it
                         // again, in a new read-only transaction when it had one.
                         if out.as_ref().is_err_and(lost_unnamed_statement) {
@@ -528,7 +551,14 @@ impl Db {
                                 c.execute(end).await?;
                                 c.execute(begin).await?;
                             }
-                            out = run!(&mut **c, conn.adapter, sql, opts.max_rows, $decode);
+                            out = run!(
+                                &mut **c,
+                                conn.adapter,
+                                sql,
+                                opts.max_rows,
+                                $decode,
+                                describe_empty
+                            );
                         }
                         if read_only && c.execute(end).await.is_err() {
                             c.close_on_drop();
@@ -563,7 +593,7 @@ impl Db {
                 if rolled_back {
                     ran = ran.map_err(|e| anyhow!("{e:#}. {ROLLED_BACK_NOTE}"));
                 }
-                ran?;
+                ran
             }};
         }
         match self.pool(conn).await? {
@@ -572,8 +602,8 @@ impl Db {
                 postgres::DIALECT,
                 postgres::value,
                 postgres::end_transaction
-            ),
-            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value, mysql::end_transaction),
+            )?,
+            Pool::My(pool) => run_all!(pool, mysql::DIALECT, mysql::value, mysql::end_transaction)?,
             Pool::Sqlite(pools) => {
                 let pool = if read_only {
                     for statement in statements {
@@ -588,8 +618,15 @@ impl Db {
                     sqlite::DIALECT,
                     sqlite::value,
                     sqlite::end_transaction
-                )
+                )?
             }
+            Pool::Redshift(pool) => run_all!(
+                pool,
+                redshift::DIALECT,
+                redshift::value,
+                redshift::end_transaction
+            )
+            .map_err(redshift::explain)?,
         }
 
         let mut result = shown.expect("callers pass at least one statement");
@@ -608,6 +645,7 @@ impl Db {
             Pool::Pg(p) => postgres::column_names(&p).await?,
             Pool::My(p) => mysql::column_names(&p).await?,
             Pool::Sqlite(p) => sqlite::column_names(&p.main).await?,
+            Pool::Redshift(p) => redshift::column_names(&p).await?,
         };
         Ok(rows.into_iter().map(|(name,)| name).collect())
     }
@@ -617,6 +655,7 @@ impl Db {
             Pool::Pg(p) => postgres::tables(&p).await?,
             Pool::My(p) => mysql::tables(&p).await?,
             Pool::Sqlite(p) => sqlite::tables(&p.main).await?,
+            Pool::Redshift(p) => redshift::tables(&p).await?,
         };
         Ok(rows
             .into_iter()
@@ -631,10 +670,11 @@ impl Db {
             Pool::Pg(p) => postgres::list_objects(&p).await,
             Pool::My(p) => mysql::list_objects(&p).await,
             Pool::Sqlite(p) => sqlite::list_objects(&p.main).await,
+            Pool::Redshift(p) => redshift::list_objects(&p).await,
         })
     }
 
-    /// Columns of `table`; `schema` defaults to `public` (PostgreSQL) or the
+    /// Columns of `table`; `schema` defaults to `public` (PostgreSQL, Redshift) or the
     /// connection's database (MariaDB/MySQL).
     pub async fn describe_table(
         &self,
@@ -646,6 +686,7 @@ impl Db {
             Pool::Pg(p) => postgres::columns(&p, schema, table).await?,
             Pool::My(p) => mysql::columns(&p, schema, &conn.database, table).await?,
             Pool::Sqlite(p) => sqlite::columns(&p.main, table).await?,
+            Pool::Redshift(p) => redshift::columns(&p, schema, table).await?,
         };
         if rows.is_empty() {
             bail!("table \"{table}\" not found");
@@ -671,6 +712,7 @@ impl Db {
             Pool::Pg(p) => postgres::object_definition(&p, object).await?,
             Pool::My(p) => mysql::object_definition(&p, object).await?,
             Pool::Sqlite(p) => sqlite::object_definition(&p.main, object).await?,
+            Pool::Redshift(p) => redshift::object_definition(&p, object).await?,
         };
         let what = format!(
             "{} {}.{}",
@@ -693,6 +735,7 @@ impl Db {
             Pool::Pg(p) => postgres::call_template(&p, object).await,
             Pool::My(p) => mysql::call_template(&p, object).await,
             Pool::Sqlite(_) => bail!("SQLite has no functions or procedures"),
+            Pool::Redshift(p) => redshift::call_template(&p, object).await,
         }
     }
 
@@ -807,7 +850,7 @@ fn lost_unnamed_statement(error: &anyhow::Error) -> bool {
 /// Runs one statement as a prepared statement on `$conn`: streams up to `$max` rows
 /// for row-returning statements, otherwise reports the affected row count.
 macro_rules! run {
-    ($conn:expr, $adapter:expr, $sql:expr, $max:expr, $decode:path) => {
+    ($conn:expr, $adapter:expr, $sql:expr, $max:expr, $decode:path, $describe_empty:expr) => {
         async {
             let query = sqlx::query(AssertSqlSafe($sql.to_owned())).persistent(false);
             if !safety::returns_rows($adapter, $sql) {
@@ -849,7 +892,7 @@ macro_rules! run {
                 rows.push((0..row.len()).map(|i| $decode(&row, i)).collect());
             }
             drop(stream);
-            if columns.is_empty() {
+            if columns.is_empty() && $describe_empty {
                 // No row to read names from, so ask the server what it would have returned.
                 let prepared = $conn
                     .prepare(AssertSqlSafe($sql.to_owned()).into_sql_str())
@@ -905,6 +948,7 @@ pub(super) mod tests {
             Adapter::Postgres => &postgres::DIALECT,
             Adapter::Mariadb | Adapter::Mysql => &mysql::DIALECT,
             Adapter::Sqlite => &sqlite::DIALECT,
+            Adapter::Redshift => &redshift::DIALECT,
         }
     }
 
@@ -929,6 +973,10 @@ pub(super) mod tests {
             statements(Adapter::Sqlite),
             ("PRAGMA query_only = ON", "PRAGMA query_only = OFF")
         );
+        assert_eq!(
+            statements(Adapter::Redshift),
+            ("BEGIN READ ONLY", "ROLLBACK")
+        );
     }
 
     #[test]
@@ -941,6 +989,8 @@ pub(super) mod tests {
         );
         assert_eq!(kinds(Adapter::Mysql), [Function, Procedure, Trigger, Event]);
         assert_eq!(kinds(Adapter::Sqlite), [Trigger, Index]);
+        // No sequences, types, extensions or triggers on Redshift.
+        assert_eq!(kinds(Adapter::Redshift), [Function, Procedure]);
         for adapter in Adapter::ALL {
             // Views are listed with the tables.
             assert!(!kinds(adapter).contains(&View));

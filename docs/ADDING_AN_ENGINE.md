@@ -80,7 +80,7 @@ function names. `options` and `connect` take the connection; the rest take the e
 | Item                          | What it does                                                        |
 | ----------------------------- | ------------------------------------------------------------------- |
 | `OBJECTS`                     | one query per kind of object beyond tables, each returning schema, name and detail |
-| `DIALECT`                     | `read_only_begin` and `read_only_end`, run around each statement in read-only mode; `objects: OBJECTS` |
+| `DIALECT`                     | `read_only_begin` and `read_only_end`, run around each statement in read-only mode; `objects: OBJECTS`; `describe_empty`, false if the engine can't run the driver's column-origin lookup (Redshift) |
 | `end_transaction(conn, left_open)` | after each run, ends any transaction it left open, so the connection goes back to the pool without one, and returns whether there was one (`left_open`, from the statements, when the server can't say) |
 | `column_names(pool)`          | distinct column names for autocomplete, at most 5000                |
 | `tables(pool)`                | schema, name and `BASE TABLE` or `VIEW` for each table and view     |

@@ -1,6 +1,7 @@
 # Features
 
-Works with PostgreSQL, MariaDB, MySQL and SQLite.
+Works with PostgreSQL, MariaDB, MySQL, SQLite and Amazon Redshift (provisioned clusters and
+Serverless workgroups).
 
 ## Connections
 
@@ -19,10 +20,11 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
   [credentials kept in AWS](CREDENTIALS.md#credentials-kept-in-aws).
 - Or sign in to RDS and Aurora with an IAM token made from your AWS profile, with no password
   at all; the app renews it while the connection is open. See
-  [IAM tokens](CREDENTIALS.md#iam-tokens).
+  [IAM tokens](CREDENTIALS.md#iam-tokens). Redshift signs in the same way with temporary
+  credentials from AWS ([Redshift](CREDENTIALS.md#redshift)).
 - Find your databases in AWS: choose an AWS profile and regions, and the app lists the RDS
-  databases and Aurora clusters there. Pick one to fill in the connection, with its
-  RDS-managed secret or an IAM token already chosen. See
+  databases, Aurora clusters, Redshift clusters and Redshift Serverless workgroups there. Pick
+  one to fill in the connection, with its managed secret or IAM sign-in already chosen. See
   [finding databases in AWS](CREDENTIALS.md#finding-databases-in-aws).
 - Certificates of RDS databases can be verified: Amazon's RDS certificate authorities come
   with the app.
@@ -32,7 +34,8 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 - Browse schemas, tables, views and columns.
 - See what else each database holds: functions, procedures, sequences, types and extensions on
   PostgreSQL; functions, procedures, triggers and events on MariaDB and MySQL; indexes and triggers
-  on SQLite.
+  on SQLite; functions and procedures on Redshift, where materialized views are listed with the
+  views.
 - Filter everything by name.
 - Preview the first 100 rows of a table with one click.
 - Move through the connection tree and the schema tree with the arrow keys: up and down to walk,
@@ -48,7 +51,7 @@ Works with PostgreSQL, MariaDB, MySQL and SQLite.
 - `Cmd+Shift+Enter` or `Ctrl+Shift+Enter` runs everything in the editor, several statements at
   once.
 - Statements end at `;`, as the database reads them: a `;` in a string, a comment, a
-  PostgreSQL `$$` body or a MariaDB or MySQL `BEGIN … END` body doesn't end one.
+  PostgreSQL or Redshift `$$` body or a MariaDB or MySQL `BEGIN … END` body doesn't end one.
 - Autocomplete SQL keywords and the connection's table and column names. Suggestions show after
   two letters of a word, or at once with `Ctrl+Space`. `Tab` takes the highlighted one, `Enter`
   always starts a new line, and `Esc` closes the list.

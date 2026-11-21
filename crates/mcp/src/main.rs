@@ -31,7 +31,7 @@ struct DescribeArgs {
     connection: String,
     /// Table name.
     table: String,
-    /// Schema; defaults to `public` (PostgreSQL) or the connection's database.
+    /// Schema; defaults to `public` (PostgreSQL, Redshift) or the connection's database.
     schema: Option<String>,
 }
 

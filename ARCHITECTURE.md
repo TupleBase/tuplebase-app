@@ -48,6 +48,7 @@ scripts/                   install, packaging, release helpers
 | `db/postgres`  | PostgreSQL's connect options and pool, own SQL, read-only statements, value decoding | `config`, and `db` (its parent) and `db/connect` |
 | `db/mysql`     | MySQL's and MariaDB's connect options and pool, SQL, read-only statements, decoding | `config`, and `db` (its parent) and `db/connect` |
 | `db/sqlite`    | SQLite's connect options and pools (one read-only), own SQL, read-only switch, value decoding | `config` `ssh`, and `db` (its parent) and `db/connect` |
+| `db/redshift`  | Redshift's connect options and pool (PostgreSQL's driver), own catalog SQL, read-only statements, decoding | `config`, and `db` (its parent), `db/connect` and `db/postgres` |
 | `db/decode`    | value decoding the engine modules share                   | nothing                                                 |
 | `agents`       | the MCP server's entry in each agent's config file        | `updates`                                               |
 | `chat`         | running the user's agent for the chat panel               | `config` `agents`                                       |

@@ -45,6 +45,12 @@ fn logo(adapter: Adapter) -> Logo {
             color: 0x0F80CC,
             letters: "SL",
         },
+        // TupleBase's own mark, three shifted slabs of a warehouse, not Amazon's logo.
+        Adapter::Redshift => Logo {
+            glyph: include_bytes!("../../../assets/logos/redshift.svg"),
+            color: 0x4A3AA8,
+            letters: "RS",
+        },
     }
 }
 

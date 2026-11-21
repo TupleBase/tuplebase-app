@@ -38,6 +38,7 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_begin: "PRAGMA query_only = ON",
     read_only_end: "PRAGMA query_only = OFF",
     objects: OBJECTS,
+    describe_empty: true,
 };
 
 /// Ends any transaction a run left open, so the connection goes back to the pool

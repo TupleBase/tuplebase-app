@@ -54,7 +54,9 @@ enum Escapes {
 /// The token at byte `i` of `sql`, which is on a character boundary, and its length in
 /// bytes. `escapes` only matters on MySQL and MariaDB.
 fn token(flavor: ScriptFlavor, escapes: Escapes, sql: &str, i: usize) -> (Token, usize) {
-    let postgres = flavor == ScriptFlavor::Postgres;
+    // Redshift reads SQL as PostgreSQL does, apart from backslashes in strings.
+    let postgres = matches!(flavor, ScriptFlavor::Postgres | ScriptFlavor::Redshift);
+    let redshift = flavor == ScriptFlavor::Redshift;
     let mysql = flavor == ScriptFlavor::Mysql;
     let bytes = sql.as_bytes();
     let rest = &sql[i..];
@@ -89,10 +91,11 @@ fn token(flavor: ScriptFlavor, escapes: Escapes, sql: &str, i: usize) -> (Token,
             (kind, block_comment_len(rest, postgres))
         }
         quote @ (b'\'' | b'"' | b'`') if quote != b'`' || !postgres => {
-            let escape_string = postgres
-                && i > 0
-                && bytes[i - 1].eq_ignore_ascii_case(&b'e')
-                && (i == 1 || !is_word(bytes[i - 2]));
+            let escape_string = (redshift && quote == b'\'')
+                || (postgres
+                    && i > 0
+                    && bytes[i - 1].eq_ignore_ascii_case(&b'e')
+                    && (i == 1 || !is_word(bytes[i - 2])));
             let mysql_escapes = mysql
                 && match escapes {
                     Escapes::Both => true,
@@ -373,6 +376,8 @@ fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
         }
         // Many pragmas return rows, and one that sets a value returns nothing at all.
         Adapter::Sqlite => &["pragma"],
+        // A procedure's INOUT and OUT values come back as a row; FETCH reads a cursor.
+        Adapter::Redshift => &["call", "fetch"],
     }
 }
 
@@ -380,6 +385,8 @@ fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
 /// ended, or autocommit turned off and something run after it. Read from their first
 /// words, for a server that can't say itself (MySQL). Not part of the read-only guard.
 pub fn leaves_transaction_open(adapter: Adapter, statements: &[&str]) -> bool {
+    let mysql = adapter.info().script == ScriptFlavor::Mysql;
+    let redshift = adapter.info().script == ScriptFlavor::Redshift;
     let (mut open, mut manual) = (false, false);
     for statement in statements {
         let words: Vec<String> = tokens(adapter, statement)
@@ -397,9 +404,12 @@ pub fn leaves_transaction_open(adapter: Adapter, statements: &[&str]) -> bool {
             }
             ("begin", ..) | ("start", "transaction", _) => open = true,
             ("rollback", "to", _) => {}
-            ("commit" | "rollback", ..) => open = false,
-            // MySQL commits before each of these.
-            ("create" | "alter" | "drop" | "rename" | "truncate", ..) => open = false,
+            // PostgreSQL and Redshift also spell them END and ABORT.
+            ("commit" | "rollback" | "end" | "abort", ..) => open = false,
+            // MySQL commits before each of these; PostgreSQL and Redshift don't.
+            ("create" | "alter" | "drop" | "rename" | "truncate", ..) if mysql => open = false,
+            // Redshift commits the transaction a TRUNCATE runs in.
+            ("truncate", ..) if redshift => open = false,
             _ => open |= manual,
         }
     }
@@ -801,6 +811,90 @@ mod tests {
             split(Adapter::Postgres, "/* a /* b; */ c; */ select 1").len(),
             1
         );
+    }
+
+    #[test]
+    fn redshift_reads_backslash_escapes_in_every_string() {
+        // Redshift's strings take backslash escapes, as QUOTE_LITERAL's doubling of
+        // backslashes shows: `\'` doesn't end the string, also without `E`.
+        assert_eq!(
+            split(Adapter::Redshift, r"select 'a\';b'; select 2").len(),
+            2
+        );
+        assert_eq!(split(Adapter::Redshift, r"select 'a\\'; select 2").len(), 2);
+        assert_eq!(
+            split(Adapter::Redshift, r"select E'a\';b'; select 2").len(),
+            2
+        );
+        // Not in a quoted name.
+        assert_eq!(
+            split(Adapter::Redshift, r#"select "a\"; select 2"#).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn redshift_keeps_postgres_comments_and_dollar_quotes() {
+        let procedure = "CREATE OR REPLACE PROCEDURE p() AS $$ BEGIN \
+             INSERT INTO t VALUES (1); END; $$ LANGUAGE plpgsql; CALL p()";
+        assert_eq!(split(Adapter::Redshift, procedure).len(), 2);
+        assert_eq!(
+            split(Adapter::Redshift, "select $tag$a;b$tag$; select 2").len(),
+            2
+        );
+        assert_eq!(
+            split(Adapter::Redshift, "/* a /* b; */ c; */ select 1").len(),
+            1
+        );
+        assert_eq!(split(Adapter::Redshift, "select $1; select $2").len(), 2);
+        assert_eq!(
+            first_keyword(Adapter::Redshift, "-- x\rdelete from t").as_deref(),
+            Some("delete")
+        );
+        for sql in [
+            "/* /* */ select */ delete from t",
+            "-- \r insert into t values (1) --\n select 1",
+            "/* a /* b */ c */ /* select */ unload ('select 1') to 's3://b/x'",
+        ] {
+            assert!(check_read_only(Adapter::Redshift, sql).is_err(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_redshift_read_only_script_cannot_hide_a_write_in_a_string() {
+        // Read with PostgreSQL's rules, `'a\'` ends at the second quote and the rest is
+        // one more string: a single SELECT. Redshift reads `\'` as a quote inside the
+        // string, so the DELETE is code. The guard must read it as Redshift does.
+        let script = r"select 'a\', ' ; delete from t; -- '";
+        assert_eq!(split(Adapter::Postgres, script).len(), 1);
+        let statements = split_statements(Adapter::Redshift, script);
+        assert_eq!(statements.len(), 2, "{statements:?}");
+        assert!(check_read_only(Adapter::Redshift, statements[0]).is_ok());
+        assert!(check_read_only(Adapter::Redshift, statements[1]).is_err());
+        // And in a single statement, the write is the first keyword after the string.
+        assert_eq!(
+            first_keyword(Adapter::Redshift, statements[1]).as_deref(),
+            Some("delete")
+        );
+    }
+
+    #[test]
+    fn a_redshift_transaction_stays_open_after_ddl() {
+        // Unlike MySQL, Redshift doesn't commit before DDL, so the run left it open.
+        let open = |statements: &[&str]| leaves_transaction_open(Adapter::Redshift, statements);
+        assert!(open(&["BEGIN", "CREATE TABLE u (a int)"]));
+        assert!(open(&["begin read write", "insert into t values (1)"]));
+        assert!(!open(&["BEGIN", "CREATE TABLE u (a int)", "END"]));
+        assert!(!open(&["BEGIN", "CREATE TABLE u (a int)", "COMMIT"]));
+        assert!(!open(&["select 1", "create table u (a int)"]));
+        // But TRUNCATE commits the transaction it runs in; PostgreSQL's doesn't.
+        assert!(!open(&["BEGIN", "insert into t values (1)", "TRUNCATE t"]));
+        assert!(!open(&["BEGIN", "TRUNCATE t", "insert into t values (1)"]));
+        assert!(open(&["TRUNCATE t", "BEGIN", "insert into t values (1)"]));
+        assert!(leaves_transaction_open(
+            Adapter::Postgres,
+            &["BEGIN", "TRUNCATE t"]
+        ));
     }
 
     #[test]
