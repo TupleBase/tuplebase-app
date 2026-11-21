@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 
 use crate::cloud::aws;
-use crate::config::{Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection};
+use crate::config::{Adapter, Auth, AwsIamAuth, AwsSecretRef, AwsStore, Connection};
 use crate::secrets;
 
 /// How often a password that expires is made again, well before it does. An IAM token
@@ -80,6 +80,14 @@ trait Store {
         port: u16,
         user: &str,
     ) -> Result<aws::IamToken>;
+    /// New temporary Redshift credentials for the cluster or workgroup at `host`.
+    async fn redshift_credentials(
+        &self,
+        iam: &AwsIamAuth,
+        host: &str,
+        user: &str,
+        database: &str,
+    ) -> Result<aws::RedshiftLogin>;
 }
 
 /// The real ones.
@@ -104,6 +112,16 @@ impl Store for System {
         user: &str,
     ) -> Result<aws::IamToken> {
         aws::iam_token(&iam.profile, &iam.region, host, port, user).await
+    }
+
+    async fn redshift_credentials(
+        &self,
+        iam: &AwsIamAuth,
+        host: &str,
+        user: &str,
+        database: &str,
+    ) -> Result<aws::RedshiftLogin> {
+        aws::redshift_credentials(&iam.profile, &iam.region, host, user, database).await
     }
 }
 
@@ -143,13 +161,33 @@ async fn resolve_with(store: &impl Store, conn: &Connection) -> Result<Resolved>
         Auth::AwsIam(iam) => {
             // Before making a token, so none is ever sent without encryption.
             conn.check_iam_encryption()?;
-            // Signed for the database's own name, even when a tunnel carries the traffic.
             let made = SystemTime::now();
-            let token = store
-                .iam_token(iam, &conn.host, conn.port, &conn.user)
-                .await?;
-            let expiry = iam_expiry(made, token.credentials_expire);
-            Ok(unchanged(Some(token.token), Some(expiry)))
+            match conn.adapter {
+                // Redshift doesn't take RDS tokens: AWS hands out a temporary user and
+                // password instead, for the cluster or workgroup its endpoint names.
+                Adapter::Redshift => {
+                    let login = store
+                        .redshift_credentials(iam, &conn.host, &conn.user, &conn.database)
+                        .await?;
+                    let mut target = conn.clone();
+                    // AWS names the user to sign in as, such as `IAM:app`.
+                    target.user = login.user;
+                    Ok(Resolved {
+                        target,
+                        password: Some(login.password),
+                        refresh: Some(iam_expiry(made, login.expires)),
+                    })
+                }
+                Adapter::Postgres | Adapter::Mariadb | Adapter::Mysql | Adapter::Sqlite => {
+                    // Signed for the database's own name, even when a tunnel carries the
+                    // traffic.
+                    let token = store
+                        .iam_token(iam, &conn.host, conn.port, &conn.user)
+                        .await?;
+                    let expiry = iam_expiry(made, token.credentials_expire);
+                    Ok(unchanged(Some(token.token), Some(expiry)))
+                }
+            }
         }
     }
 }
@@ -168,6 +206,8 @@ mod tests {
     struct Fake {
         asked: Mutex<Vec<String>>,
         secret: Option<&'static str>,
+        /// When the temporary Redshift password it hands out expires.
+        redshift_expires: Option<SystemTime>,
     }
 
     impl Store for Fake {
@@ -204,6 +244,24 @@ mod tests {
             Ok(aws::IamToken {
                 token: format!("{host}:{port}/?Action=connect&DBUser={user}"),
                 credentials_expire: None,
+            })
+        }
+
+        async fn redshift_credentials(
+            &self,
+            iam: &AwsIamAuth,
+            host: &str,
+            user: &str,
+            database: &str,
+        ) -> Result<aws::RedshiftLogin> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push(format!("redshift {} {host} {user} {database}", iam.profile));
+            Ok(aws::RedshiftLogin {
+                user: format!("IAM:{user}"),
+                password: "temporary".into(),
+                expires: self.redshift_expires,
             })
         }
     }
@@ -346,6 +404,93 @@ mod tests {
             *fake.asked.lock().unwrap(),
             ["iam prod orders.abc.eu-west-1.rds.amazonaws.com:5432 app"]
         );
+    }
+
+    fn redshift(auth: Auth) -> Connection {
+        Connection {
+            adapter: Adapter::Redshift,
+            host: "dw.abc123.eu-west-1.redshift.amazonaws.com".into(),
+            port: 5439,
+            database: "dev".into(),
+            ..conn(auth)
+        }
+    }
+
+    fn iam() -> Auth {
+        Auth::AwsIam(AwsIamAuth {
+            profile: "prod".into(),
+            region: String::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn redshift_signs_in_as_the_user_aws_names_with_its_temporary_password() {
+        let made = SystemTime::now();
+        let fake = Fake {
+            redshift_expires: Some(made + aws::REDSHIFT_PASSWORD_LIFETIME),
+            ..Fake::default()
+        };
+        let conn = redshift(iam());
+        let resolved = resolve_with(&fake, &conn).await.unwrap();
+        // Never an RDS token: Redshift doesn't take them.
+        assert_eq!(
+            *fake.asked.lock().unwrap(),
+            ["redshift prod dw.abc123.eu-west-1.redshift.amazonaws.com app dev"]
+        );
+        assert_eq!(resolved.password.as_deref(), Some("temporary"));
+        assert_eq!(resolved.target.user, "IAM:app");
+        assert_eq!(
+            (resolved.target.host.as_str(), resolved.target.port),
+            (conn.host.as_str(), 5439)
+        );
+        // Renewed after two thirds of its 15 minutes, as an RDS token is.
+        let refresh = resolved.refresh.unwrap();
+        assert!(refresh.renew_after <= IAM_REFRESH);
+        assert!(refresh.renew_after > IAM_REFRESH - Duration::from_secs(40));
+        assert!(refresh.lasts <= aws::REDSHIFT_PASSWORD_LIFETIME);
+        assert!(refresh.lasts > aws::REDSHIFT_PASSWORD_LIFETIME - Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn a_redshift_password_that_expires_sooner_is_renewed_sooner() {
+        let fake = Fake {
+            redshift_expires: Some(SystemTime::now() + Duration::from_secs(6 * 60)),
+            ..Fake::default()
+        };
+        let refresh = resolve_with(&fake, &redshift(iam()))
+            .await
+            .unwrap()
+            .refresh
+            .unwrap();
+        assert!(refresh.lasts <= Duration::from_secs(6 * 60));
+        assert!(refresh.renew_after <= Duration::from_secs(4 * 60));
+        assert!(refresh.renew_after > Duration::from_secs(3 * 60));
+        // Without an expiry from AWS, the lifetime it was asked for.
+        let unknown = resolve_with(&Fake::default(), &redshift(iam()))
+            .await
+            .unwrap();
+        assert_eq!(unknown.refresh, Some(IAM_EXPIRY));
+    }
+
+    #[tokio::test]
+    async fn no_redshift_credentials_are_asked_for_an_unencrypted_connection() {
+        let fake = Fake::default();
+        let mut plain = redshift(iam());
+        plain.tls = TlsMode::Prefer;
+        let error = resolve_with(&fake, &plain).await.err().unwrap().to_string();
+        assert!(error.contains("encrypted connection"), "{error}");
+        assert!(fake.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redshift_with_a_password_uses_the_keychain() {
+        let fake = Fake::default();
+        let resolved = resolve_with(&fake, &redshift(Auth::Password))
+            .await
+            .unwrap();
+        assert_eq!(resolved.password.as_deref(), Some("from-keychain"));
+        assert_eq!(resolved.target.user, "app");
+        assert_eq!(resolved.refresh, None);
     }
 
     #[test]

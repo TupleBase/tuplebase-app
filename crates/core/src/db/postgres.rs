@@ -107,6 +107,7 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_begin: "BEGIN READ ONLY",
     read_only_end: "ROLLBACK",
     objects: OBJECTS,
+    describe_empty: true,
 };
 
 /// Ends any transaction a run left open, such as one it began, or one a failed

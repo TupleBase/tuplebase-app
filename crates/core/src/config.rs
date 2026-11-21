@@ -58,6 +58,7 @@ pub enum Adapter {
     Mariadb,
     Mysql,
     Sqlite,
+    Redshift,
 }
 
 /// How a database quotes an identifier such as a table name.
@@ -76,6 +77,9 @@ pub enum ScriptFlavor {
     /// Dollar quotes, nested block comments, `--` comments that also end at a carriage
     /// return, and `E'...'` escape strings; backticks are not quotes.
     Postgres,
+    /// PostgreSQL's rules, except that a backslash escapes the next character in every
+    /// `'...'` string, not only in `E'...'`: Redshift reads `'a\'b'` as one string.
+    Redshift,
     /// `#` comments, `--` comments only before a space, backslash escapes, executable
     /// `/*! ... */` comments, and routine bodies kept whole.
     Mysql,
@@ -130,12 +134,21 @@ const SQLITE: EngineInfo = EngineInfo {
     script: ScriptFlavor::Sqlite,
 };
 
+const REDSHIFT: EngineInfo = EngineInfo {
+    label: "Redshift",
+    default_port: 5439,
+    is_file: false,
+    quote: IdentQuote::Double,
+    script: ScriptFlavor::Redshift,
+};
+
 impl Adapter {
-    pub const ALL: [Adapter; 4] = [
+    pub const ALL: [Adapter; 5] = [
         Adapter::Postgres,
         Adapter::Mariadb,
         Adapter::Mysql,
         Adapter::Sqlite,
+        Adapter::Redshift,
     ];
 
     /// This engine's static facts. A new engine adds its constant here.
@@ -145,6 +158,7 @@ impl Adapter {
             Adapter::Mariadb => &MARIADB,
             Adapter::Mysql => &MYSQL,
             Adapter::Sqlite => &SQLITE,
+            Adapter::Redshift => &REDSHIFT,
         }
     }
 
@@ -1075,6 +1089,7 @@ mod tests {
             Adapter::Mariadb => 1,
             Adapter::Mysql => 2,
             Adapter::Sqlite => 3,
+            Adapter::Redshift => 4,
         };
         for (i, adapter) in Adapter::ALL.into_iter().enumerate() {
             assert_eq!(position(adapter), i);
@@ -1084,9 +1099,12 @@ mod tests {
     #[test]
     fn each_engine_has_its_own_facts() {
         let labels = Adapter::ALL.map(Adapter::label);
-        assert_eq!(labels, ["PostgreSQL", "MariaDB", "MySQL", "SQLite"]);
+        assert_eq!(
+            labels,
+            ["PostgreSQL", "MariaDB", "MySQL", "SQLite", "Redshift"]
+        );
         let ports = Adapter::ALL.map(Adapter::default_port);
-        assert_eq!(ports, [5432, 3306, 3306, 0]);
+        assert_eq!(ports, [5432, 3306, 3306, 0, 5439]);
         for adapter in Adapter::ALL {
             // Only a server has a port.
             let info = adapter.info();
@@ -1103,6 +1121,14 @@ mod tests {
         assert_eq!(Adapter::Mariadb.info().script, ScriptFlavor::Mysql);
         assert_eq!(Adapter::Mysql.info().script, ScriptFlavor::Mysql);
         assert_eq!(Adapter::Sqlite.info().script, ScriptFlavor::Sqlite);
+        assert_eq!(Adapter::Redshift.info().script, ScriptFlavor::Redshift);
+        assert!(!Adapter::Redshift.is_file());
+        assert_eq!(Adapter::Redshift.quote_ident(r#"a"b"#), r#""a""b""#);
+        // Saved in every connections.json: it can never change.
+        assert_eq!(
+            serde_json::to_string(&Adapter::Redshift).unwrap(),
+            r#""redshift""#
+        );
     }
 
     #[test]

@@ -83,6 +83,7 @@ pub(super) const DIALECT: Dialect = Dialect {
     read_only_begin: "START TRANSACTION READ ONLY",
     read_only_end: "ROLLBACK",
     objects: OBJECTS,
+    describe_empty: true,
 };
 
 /// Ends any transaction a run left open, so the connection goes back to the pool

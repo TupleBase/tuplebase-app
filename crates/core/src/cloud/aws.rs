@@ -1,5 +1,6 @@
 //! Everything that talks to AWS: credentials kept in Secrets Manager and SSM Parameter
-//! Store, RDS IAM auth tokens, the profiles on this machine, and the databases in RDS.
+//! Store, RDS IAM auth tokens, temporary Redshift credentials, the profiles on this
+//! machine, and the databases in RDS and Redshift.
 //!
 //! A connection saves only where the secret is (profile, region, name). The value is
 //! read on every connect and never written to disk or the OS credential store, so a
@@ -12,6 +13,7 @@ use aws_config::profile::ProfileFileCredentialsProvider;
 use aws_config::provider_config::ProviderConfig;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
 use aws_sdk_rds::types::{DbCluster, DbInstance};
+use aws_sdk_redshiftserverless::types::{Namespace, Workgroup};
 use aws_sdk_ssm::config::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_ssm::error::{ProvideErrorMetadata, SdkError};
 use aws_smithy_http_client::tls::{Provider as TlsProvider, rustls_provider::CryptoMode};
@@ -210,18 +212,172 @@ async fn sign_iam_token(config: &SdkConfig, host: &str, port: u16, user: &str) -
     Ok(token.as_str().to_owned())
 }
 
-/// The region in an RDS endpoint such as `orders.abc123.eu-west-1.rds.amazonaws.com`.
-pub fn region_of_host(host: &str) -> Option<String> {
+/// The service, the labels before the region, and the region of an AWS database
+/// endpoint: `orders.abc123.eu-west-1.rds.amazonaws.com` gives `rds`, `orders.abc123`
+/// and `eu-west-1`. RDS, Redshift and Redshift Serverless endpoints, also in China.
+fn endpoint_parts(host: &str) -> Option<(String, String, String)> {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     let rest = host
-        .strip_suffix(".rds.amazonaws.com")
-        .or_else(|| host.strip_suffix(".rds.amazonaws.com.cn"))?;
-    let region = rest.rsplit('.').next()?;
+        .strip_suffix(".amazonaws.com")
+        .or_else(|| host.strip_suffix(".amazonaws.com.cn"))?;
+    let (rest, service) = rest.rsplit_once('.')?;
+    if !["rds", "redshift", "redshift-serverless"].contains(&service) {
+        return None;
+    }
+    let (labels, region) = rest.rsplit_once('.')?;
     let looks_like_one = region.split('-').count() >= 3
         && region
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    looks_like_one.then(|| region.to_owned())
+    (looks_like_one && !labels.is_empty())
+        .then(|| (service.to_owned(), labels.to_owned(), region.to_owned()))
+}
+
+/// The region in an RDS or Redshift endpoint such as
+/// `orders.abc123.eu-west-1.rds.amazonaws.com`.
+pub fn region_of_host(host: &str) -> Option<String> {
+    endpoint_parts(host).map(|(_, _, region)| region)
+}
+
+/// What a Redshift endpoint names, for asking AWS for its temporary credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedshiftTarget {
+    /// A provisioned cluster, by its identifier.
+    Cluster(String),
+    /// A Redshift Serverless workgroup, by its name.
+    Workgroup(String),
+}
+
+/// The cluster or workgroup at a Redshift endpoint, and its region. A cluster's endpoint
+/// is `<cluster>.<id>.<region>.redshift.amazonaws.com`, a workgroup's
+/// `<workgroup>.<account>.<region>.redshift-serverless.amazonaws.com`. `None` for any other
+/// host, such as a custom domain name.
+pub fn redshift_target(host: &str) -> Option<(RedshiftTarget, String)> {
+    let (service, labels, region) = endpoint_parts(host)?;
+    let (name, _) = labels.split_once('.')?;
+    let target = match service.as_str() {
+        "redshift" => RedshiftTarget::Cluster(name.to_owned()),
+        "redshift-serverless" => RedshiftTarget::Workgroup(name.to_owned()),
+        _ => return None,
+    };
+    Some((target, region))
+}
+
+/// How long a temporary Redshift password is asked for: the least both
+/// `GetClusterCredentials` and Redshift Serverless's `GetCredentials` allow, the same as
+/// an RDS IAM token, so it is renewed on the same schedule.
+pub const REDSHIFT_PASSWORD_LIFETIME: Duration = Duration::from_secs(15 * 60);
+
+/// A temporary Redshift sign-in, from [`redshift_credentials`].
+pub struct RedshiftLogin {
+    /// The database user to sign in as, which AWS names: `IAM:<user>` for a cluster,
+    /// `IAM:<user>` or `IAMR:<role>` for a workgroup.
+    pub user: String,
+    pub password: String,
+    /// When new connections can no longer sign in with it.
+    pub expires: Option<SystemTime>,
+}
+
+/// Temporary credentials for the Redshift at `host`: `GetClusterCredentials` for a
+/// provisioned cluster, for the database user `user`, never creating it; Redshift
+/// Serverless's `GetCredentials` for a workgroup, whose user AWS takes from the IAM
+/// identity. `database` limits them to that database when given. An empty `region` means
+/// the one in the host name. Made from the profile's credentials, read afresh on every
+/// call.
+///
+/// `host` must be the cluster's or workgroup's own endpoint, even when the connection goes
+/// through an SSH tunnel: it names the cluster or workgroup.
+pub async fn redshift_credentials(
+    profile: &str,
+    region: &str,
+    host: &str,
+    user: &str,
+    database: &str,
+) -> Result<RedshiftLogin> {
+    let Some((target, host_region)) = redshift_target(host) else {
+        bail!(
+            "signing in to Redshift with IAM needs the cluster's or workgroup's own endpoint \
+             (*.redshift.amazonaws.com or *.redshift-serverless.amazonaws.com) as the host, \
+             to know which one to ask for credentials; \"{host}\" isn't one"
+        );
+    };
+    let region = match region {
+        "" => host_region,
+        region => region.to_owned(),
+    };
+    let made = async {
+        let config = sdk_config(profile, &region).await?;
+        match &target {
+            RedshiftTarget::Cluster(cluster) => {
+                let client = aws_sdk_redshift::Client::new(&config);
+                let output = cluster_credentials(&client, cluster, user, database)
+                    .send()
+                    .await
+                    .map_err(api_error)?;
+                redshift_login(output.db_user(), output.db_password(), output.expiration())
+            }
+            RedshiftTarget::Workgroup(workgroup) => {
+                let client = aws_sdk_redshiftserverless::Client::new(&config);
+                let output = workgroup_credentials(&client, workgroup, database)
+                    .send()
+                    .await
+                    .map_err(api_error)?;
+                redshift_login(output.db_user(), output.db_password(), output.expiration())
+            }
+        }
+    };
+    timeout(TIMEOUT, made)
+        .await
+        .map_err(|_| anyhow!("timed out"))?
+        .context("getting temporary Redshift credentials")
+}
+
+/// The `GetClusterCredentials` request: the user, never created, and the database when
+/// given, for [`REDSHIFT_PASSWORD_LIFETIME`].
+fn cluster_credentials(
+    client: &aws_sdk_redshift::Client,
+    cluster: &str,
+    user: &str,
+    database: &str,
+) -> aws_sdk_redshift::operation::get_cluster_credentials::builders::GetClusterCredentialsFluentBuilder
+{
+    client
+        .get_cluster_credentials()
+        .cluster_identifier(cluster)
+        .db_user(user)
+        .set_db_name((!database.is_empty()).then(|| database.to_owned()))
+        .auto_create(false)
+        .duration_seconds(REDSHIFT_PASSWORD_LIFETIME.as_secs() as i32)
+}
+
+/// Redshift Serverless's `GetCredentials` request: the workgroup, and the database when
+/// given, for [`REDSHIFT_PASSWORD_LIFETIME`]. It takes no user: AWS maps the IAM identity
+/// to one.
+fn workgroup_credentials(
+    client: &aws_sdk_redshiftserverless::Client,
+    workgroup: &str,
+    database: &str,
+) -> aws_sdk_redshiftserverless::operation::get_credentials::builders::GetCredentialsFluentBuilder {
+    client
+        .get_credentials()
+        .workgroup_name(workgroup)
+        .set_db_name((!database.is_empty()).then(|| database.to_owned()))
+        .duration_seconds(REDSHIFT_PASSWORD_LIFETIME.as_secs() as i32)
+}
+
+/// The sign-in from what either credentials call answered.
+fn redshift_login(
+    user: Option<&str>,
+    password: Option<&str>,
+    expiration: Option<&aws_sdk_redshift::primitives::DateTime>,
+) -> Result<RedshiftLogin> {
+    let user = user.filter(|u| !u.is_empty());
+    let password = password.filter(|p| !p.is_empty());
+    Ok(RedshiftLogin {
+        user: user.context("AWS returned no database user")?.to_owned(),
+        password: password.context("AWS returned no password")?.to_owned(),
+        expires: expiration.and_then(|at| SystemTime::try_from(*at).ok()),
+    })
 }
 
 /// Whether `host` is an RDS endpoint, whose certificates come from Amazon's RDS
@@ -272,9 +428,11 @@ async fn profiles_in(fs: &Fs, env: &Env) -> Result<Vec<Profile>> {
     Ok(profiles)
 }
 
-/// Finds the RDS databases and Aurora clusters `profile` can see in `regions`, searching
-/// the regions at once; no regions means the profile's own. Needs
-/// `rds:DescribeDBInstances` and `rds:DescribeDBClusters`. See [`super::discover`].
+/// Finds the RDS databases, Aurora clusters, Redshift clusters and Redshift Serverless
+/// workgroups `profile` can see in `regions`, searching the regions and the services at
+/// once; no regions means the profile's own. Each service needs its own permissions (see
+/// [`Service::permissions`]); one that is refused is an error beside what the others
+/// found. See [`super::discover`].
 pub async fn discover(profile: &str, regions: &[String]) -> Discovery {
     let regions: Vec<&str> = regions
         .iter()
@@ -314,23 +472,14 @@ pub async fn discover(profile: &str, regions: &[String]) -> Discovery {
             .into_builder()
             .region(Region::new(region.clone()))
             .build();
-        async move {
-            let result = timeout(TIMEOUT, discover_region(&config, profile, region)).await;
-            (region, result)
-        }
+        async move { (region, discover_region(&config, profile, region).await) }
     });
-    for (region, result) in futures_util::future::join_all(searches).await {
-        match result {
-            Ok(Ok(found)) if found.is_empty() => discovery.empty_regions.push(region.clone()),
-            Ok(Ok(found)) => discovery.found.extend(found),
-            Ok(Err(e)) => discovery.errors.push(region_error(region, profile, e)),
-            Err(_) => discovery.errors.push(DiscoverError {
-                region: Some(region.clone()),
-                kind: DiscoverErrorKind::TimedOut,
-                message: format!("Timed out listing the databases in {region}."),
-                detail: None,
-            }),
+    for (region, (found, errors)) in futures_util::future::join_all(searches).await {
+        if found.is_empty() && errors.is_empty() {
+            discovery.empty_regions.push(region.clone());
         }
+        discovery.found.extend(found);
+        discovery.errors.extend(errors);
     }
     discovery
         .found
@@ -360,7 +509,87 @@ where
     }
 }
 
+/// An AWS service that discovery lists databases in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Service {
+    Rds,
+    Redshift,
+    RedshiftServerless,
+}
+
+impl Service {
+    fn name(self) -> &'static str {
+        match self {
+            Service::Rds => "RDS",
+            Service::Redshift => "Redshift",
+            Service::RedshiftServerless => "Redshift Serverless",
+        }
+    }
+
+    /// What it lists.
+    fn listing(self) -> &'static str {
+        match self {
+            Service::Rds => "databases",
+            Service::Redshift => "Redshift clusters",
+            Service::RedshiftServerless => "Redshift Serverless workgroups",
+        }
+    }
+
+    /// What the AWS identity needs to list them.
+    fn permissions(self) -> &'static str {
+        match self {
+            Service::Rds => "rds:DescribeDBInstances and rds:DescribeDBClusters",
+            Service::Redshift => "redshift:DescribeClusters",
+            Service::RedshiftServerless => {
+                "redshift-serverless:ListWorkgroups and redshift-serverless:ListNamespaces"
+            }
+        }
+    }
+
+    /// How a public database's certificate is checked.
+    fn verified_note(self) -> &'static str {
+        match self {
+            Service::Rds => "Encryption: Verified, with Amazon's RDS certificates.",
+            Service::Redshift | Service::RedshiftServerless => {
+                "Encryption: Verified, with Amazon's public certificate authorities."
+            }
+        }
+    }
+}
+
+/// What every service holds in `region`, and the services that couldn't be listed.
 async fn discover_region(
+    config: &SdkConfig,
+    profile: &str,
+    region: &str,
+) -> (Vec<Discovered>, Vec<DiscoverError>) {
+    let (rds, redshift, serverless) = tokio::join!(
+        timeout(TIMEOUT, rds_in_region(config, profile, region)),
+        timeout(TIMEOUT, redshift_in_region(config, profile, region)),
+        timeout(TIMEOUT, serverless_in_region(config, profile, region)),
+    );
+    let mut found = Vec::new();
+    let mut errors = Vec::new();
+    for (service, result) in [
+        (Service::Rds, rds),
+        (Service::Redshift, redshift),
+        (Service::RedshiftServerless, serverless),
+    ] {
+        match result {
+            Ok(Ok(more)) => found.extend(more),
+            Ok(Err(e)) => errors.push(region_error(service, region, profile, e)),
+            Err(_) => errors.push(DiscoverError {
+                region: Some(region.to_owned()),
+                kind: DiscoverErrorKind::TimedOut,
+                message: format!("Timed out listing the {} in {region}.", service.listing()),
+                detail: None,
+            }),
+        }
+    }
+    (found, errors)
+}
+
+async fn rds_in_region(
     config: &SdkConfig,
     profile: &str,
     region: &str,
@@ -383,6 +612,62 @@ async fn discover_region(
         .await
         .map_err(api_failure)?;
     Ok(found_in_region(&instances, &clusters, profile, region))
+}
+
+async fn redshift_in_region(
+    config: &SdkConfig,
+    profile: &str,
+    region: &str,
+) -> Result<Vec<Discovered>, ApiFailure> {
+    let clusters: Vec<aws_sdk_redshift::types::Cluster> = aws_sdk_redshift::Client::new(config)
+        .describe_clusters()
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await
+        .map_err(api_failure)?;
+    Ok(clusters
+        .iter()
+        .map(|cluster| from_redshift_cluster(cluster, profile, region))
+        .collect())
+}
+
+async fn serverless_in_region(
+    config: &SdkConfig,
+    profile: &str,
+    region: &str,
+) -> Result<Vec<Discovered>, ApiFailure> {
+    let client = aws_sdk_redshiftserverless::Client::new(config);
+    let workgroups: Vec<Workgroup> = client
+        .list_workgroups()
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await
+        .map_err(api_failure)?;
+    if workgroups.is_empty() {
+        return Ok(Vec::new());
+    }
+    // A workgroup's database and admin user are its namespace's.
+    let namespaces: Vec<Namespace> = client
+        .list_namespaces()
+        .into_paginator()
+        .items()
+        .send()
+        .try_collect()
+        .await
+        .map_err(api_failure)?;
+    Ok(workgroups
+        .iter()
+        .map(|workgroup| {
+            let namespace = namespaces.iter().find(|n| {
+                n.namespace_name().is_some() && n.namespace_name() == workgroup.namespace_name()
+            });
+            from_workgroup(workgroup, namespace, profile, region)
+        })
+        .collect())
 }
 
 /// Clusters once each, at their writer endpoint, and the instances outside any cluster.
@@ -416,6 +701,7 @@ fn found_in_region(
 
 /// What a database's fields say, in the provider-neutral form.
 struct Found<'a> {
+    service: Service,
     label: &'a str,
     engine: &'a str,
     host: &'a str,
@@ -435,6 +721,7 @@ fn from_instance(instance: &DbInstance, profile: &str, region: &str) -> Discover
     let endpoint = instance.endpoint();
     discovered(
         Found {
+            service: Service::Rds,
             label: instance.db_instance_identifier().unwrap_or_default(),
             engine: instance.engine().unwrap_or_default(),
             host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
@@ -456,6 +743,7 @@ fn from_instance(instance: &DbInstance, profile: &str, region: &str) -> Discover
 fn from_cluster(cluster: &DbCluster, public: bool, profile: &str, region: &str) -> Discovered {
     discovered(
         Found {
+            service: Service::Rds,
             label: cluster.db_cluster_identifier().unwrap_or_default(),
             engine: cluster.engine().unwrap_or_default(),
             host: cluster.endpoint().unwrap_or_default(),
@@ -474,13 +762,78 @@ fn from_cluster(cluster: &DbCluster, public: bool, profile: &str, region: &str) 
     )
 }
 
-/// The app's database for an RDS engine name; `None` for the ones it can't open yet.
+/// A provisioned Redshift cluster. Any cluster takes temporary IAM credentials
+/// (`GetClusterCredentials`), so `iam_enabled` is always set.
+fn from_redshift_cluster(
+    cluster: &aws_sdk_redshift::types::Cluster,
+    profile: &str,
+    region: &str,
+) -> Discovered {
+    let endpoint = cluster.endpoint();
+    discovered(
+        Found {
+            service: Service::Redshift,
+            label: cluster.cluster_identifier().unwrap_or_default(),
+            engine: REDSHIFT_ENGINE,
+            host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
+            port: endpoint.and_then(|e| e.port()),
+            database: cluster.db_name(),
+            user: cluster.master_username(),
+            status: cluster.cluster_status(),
+            public: cluster.publicly_accessible().unwrap_or(false),
+            iam_enabled: true,
+            managed_secret: cluster.master_password_secret_arn(),
+            arn: cluster.cluster_namespace_arn(),
+            readers: None,
+        },
+        profile,
+        region,
+    )
+}
+
+/// A Redshift Serverless workgroup, with its namespace's database and admin user when
+/// known. Any workgroup takes temporary IAM credentials (`GetCredentials`).
+fn from_workgroup(
+    workgroup: &Workgroup,
+    namespace: Option<&Namespace>,
+    profile: &str,
+    region: &str,
+) -> Discovered {
+    let endpoint = workgroup.endpoint();
+    discovered(
+        Found {
+            service: Service::RedshiftServerless,
+            label: workgroup.workgroup_name().unwrap_or_default(),
+            engine: REDSHIFT_SERVERLESS_ENGINE,
+            host: endpoint.and_then(|e| e.address()).unwrap_or_default(),
+            port: endpoint.and_then(|e| e.port()).or(workgroup.port()),
+            database: namespace.and_then(|n| n.db_name()),
+            user: namespace.and_then(|n| n.admin_username()),
+            status: workgroup.status().map(|s| s.as_str()),
+            public: workgroup.publicly_accessible().unwrap_or(false),
+            iam_enabled: true,
+            managed_secret: namespace.and_then(|n| n.admin_password_secret_arn()),
+            arn: workgroup.workgroup_arn(),
+            readers: None,
+        },
+        profile,
+        region,
+    )
+}
+
+/// The engine names discovery gives Redshift, which RDS doesn't run.
+const REDSHIFT_ENGINE: &str = "redshift";
+const REDSHIFT_SERVERLESS_ENGINE: &str = "redshift-serverless";
+
+/// The app's database for an RDS engine name, or Redshift's; `None` for the ones it
+/// can't open yet.
 pub fn adapter_for_engine(engine: &str) -> Option<Adapter> {
     match engine {
         "postgres" | "aurora-postgresql" => Some(Adapter::Postgres),
         // `aurora` is Aurora MySQL 5.6, from before the engine had its own name.
         "mysql" | "aurora-mysql" | "aurora" => Some(Adapter::Mysql),
         "mariadb" => Some(Adapter::Mariadb),
+        REDSHIFT_ENGINE | REDSHIFT_SERVERLESS_ENGINE => Some(Adapter::Redshift),
         _ => None,
     }
 }
@@ -521,7 +874,7 @@ fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
         ));
     }
     if found.public {
-        notes.push("Encryption: Verified, with Amazon's RDS certificates.".into());
+        notes.push(found.service.verified_note().into());
     } else {
         notes.push(
             "Not reachable from the internet: connect through an SSH tunnel to a host in \
@@ -530,10 +883,12 @@ fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
                 .into(),
         );
     }
-    // Without a database, PostgreSQL would look for one named after the user.
-    let database = match found.database {
-        Some(name) if !name.is_empty() => name.to_owned(),
-        _ if adapter == Some(Adapter::Postgres) => "postgres".to_owned(),
+    // Without a database, PostgreSQL and Redshift would look for one named after the
+    // user. Redshift's first database is `dev` unless named otherwise.
+    let database = match (found.database, adapter) {
+        (Some(name), _) if !name.is_empty() => name.to_owned(),
+        (_, Some(Adapter::Postgres)) => "postgres".to_owned(),
+        (_, Some(Adapter::Redshift)) => "dev".to_owned(),
         _ => String::new(),
     };
     Discovered {
@@ -617,14 +972,20 @@ fn sign_in_error(profile: &str, message: &str) -> DiscoverError {
     }
 }
 
-fn region_error(region: &str, profile: &str, failure: ApiFailure) -> DiscoverError {
+fn region_error(
+    service: Service,
+    region: &str,
+    profile: &str,
+    failure: ApiFailure,
+) -> DiscoverError {
     let code = failure.code.as_deref().unwrap_or_default();
     let (kind, message) = match code {
         "AccessDenied" | "AccessDeniedException" | "UnauthorizedOperation" => (
             DiscoverErrorKind::AccessDenied,
             format!(
-                "Not allowed to list databases in {region}: the AWS identity needs \
-                 rds:DescribeDBInstances and rds:DescribeDBClusters ({}).",
+                "Not allowed to list {} in {region}: the AWS identity needs {} ({}).",
+                service.listing(),
+                service.permissions(),
                 failure.message
             ),
         ),
@@ -642,11 +1003,19 @@ fn region_error(region: &str, profile: &str, failure: ApiFailure) -> DiscoverErr
         ),
         "" => (
             DiscoverErrorKind::Other,
-            format!("Couldn't reach RDS in {region}: {}", failure.message),
+            format!(
+                "Couldn't reach {} in {region}: {}",
+                service.name(),
+                failure.message
+            ),
         ),
         code => (
             DiscoverErrorKind::Other,
-            format!("{code} in {region}: {}", failure.message),
+            format!(
+                "{}: {code} in {region}: {}",
+                service.name(),
+                failure.message
+            ),
         ),
     };
     DiscoverError {
@@ -836,6 +1205,11 @@ mod tests {
         assert_eq!(adapter_for_engine("mysql"), Some(Adapter::Mysql));
         assert_eq!(adapter_for_engine("aurora-mysql"), Some(Adapter::Mysql));
         assert_eq!(adapter_for_engine("mariadb"), Some(Adapter::Mariadb));
+        assert_eq!(adapter_for_engine("redshift"), Some(Adapter::Redshift));
+        assert_eq!(
+            adapter_for_engine("redshift-serverless"),
+            Some(Adapter::Redshift)
+        );
         for other in ["oracle-ee", "sqlserver-se", "db2-se", "docdb", "neptune"] {
             assert_eq!(adapter_for_engine(other), None, "{other}");
         }
@@ -998,6 +1372,7 @@ mod tests {
         assert_eq!(no_region.kind, DiscoverErrorKind::NoRegion);
 
         let denied = region_error(
+            Service::Rds,
             "eu-west-1",
             "prod",
             ApiFailure {
@@ -1010,6 +1385,7 @@ mod tests {
         assert_eq!(denied.region.as_deref(), Some("eu-west-1"));
 
         let expired = region_error(
+            Service::Rds,
             "us-east-1",
             "",
             ApiFailure {
@@ -1021,6 +1397,7 @@ mod tests {
         assert!(expired.message.contains("`aws sso login`"));
 
         let offline = region_error(
+            Service::Rds,
             "eu-west-1",
             "",
             ApiFailure {
@@ -1101,6 +1478,219 @@ mod tests {
         assert_eq!(region("localhost"), None);
         assert!(is_rds_host("orders.abc123.eu-west-1.rds.amazonaws.com"));
         assert!(!is_rds_host("rds.amazonaws.com.example.com"));
+    }
+
+    #[test]
+    fn a_redshift_endpoint_names_its_cluster_or_workgroup_and_region() {
+        assert_eq!(
+            redshift_target("examplecluster.abc123xyz789.us-west-2.redshift.amazonaws.com"),
+            Some((
+                RedshiftTarget::Cluster("examplecluster".into()),
+                "us-west-2".into()
+            ))
+        );
+        assert_eq!(
+            redshift_target("Default-WG.123456789012.EU-WEST-1.redshift-serverless.amazonaws.com."),
+            Some((
+                RedshiftTarget::Workgroup("default-wg".into()),
+                "eu-west-1".into()
+            ))
+        );
+        assert_eq!(
+            redshift_target("dw.abc.cn-north-1.redshift.amazonaws.com.cn"),
+            Some((RedshiftTarget::Cluster("dw".into()), "cn-north-1".into()))
+        );
+        for other in [
+            "orders.abc.eu-west-1.rds.amazonaws.com",
+            "dw.example.com",
+            "redshift.amazonaws.com",
+            "eu-west-1.redshift.amazonaws.com",
+            "dw.eu-west-1.redshift.amazonaws.com.example.com",
+        ] {
+            assert_eq!(redshift_target(other), None, "{other}");
+        }
+        assert_eq!(
+            region_of_host("dw.abc.ap-south-1.redshift.amazonaws.com").as_deref(),
+            Some("ap-south-1")
+        );
+        // Amazon's RDS authorities are for RDS hosts only.
+        assert!(!is_rds_host("dw.abc.ap-south-1.redshift.amazonaws.com"));
+    }
+
+    #[test]
+    fn a_cluster_is_asked_for_an_existing_user_for_fifteen_minutes() {
+        let client = aws_sdk_redshift::Client::new(&fixed_config("eu-west-1"));
+        let request = cluster_credentials(&client, "dw", "app", "sales");
+        let input = request.as_input();
+        assert_eq!(input.get_cluster_identifier().as_deref(), Some("dw"));
+        assert_eq!(input.get_db_user().as_deref(), Some("app"));
+        assert_eq!(input.get_db_name().as_deref(), Some("sales"));
+        // Never creates a user that doesn't exist.
+        assert_eq!(*input.get_auto_create(), Some(false));
+        assert_eq!(*input.get_duration_seconds(), Some(900));
+        assert!(input.get_db_groups().is_none());
+        let any_database = cluster_credentials(&client, "dw", "app", "");
+        assert_eq!(*any_database.as_input().get_db_name(), None);
+    }
+
+    #[test]
+    fn a_workgroup_is_asked_without_a_user() {
+        let client = aws_sdk_redshiftserverless::Client::new(&fixed_config("eu-west-1"));
+        let request = workgroup_credentials(&client, "analytics", "dev");
+        let input = request.as_input();
+        assert_eq!(input.get_workgroup_name().as_deref(), Some("analytics"));
+        assert_eq!(input.get_db_name().as_deref(), Some("dev"));
+        assert_eq!(*input.get_duration_seconds(), Some(900));
+        assert_eq!(*input.get_custom_domain_name(), None);
+    }
+
+    #[test]
+    fn a_redshift_login_takes_the_user_password_and_expiry_aws_returns() {
+        use aws_sdk_redshift::primitives::DateTime;
+        let at = DateTime::from_secs(1_724_710_500);
+        let login = redshift_login(Some("IAMR:analyst"), Some("p4ss"), Some(&at)).unwrap();
+        assert_eq!(login.user, "IAMR:analyst");
+        assert_eq!(login.password, "p4ss");
+        assert_eq!(
+            login.expires,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_724_710_500))
+        );
+        assert!(redshift_login(None, Some("p"), None).is_err());
+        assert!(redshift_login(Some("IAM:a"), Some(""), None).is_err());
+        assert!(
+            redshift_login(Some("IAM:a"), Some("p"), None)
+                .unwrap()
+                .expires
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn redshift_credentials_need_a_redshift_endpoint() {
+        // Refused before asking AWS for anything.
+        let error = redshift_credentials("", "eu-west-1", "dw.example.com", "app", "dev")
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("*.redshift.amazonaws.com"), "{error}");
+    }
+
+    #[test]
+    fn redshift_clusters_and_workgroups_are_found_with_their_sign_in() {
+        use aws_sdk_redshift::types::{Cluster, Endpoint as ClusterEndpoint};
+        use aws_sdk_redshiftserverless::types::{Endpoint as WorkgroupEndpoint, WorkgroupStatus};
+        let cluster = Cluster::builder()
+            .cluster_identifier("dw")
+            .cluster_status("available")
+            .master_username("awsuser")
+            .publicly_accessible(true)
+            .cluster_namespace_arn("arn:aws:redshift:eu-west-1:123456789012:namespace:abc")
+            .endpoint(
+                ClusterEndpoint::builder()
+                    .address("dw.abc123.eu-west-1.redshift.amazonaws.com")
+                    .port(5439)
+                    .build(),
+            )
+            .build();
+        let found = from_redshift_cluster(&cluster, "prod", "eu-west-1");
+        assert_eq!(found.adapter, Some(Adapter::Redshift));
+        assert_eq!(found.engine, "redshift");
+        assert_eq!(found.database, "dev", "Redshift's first database");
+        assert_eq!((found.port, found.user.as_str()), (5439, "awsuser"));
+        assert_eq!(
+            found.auth,
+            Auth::AwsIam(AwsIamAuth {
+                profile: "prod".into(),
+                region: "eu-west-1".into(),
+            })
+        );
+        assert!(
+            found
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("public certificate")
+        );
+        let conn = found.connection().unwrap();
+        assert_eq!(conn.tls, TlsMode::Verify);
+        assert_eq!(conn.adapter, Adapter::Redshift);
+
+        let managed = Cluster::builder()
+            .cluster_identifier("dw2")
+            .db_name("sales")
+            .master_password_secret_arn("arn:aws:secretsmanager:eu-west-1:1:secret:redshift!dw2")
+            .build();
+        let found = from_redshift_cluster(&managed, "prod", "eu-west-1");
+        assert!(matches!(&found.auth, Auth::AwsSecret(s) if s.name.ends_with("redshift!dw2")));
+        assert_eq!(found.database, "sales");
+        assert!(!found.usable(), "no endpoint yet");
+
+        let workgroup = Workgroup::builder()
+            .workgroup_name("analytics")
+            .namespace_name("ns")
+            .status(WorkgroupStatus::Available)
+            .workgroup_arn("arn:aws:redshift-serverless:eu-west-1:1:workgroup/x")
+            .endpoint(
+                WorkgroupEndpoint::builder()
+                    .address("analytics.123456789012.eu-west-1.redshift-serverless.amazonaws.com")
+                    .port(5439)
+                    .build(),
+            )
+            .build();
+        let namespace = Namespace::builder()
+            .namespace_name("ns")
+            .db_name("warehouse")
+            .admin_username("admin")
+            .build();
+        let found = from_workgroup(&workgroup, Some(&namespace), "", "eu-west-1");
+        assert_eq!(found.engine, "redshift-serverless");
+        assert_eq!(found.status, "AVAILABLE");
+        assert_eq!(
+            (found.database.as_str(), found.user.as_str()),
+            ("warehouse", "admin")
+        );
+        assert!(found.note.as_deref().unwrap().contains("SSH tunnel"));
+        assert_eq!(found.connection().unwrap().tls, TlsMode::Require);
+        let alone = from_workgroup(&workgroup, None, "", "eu-west-1");
+        assert_eq!(alone.database, "dev");
+        assert!(matches!(alone.auth, Auth::AwsIam(_)));
+    }
+
+    #[test]
+    fn a_refused_redshift_listing_names_its_own_permissions() {
+        let failure = || ApiFailure {
+            code: Some("AccessDeniedException".into()),
+            message: "not authorized".into(),
+        };
+        let cluster = region_error(Service::Redshift, "eu-west-1", "prod", failure());
+        assert_eq!(cluster.kind, DiscoverErrorKind::AccessDenied);
+        assert!(
+            cluster.message.contains("redshift:DescribeClusters"),
+            "{}",
+            cluster.message
+        );
+        assert!(!cluster.message.contains("rds:"), "{}", cluster.message);
+        let serverless = region_error(Service::RedshiftServerless, "eu-west-1", "prod", failure());
+        assert!(
+            serverless
+                .message
+                .contains("redshift-serverless:ListWorkgroups")
+        );
+        let unknown = region_error(
+            Service::RedshiftServerless,
+            "eu-west-1",
+            "",
+            ApiFailure {
+                code: Some("UnknownOperationException".into()),
+                message: "x".into(),
+            },
+        );
+        assert!(
+            unknown.message.starts_with("Redshift Serverless: "),
+            "{}",
+            unknown.message
+        );
     }
 
     #[test]
