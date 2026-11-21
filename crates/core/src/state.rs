@@ -100,6 +100,20 @@ impl SessionState {
             .map(|e| e.sql.as_str())
     }
 
+    /// The connections queries last ran on, newest first, at most `n` of them.
+    pub fn recent_connections(&self, n: usize) -> Vec<&str> {
+        let mut recent: Vec<&str> = Vec::new();
+        for entry in self.history.iter().rev() {
+            if recent.len() == n {
+                break;
+            }
+            if !recent.contains(&entry.connection.as_str()) {
+                recent.push(&entry.connection);
+            }
+        }
+        recent
+    }
+
     /// Remembers what's in the editor; an empty editor needs no draft.
     pub fn set_draft(&mut self, connection: &str, sql: &str) {
         if sql.trim().is_empty() {
@@ -144,6 +158,21 @@ mod tests {
         state.record("a", "two");
         state.record("a", " one ");
         assert_eq!(state.history_for("a").collect::<Vec<_>>(), ["one", "two"]);
+    }
+
+    #[test]
+    fn recent_connections_are_newest_first_once_each() {
+        let mut state = SessionState::default();
+        assert!(state.recent_connections(5).is_empty());
+        state.record("a", "one");
+        state.record("b", "one");
+        state.record("a", "two");
+        state.record("c", "one");
+        assert_eq!(state.recent_connections(5), ["c", "a", "b"]);
+        assert_eq!(state.recent_connections(2), ["c", "a"]);
+        assert!(state.recent_connections(0).is_empty());
+        state.remove_connection("a");
+        assert_eq!(state.recent_connections(5), ["c", "b"]);
     }
 
     #[test]

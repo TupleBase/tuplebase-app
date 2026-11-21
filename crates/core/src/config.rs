@@ -400,6 +400,16 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Whether a search for `query` finds it: each word of the query, ignoring case, is
+    /// in its name, its folder path or where it connects to. An empty query finds all.
+    pub fn matches(&self, query: &str) -> bool {
+        let fields = [&self.name, &self.folder, &self.location()].map(|f| f.to_lowercase());
+        query
+            .to_lowercase()
+            .split_whitespace()
+            .all(|word| fields.iter().any(|field| field.contains(word)))
+    }
+
     /// Where it connects to, for display: the host, a database file's name, or the
     /// secret that names the host.
     pub fn location(&self) -> String {
@@ -494,15 +504,36 @@ pub struct FolderNode<'a> {
     pub connections: Vec<&'a Connection>,
 }
 
-impl FolderNode<'_> {
+impl<'a> FolderNode<'a> {
     /// Connections in this folder and every folder below it.
     pub fn connection_count(&self) -> usize {
-        self.connections.len()
-            + self
+        self.count(|_| true)
+    }
+
+    /// Connections in this folder and every folder below it for which `pred` holds.
+    pub fn count(&self, pred: impl Fn(&Connection) -> bool + Copy) -> usize {
+        self.connections.iter().filter(|c| pred(c)).count()
+            + self.folders.iter().map(|f| f.count(pred)).sum::<usize>()
+    }
+
+    /// This folder with only the connections `keep` holds for, and only the folders below
+    /// that still hold one of them.
+    pub fn filtered(&self, keep: impl Fn(&Connection) -> bool + Copy) -> FolderNode<'a> {
+        FolderNode {
+            path: self.path.clone(),
+            folders: self
                 .folders
                 .iter()
-                .map(FolderNode::connection_count)
-                .sum::<usize>()
+                .map(|f| f.filtered(keep))
+                .filter(|f| f.connection_count() > 0)
+                .collect(),
+            connections: self
+                .connections
+                .iter()
+                .copied()
+                .filter(|c| keep(c))
+                .collect(),
+        }
     }
 }
 
@@ -1766,6 +1797,49 @@ mod tests {
         config.upsert(in_folder("b", "P/Q"), None).unwrap();
         let tree = config.tree();
         assert_eq!(tree.folders[0].connection_count(), 2);
+    }
+
+    #[test]
+    fn count_and_filtered_keep_only_matching_connections() {
+        let mut config = Config::default();
+        config.upsert(in_folder("a", "P"), None).unwrap();
+        config.upsert(in_folder("b", "P/Q"), None).unwrap();
+        config.upsert(in_folder("c", "R"), None).unwrap();
+        config.add_folder("", "Empty").unwrap();
+        let tree = config.tree();
+        assert_eq!(tree.count(|c| c.name != "a"), 2);
+        assert_eq!(tree.folders[1].count(|c| c.name == "b"), 1);
+        assert_eq!(tree.count(|_| false), 0);
+
+        let only_b = tree.filtered(|c| c.name == "b");
+        assert_eq!(only_b.folders.len(), 1);
+        assert_eq!(only_b.folders[0].path, "P");
+        assert!(only_b.folders[0].connections.is_empty());
+        assert_eq!(only_b.folders[0].folders[0].connections[0].name, "b");
+        // A folder left with nothing, like an empty one, goes.
+        assert_eq!(tree.folders.len(), 3);
+        assert_eq!(tree.filtered(|_| true).folders.len(), 2);
+        assert!(tree.filtered(|_| false).folders.is_empty());
+    }
+
+    #[test]
+    fn a_search_matches_name_folder_or_host_in_any_case() {
+        let mut conn = in_folder("shop-bear", "RGG/storefront");
+        conn.host = "bear-db.internal".into();
+        assert!(conn.matches(""));
+        assert!(conn.matches("  "));
+        assert!(conn.matches("BEAR"));
+        assert!(conn.matches("storefront"));
+        assert!(conn.matches("db.internal"));
+        // Every word must be found, each anywhere.
+        assert!(conn.matches("rgg bear"));
+        assert!(!conn.matches("rgg fox"));
+        // Not what it doesn't show, such as the user or the database.
+        assert!(!conn.matches("dev"));
+        let mut file = in_folder("local", "");
+        file.adapter = Adapter::Sqlite;
+        file.database = "/data/shop.db".into();
+        assert!(file.matches("shop.db"));
     }
 
     #[test]
