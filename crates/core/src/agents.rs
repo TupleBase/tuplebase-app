@@ -17,7 +17,8 @@ use crate::updates;
 pub const HOME_ENV: &str = "TUPLEBASE_AGENTS_HOME";
 
 const SERVER_NAME: &str = "tuplebase";
-const TOML_HEADER: &str = "[mcp_servers.tuplebase]";
+/// The table Codex keeps its servers in.
+const TOML_SERVERS: &str = "mcp_servers";
 
 #[derive(Clone, Copy)]
 enum Format {
@@ -244,7 +245,7 @@ fn read_config(path: &Path) -> Result<String> {
 fn change(format: Format, text: &str, server: &str) -> Result<Option<String>> {
     match format {
         Format::Json { key, typed } => change_json(text, key, typed, server),
-        Format::Toml => Ok(change_toml(text, server)),
+        Format::Toml => change_toml(text, server),
     }
 }
 
@@ -284,38 +285,59 @@ fn change_json(text: &str, key: &str, typed: bool, server: &str) -> Result<Optio
     Ok(Some(format!("{text}\n")))
 }
 
-/// Edits the text directly, so the rest of the file keeps its comments and layout.
-fn change_toml(text: &str, server: &str) -> Option<String> {
-    // A JSON string of a path is also a valid TOML basic string.
-    let command = format!("command = {}", json!(server));
-    let mut lines: Vec<&str> = text.lines().collect();
-    let Some(header) = lines.iter().position(|line| line.trim() == TOML_HEADER) else {
-        let mut updated = text.trim_end().to_owned();
-        if !updated.is_empty() {
-            updated.push_str("\n\n");
-        }
-        updated.push_str(TOML_HEADER);
-        updated.push('\n');
-        updated.push_str(&command);
-        updated.push('\n');
-        return Some(updated);
-    };
-    let body = header + 1;
-    let end = lines[body..]
-        .iter()
-        .position(|line| line.trim_start().starts_with('['))
-        .map_or(lines.len(), |offset| body + offset);
-    let existing = lines[body..end].iter().position(|line| {
-        line.split('=')
-            .next()
-            .is_some_and(|key| key.trim() == "command")
-    });
-    match existing {
-        Some(offset) if lines[body + offset].trim() == command => return None,
-        Some(offset) => lines[body + offset] = &command,
-        None => lines.insert(body, &command),
+/// Edits the parsed document, so the rest of the file keeps its comments and layout, and
+/// the entry is found however it is written: `[mcp_servers.tuplebase]`, a quoted key, or
+/// `tuplebase = { … }` under `[mcp_servers]`. Only touches `command`, like JSON.
+fn change_toml(text: &str, server: &str) -> Result<Option<String>> {
+    // Lines added here end in `\n`; a Windows file keeps its `\r\n` throughout.
+    let crlf = text.contains("\r\n");
+    let mut doc: toml_edit::DocumentMut = text
+        .replace("\r\n", "\n")
+        .parse()
+        .context("the file isn't valid TOML, so it was left alone")?;
+    // A new table goes at the end, after comments that ended the file, and a blank line.
+    let mut prefix = doc.trailing().as_str().unwrap_or_default().to_owned();
+    if !text.trim().is_empty() {
+        prefix.push('\n');
     }
-    Some(format!("{}\n", lines.join("\n")))
+    let mut header_added = false;
+    let servers = doc.entry(TOML_SERVERS).or_insert_with(|| {
+        // No `[mcp_servers]` header of its own, only `[mcp_servers.tuplebase]`.
+        let mut table = toml_edit::Table::new();
+        table.set_implicit(true);
+        table.into()
+    });
+    let inline = servers.is_inline_table();
+    let servers = servers
+        .as_table_like_mut()
+        .with_context(|| format!("`{TOML_SERVERS}` isn't a table, so the file was left alone"))?;
+    let entry = servers
+        .entry(SERVER_NAME)
+        .or_insert_with(|| {
+            // A table header can't go inside `mcp_servers = { … }`.
+            if inline {
+                return toml_edit::value(toml_edit::InlineTable::new());
+            }
+            header_added = true;
+            let mut table = toml_edit::Table::new();
+            table.decor_mut().set_prefix(prefix);
+            table.into()
+        })
+        .as_table_like_mut()
+        .context("the existing entry isn't a table, so the file was left alone")?;
+    if entry.get("command").and_then(toml_edit::Item::as_str) == Some(server) {
+        return Ok(None);
+    }
+    entry.insert("command", toml_edit::value(server));
+    if header_added {
+        doc.set_trailing("");
+    }
+    let updated = doc.to_string();
+    Ok(Some(if crlf {
+        updated.replace('\n', "\r\n")
+    } else {
+        updated
+    }))
 }
 
 /// Replaces the file atomically, following a symlink and keeping its permissions: these
@@ -465,29 +487,106 @@ mod tests {
         assert_eq!(fs::read_to_string(config).unwrap(), original);
     }
 
+    /// The updated file: valid, with one server entry that runs `server`, and needing no
+    /// second change.
+    fn toml_changed(text: &str, server: &str) -> String {
+        let updated = change_toml(text, server).unwrap().expect("a change");
+        let doc: toml_edit::DocumentMut = updated.parse().expect("valid TOML");
+        let servers = doc[TOML_SERVERS].as_table_like().unwrap();
+        assert_eq!(
+            servers
+                .iter()
+                .filter(|(key, _)| *key == SERVER_NAME)
+                .count(),
+            1
+        );
+        assert_eq!(
+            servers.get(SERVER_NAME).unwrap()["command"].as_str(),
+            Some(server)
+        );
+        assert_eq!(change_toml(&updated, server).unwrap(), None);
+        updated
+    }
+
     #[test]
     fn toml_is_appended_without_disturbing_the_file() {
+        for text in ["# only a comment\n", "model = \"x\"\n# tail\n"] {
+            assert!(toml_changed(text, SERVER).starts_with(text));
+        }
         let text = "# mine\nmodel = \"x\"\n";
-        let updated = change_toml(text, SERVER).unwrap();
+        let updated = toml_changed(text, SERVER);
         assert!(updated.starts_with(text));
         assert!(updated.ends_with(&format!(
-            "\n[mcp_servers.tuplebase]\ncommand = \"{SERVER}\"\n"
+            "\n\n[mcp_servers.tuplebase]\ncommand = \"{SERVER}\"\n"
         )));
+        assert_eq!(
+            toml_changed("", SERVER),
+            format!("[mcp_servers.tuplebase]\ncommand = \"{SERVER}\"\n")
+        );
     }
 
     #[test]
     fn toml_only_replaces_this_servers_command() {
         let text = "[mcp_servers.other]\ncommand = \"a\"\n\n[mcp_servers.tuplebase]\ncommand = \"/old\"\nenv = { A = \"1\" }\n";
-        let updated = change_toml(text, SERVER).unwrap();
+        let updated = toml_changed(text, SERVER);
         assert!(updated.contains("[mcp_servers.other]\ncommand = \"a\""));
         assert!(updated.contains(&format!("command = \"{SERVER}\"\nenv = {{ A = \"1\" }}")));
-        assert_eq!(change_toml(&updated, SERVER), None);
+    }
+
+    #[test]
+    fn toml_finds_the_entry_however_it_is_written() {
+        for text in [
+            "[mcp_servers.tuplebase] # mine\ncommand = \"/old\"\nenv = { A = \"1\" }\n",
+            "[mcp_servers.\"tuplebase\"]\ncommand = \"/old\"\nenv = { A = \"1\" }\n",
+            "[ mcp_servers . tuplebase ]\ncommand = \"/old\"\nenv = { A = \"1\" }\n",
+            "[mcp_servers]\ntuplebase = { command = \"/old\", env = { A = \"1\" } }\n",
+            "mcp_servers.tuplebase.command = \"/old\"\nmcp_servers.tuplebase.env = { A = \"1\" }\n",
+            "mcp_servers = { tuplebase = { command = \"/old\", env = { A = \"1\" } } }\n",
+        ] {
+            let updated = toml_changed(text, SERVER);
+            assert!(!updated.contains("/old"), "{updated}");
+            assert!(updated.contains("A = \"1\""), "{updated}");
+        }
+    }
+
+    #[test]
+    fn toml_adds_to_servers_written_any_way() {
+        for text in [
+            "[mcp_servers]\nother = { command = \"a\" }\n",
+            "[mcp_servers.other]\ncommand = \"a\"\n",
+            "mcp_servers = { other = { command = \"a\" } }\n",
+            "mcp_servers.other.command = \"a\"\n",
+        ] {
+            let updated = toml_changed(text, SERVER);
+            assert!(updated.contains("command = \"a\""), "{updated}");
+        }
+    }
+
+    #[test]
+    fn toml_keeps_windows_line_endings() {
+        let text = "# mine\r\n[mcp_servers.tuplebase]\r\ncommand = \"/old\"\r\n";
+        let updated = toml_changed(text, SERVER);
+        assert!(!updated.replace("\r\n", "").contains('\n'), "{updated:?}");
+        let added = toml_changed("model = \"x\"\r\n", SERVER);
+        assert!(!added.replace("\r\n", "").contains('\n'), "{added:?}");
+    }
+
+    #[test]
+    fn invalid_toml_is_left_alone_and_reported() {
+        let home = tempfile::tempdir().unwrap();
+        added(home.path(), ".codex");
+        let config = home.path().join(".codex/config.toml");
+        for original in ["[mcp_servers\n", "mcp_servers = 1\n"] {
+            fs::write(&config, original).unwrap();
+            let result = add_in(home.path(), Os::Linux, SERVER, None);
+            assert!(matches!(state_of(&result, "Codex"), AgentState::Failed(_)));
+            assert_eq!(fs::read_to_string(&config).unwrap(), original);
+        }
     }
 
     #[test]
     fn toml_escapes_windows_paths() {
-        let updated = change_toml("", r"C:\Tools\tuplebase-mcp.exe").unwrap();
-        assert!(updated.contains(r#"command = "C:\\Tools\\tuplebase-mcp.exe""#));
+        toml_changed("", r"C:\Tools\tuplebase-mcp.exe");
     }
 
     #[test]

@@ -67,8 +67,11 @@ pub struct ChatPanel {
     busy: bool,
     /// Counts messages sent and chats cleared, so an answer nobody waits for is dropped.
     turn: usize,
+    /// Stops the agent of the turn in progress.
+    stop: Option<chat::Stop>,
     scroll: ScrollHandle,
     _input_subscription: Subscription,
+    _quit_subscription: Subscription,
 }
 
 impl EventEmitter<ChatEvent> for ChatPanel {}
@@ -83,6 +86,11 @@ impl ChatPanel {
                     this.send_input(window, cx);
                 }
             });
+        // Dropping the panel is not enough: the app can quit with it still open.
+        let _quit_subscription = cx.on_app_quit(|this, _| {
+            this.stop_turn();
+            async {}
+        });
         Self {
             input,
             entries: Vec::new(),
@@ -90,8 +98,10 @@ impl ChatPanel {
             session: None,
             busy: false,
             turn: 0,
+            stop: None,
             scroll: ScrollHandle::new(),
             _input_subscription,
+            _quit_subscription,
         }
     }
 
@@ -113,9 +123,12 @@ impl ChatPanel {
         if self.busy {
             return;
         }
+        self.stop_turn();
         self.busy = true;
         self.turn += 1;
         self.push(Entry::User(prompt.clone().into()), cx);
+        let stop = chat::Stop::default();
+        self.stop = Some(stop.clone());
         let inbox = Inbox::default();
         let turn = self.turn;
         let session = self.session.clone();
@@ -142,7 +155,7 @@ impl ChatPanel {
         cx.spawn(async move |this, cx| {
             let events = inbox.clone();
             let result = blocking(move || {
-                chat::ask(&prompt, session.as_deref(), |event| {
+                chat::ask(&prompt, session.as_deref(), &stop, |event| {
                     events.lock().unwrap().push(event);
                 })
             })
@@ -153,6 +166,7 @@ impl ChatPanel {
                 }
                 this.take(&inbox, cx);
                 this.busy = false;
+                this.stop = None;
                 match result {
                     Ok(session) => this.session = session,
                     Err(e) => this.push(Entry::Error(format!("{e:#}").into()), cx),
@@ -177,8 +191,16 @@ impl ChatPanel {
         cx.notify();
     }
 
-    /// Forgets the conversation. An answer still on its way is dropped when it arrives.
+    /// Ends the agent of the turn in progress, if any. Its answer is dropped.
+    fn stop_turn(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop.stop();
+        }
+    }
+
+    /// Forgets the conversation, and stops an answer still on its way.
     fn clear(&mut self, cx: &mut Context<Self>) {
+        self.stop_turn();
         self.turn += 1;
         self.entries.clear();
         self.expanded.clear();
@@ -400,8 +422,18 @@ fn answer_style() -> TextViewStyle {
         .table_cell(StyleRefinement::default().px_2().py_1())
 }
 
+impl Drop for ChatPanel {
+    fn drop(&mut self) {
+        self.stop_turn();
+    }
+}
+
 #[cfg(test)]
 impl ChatPanel {
+    pub(crate) fn turn_stop(&self) -> Option<chat::Stop> {
+        self.stop.clone()
+    }
+
     pub(crate) fn show(&mut self, event: Event, cx: &mut Context<Self>) {
         self.push(event.into(), cx);
     }

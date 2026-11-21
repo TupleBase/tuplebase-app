@@ -29,4 +29,5 @@ git add Cargo.toml Cargo.lock THIRD-PARTY-NOTICES.txt
 # Nothing to commit when releasing the version already in Cargo.toml.
 git diff --cached --quiet || git commit -m "Release $TAG"
 git tag "$TAG"
-git push origin HEAD:main "$TAG"
+# Atomic: the tag is never pushed without the commit it points at landing on main.
+git push --atomic origin HEAD:main "$TAG"
