@@ -126,6 +126,97 @@ fn kill(agent: &mut Child) {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Ends the agents with the app, also when the app crashes or is killed and so never
+/// stops them itself. Every agent goes in one Windows job that kills what is in it when
+/// it closes. The app never closes it: Windows does when the app's process ends. What
+/// the agent starts afterwards (node, the MCP server) is in the job too.
+#[cfg(windows)]
+mod job {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::process::Child;
+    use std::sync::OnceLock;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    /// Puts `agent` in the app's job. Best effort: without it, stopping a turn still
+    /// kills the agent's tree (`kill`), only a crash of the app may leave it running.
+    pub(super) fn add(agent: &Child) {
+        // A handle isn't `Send`; the job's handle is kept as a number for the app's life.
+        static JOB: OnceLock<Option<usize>> = OnceLock::new();
+        let Some(job) = *JOB.get_or_init(|| create().map(|job| job as usize)) else {
+            return;
+        };
+        // SAFETY: both handles are open: the job's is never closed, and `agent` owns its
+        // process handle for as long as the borrow lasts.
+        unsafe { AssignProcessToJobObject(job as HANDLE, agent.as_raw_handle() as HANDLE) };
+    }
+
+    /// A new job that kills its processes when its last handle closes.
+    pub(super) fn create() -> Option<HANDLE> {
+        // SAFETY: plain calls with valid arguments; the handle is closed on failure.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if set == 0 {
+                CloseHandle(job);
+                return None;
+            }
+            Some(job)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::windows::io::AsRawHandle as _;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        #[test]
+        fn closing_the_job_ends_the_agent_in_it() {
+            let job = super::create().expect("no job");
+            let mut agent = Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            // SAFETY: both handles are open here.
+            let assigned =
+                unsafe { AssignProcessToJobObject(job, agent.as_raw_handle() as HANDLE) };
+            assert_ne!(assigned, 0, "the agent was not put in the job");
+            assert!(agent.try_wait().unwrap().is_none());
+            // What Windows does for the app when its process ends.
+            // SAFETY: the job's handle is open and not used again.
+            unsafe { CloseHandle(job) };
+            let start = Instant::now();
+            while agent.try_wait().unwrap().is_none() {
+                if start.elapsed() > Duration::from_secs(10) {
+                    let _ = agent.kill();
+                    panic!("the agent outlived its job");
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 /// Sends `prompt` and reports what the agent does until it has answered. `session`
 /// continues an earlier conversation; the result is the session to pass next time.
 /// Blocks for the whole answer, or until `stop`; call it off the UI thread.
@@ -194,6 +285,8 @@ fn run(
     let mut child = command
         .spawn()
         .with_context(|| format!("starting {AGENT_NAME}"))?;
+    #[cfg(windows)]
+    job::add(&child);
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().context("no stdout")?;
     let mut stderr = child.stderr.take().context("no stderr")?;

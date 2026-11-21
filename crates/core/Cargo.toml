@@ -43,6 +43,16 @@ toml_edit = "0.25.19"
 aws-sdk-redshift = { version = "1.131.0", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 aws-sdk-redshiftserverless = { version = "1.132.0", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
+# Windows only: a job object ends the chat agent with the app, even when the app
+# crashes. Pure Rust bindings, already in the tree through other crates.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 # A fixed clock for signing tests, and a PEM reader to check the RDS bundle; both are
