@@ -75,6 +75,7 @@ Local databases, user `dev`, password `dev`, database `app`:
 | MariaDB    | 53306 |
 | SSH server | 52222 |
 | Fake AWS   | 54566 |
+| MongoDB    | 57017 |
 
 Besides the `users` table the tests use, both databases hold demo data to try lists, filters
 and paging: about 35 tables and half a million rows, up to 150,000 in one table. PostgreSQL
@@ -84,6 +85,19 @@ is empty, `wide_metrics` has 41 columns, `type_samples` has a column per kind of
 table has a very long name. The data is in `dev/demo-postgres.sql` and `dev/demo-mariadb.sql`,
 which run only when a database is first created. To load a changed file, run `make down`, then
 `make dev`.
+
+MongoDB runs as a single-node replica set, `rs0`, with the root user `dev` (password `dev`,
+`authSource=admin`). `dev/seed-mongo.js` fills `app.users` and `app.orders`, adds the view
+`app.active_users`, and the user `reader` (password `reader`) with only the `read` role on
+`app`, whose writes the server refuses. The seed runs only when the database is first created.
+`crates/core/tests/mongo.rs` runs each test twice, as MongoDB and as DocumentDB, against this
+one server.
+
+DocumentDB can't run locally. Before a release that changes `db/mongo.rs`, try a real cluster
+by hand: add a DocumentDB connection with its cluster endpoint, port 27017, Encryption
+Verified, and the options `replicaSet=rs0&readPreference=secondaryPreferred`; then list the
+collections, run a `find` and an `aggregate`, and on a read-only connection check that an
+`insertOne` is refused. Through an SSH tunnel, choose Encryption Required.
 
 The fake AWS serves Secrets Manager, Parameter Store and RDS (listing only: its databases
 don't accept logins). To use it from the app or the AWS
