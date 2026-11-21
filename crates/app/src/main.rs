@@ -10,6 +10,7 @@ mod dialogs;
 mod logos;
 mod results;
 mod row_detail;
+mod run_button;
 mod runtime;
 mod schema;
 mod theme;
