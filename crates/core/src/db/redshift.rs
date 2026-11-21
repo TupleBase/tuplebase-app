@@ -28,21 +28,22 @@ use super::{
 use crate::config::{Adapter, Connection};
 
 /// Leaves out Redshift's own schemas: `pg_catalog`, `information_schema`, and those that
-/// start with `pg_`, such as `pg_internal` and `pg_automv`. `left` rather than `LIKE`,
-/// whose `\_` a Redshift string would read as an escape.
+/// start with `pg_`, such as `pg_internal` and `pg_automv`. A regular expression, as AWS's
+/// Redshift JDBC driver matches them, rather than `LIKE 'pg\_%'`, whose backslash a
+/// Redshift string would read as an escape.
 macro_rules! user_schema {
     ($column:literal) => {
         concat!(
             $column,
-            " NOT IN ('pg_catalog', 'information_schema') AND left(",
+            " NOT IN ('pg_catalog', 'information_schema') AND ",
             $column,
-            ", 3) <> 'pg_'"
+            " !~ '^pg_'"
         )
     };
 }
 
 /// Each query returns schema, name and detail. A routine's detail is its argument types,
-/// which tell overloads apart.
+/// from `oidvectortypes`, as AWS's Redshift utilities read them; they tell overloads apart.
 const OBJECTS: &[(ObjectKind, &str)] = &[
     (
         ObjectKind::Function,
@@ -87,7 +88,7 @@ const TABLES: &str = concat!(
      FROM svv_all_tables t LEFT JOIN svv_mv_info m \
      ON trim(m.database_name) = t.database_name AND trim(m.schema_name) = t.schema_name \
      AND trim(m.name) = t.table_name \
-     WHERE t.database_name = current_database() AND left(t.table_name, 8) <> 'mv_tbl__' AND ",
+     WHERE t.database_name = current_database() AND t.table_name !~ '^mv_tbl__' AND ",
     user_schema!("t.schema_name"),
     " ORDER BY 1, 2"
 );
@@ -98,7 +99,7 @@ const TABLES_PLAIN: &str = concat!(
     "SELECT schema_name::varchar, table_name::varchar, \
      (CASE WHEN table_type = 'VIEW' THEN 'VIEW' ELSE 'BASE TABLE' END)::varchar \
      FROM svv_all_tables \
-     WHERE database_name = current_database() AND left(table_name, 8) <> 'mv_tbl__' AND ",
+     WHERE database_name = current_database() AND table_name !~ '^mv_tbl__' AND ",
     user_schema!("schema_name"),
     " ORDER BY 1, 2"
 );
@@ -151,11 +152,12 @@ pub(super) const DIALECT: Dialect = Dialect {
 };
 
 /// Ends any transaction a run left open, so the connection goes back to the pool
-/// without one. `ROLLBACK` is sent either way: with none open, Redshift, like
-/// PostgreSQL, only warns. Whether one was open is read from the statements
-/// (`script_left_open`): Redshift has no `statement_timestamp()` for
-/// `postgres::end_transaction`'s check, and the driver doesn't expose the server's
-/// transaction status.
+/// without one. `ROLLBACK` is sent either way; with none open, PostgreSQL only warns, and
+/// should Redshift refuse it instead, the run's connection is closed rather than returned
+/// to the pool, which is just as safe. Whether one was open is read from the statements
+/// (`script_left_open`): Redshift documents no `statement_timestamp()` for
+/// `postgres::end_transaction`'s check (its `GETDATE()` gives the statement's start, but
+/// to the second), and the driver doesn't expose the server's transaction status.
 pub(super) async fn end_transaction(
     conn: &mut PgConnection,
     script_left_open: bool,
@@ -476,7 +478,7 @@ mod tests {
                 sql.contains("NOT IN ('pg_catalog', 'information_schema')"),
                 "{sql}"
             );
-            assert!(sql.contains(", 3) <> 'pg_'"), "{sql}");
+            assert!(sql.contains(" !~ '^pg_'"), "{sql}");
             // A backslash is an escape in a Redshift string, so `LIKE 'pg\_%'` would
             // match more than meant.
             assert!(!sql.contains('\\'), "{sql}");
@@ -491,7 +493,7 @@ mod tests {
         }
         assert!(TABLES.contains("svv_mv_info") && !TABLES_PLAIN.contains("svv_mv_info"));
         for sql in [TABLES, TABLES_PLAIN] {
-            assert!(sql.contains("<> 'mv_tbl__'"), "{sql}");
+            assert!(sql.contains("!~ '^mv_tbl__'"), "{sql}");
         }
     }
 

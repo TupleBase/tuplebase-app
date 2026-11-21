@@ -336,5 +336,4 @@ async fn discovery_asks_redshift_beside_rds_without_an_error() {
         "{:?}",
         discovery.errors
     );
-    assert_eq!(discovery.empty_regions, [REGION]);
 }

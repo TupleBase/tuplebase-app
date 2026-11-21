@@ -180,8 +180,9 @@ which come with the app.
 Redshift endpoints (`*.redshift.amazonaws.com`, `*.redshift-serverless.amazonaws.com`) use
 [certificates from AWS Certificate Manager](https://docs.aws.amazon.com/redshift/latest/mgmt/connecting-transitioning-to-acm-certs.html),
 issued by Amazon Trust Services, which the app trusts like any other public authority, so
-**Verified** needs nothing more there. In the China regions Redshift uses authorities of its
-own, which the app doesn't bring: there, use **Required**.
+**Verified** needs nothing more there. For the China regions AWS publishes a certificate
+bundle of its own, which the app doesn't bring: if **Verified** fails there, use
+**Required**.
 
 ### Finding databases in AWS
 

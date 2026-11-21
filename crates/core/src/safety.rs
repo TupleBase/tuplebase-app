@@ -386,6 +386,7 @@ fn row_keywords(adapter: Adapter) -> &'static [&'static str] {
 /// words, for a server that can't say itself (MySQL). Not part of the read-only guard.
 pub fn leaves_transaction_open(adapter: Adapter, statements: &[&str]) -> bool {
     let mysql = adapter.info().script == ScriptFlavor::Mysql;
+    let redshift = adapter.info().script == ScriptFlavor::Redshift;
     let (mut open, mut manual) = (false, false);
     for statement in statements {
         let words: Vec<String> = tokens(adapter, statement)
@@ -407,6 +408,8 @@ pub fn leaves_transaction_open(adapter: Adapter, statements: &[&str]) -> bool {
             ("commit" | "rollback" | "end" | "abort", ..) => open = false,
             // MySQL commits before each of these; PostgreSQL and Redshift don't.
             ("create" | "alter" | "drop" | "rename" | "truncate", ..) if mysql => open = false,
+            // Redshift commits the transaction a TRUNCATE runs in.
+            ("truncate", ..) if redshift => open = false,
             _ => open |= manual,
         }
     }
@@ -884,6 +887,14 @@ mod tests {
         assert!(!open(&["BEGIN", "CREATE TABLE u (a int)", "END"]));
         assert!(!open(&["BEGIN", "CREATE TABLE u (a int)", "COMMIT"]));
         assert!(!open(&["select 1", "create table u (a int)"]));
+        // But TRUNCATE commits the transaction it runs in; PostgreSQL's doesn't.
+        assert!(!open(&["BEGIN", "insert into t values (1)", "TRUNCATE t"]));
+        assert!(!open(&["BEGIN", "TRUNCATE t", "insert into t values (1)"]));
+        assert!(open(&["TRUNCATE t", "BEGIN", "insert into t values (1)"]));
+        assert!(leaves_transaction_open(
+            Adapter::Postgres,
+            &["BEGIN", "TRUNCATE t"]
+        ));
     }
 
     #[test]
