@@ -387,7 +387,15 @@ pub fn is_rds_host(host: &str) -> bool {
     host.ends_with(".rds.amazonaws.com") || host.ends_with(".rds.amazonaws.com.cn")
 }
 
-/// Amazon's RDS certificate authorities, for verifying an RDS database's certificate.
+/// Whether `host` is an Amazon DocumentDB endpoint, whose certificates also come from
+/// Amazon's RDS certificate authorities.
+pub fn is_docdb_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host.ends_with(".docdb.amazonaws.com") || host.ends_with(".docdb.amazonaws.com.cn")
+}
+
+/// Amazon's RDS certificate authorities, for verifying an RDS or DocumentDB database's
+/// certificate.
 ///
 /// Source: <https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem>, the
 /// bundle for every commercial region, linked from "Using SSL/TLS to encrypt a connection
@@ -845,6 +853,8 @@ pub fn adapter_for_engine(engine: &str) -> Option<Adapter> {
         // `aurora` is Aurora MySQL 5.6, from before the engine had its own name.
         "mysql" | "aurora-mysql" | "aurora" => Some(Adapter::Mysql),
         "mariadb" => Some(Adapter::Mariadb),
+        // RDS lists DocumentDB clusters and instances under this engine.
+        "docdb" => Some(Adapter::Documentdb),
         REDSHIFT_ENGINE | REDSHIFT_SERVERLESS_ENGINE => Some(Adapter::Redshift),
         _ => None,
     }
@@ -881,9 +891,14 @@ fn discovered(found: Found, profile: &str, region: &str) -> Discovered {
         notes.push(format!("It has no endpoint yet ({status})."));
     }
     if let Some(readers) = found.readers {
-        notes.push(format!(
-            "Aurora cluster: connects to the writer. Readers are at {readers}."
-        ));
+        notes.push(if adapter == Some(Adapter::Documentdb) {
+            format!(
+                "DocumentDB cluster: connects to the primary. For reads only, which may \
+                 lag a little, its reader endpoint is {readers}."
+            )
+        } else {
+            format!("Aurora cluster: connects to the writer. Readers are at {readers}.")
+        });
     }
     if found.public {
         notes.push(found.service.verified_note().into());
@@ -1223,7 +1238,8 @@ mod tests {
             adapter_for_engine("redshift-serverless"),
             Some(Adapter::Redshift)
         );
-        for other in ["oracle-ee", "sqlserver-se", "db2-se", "docdb", "neptune"] {
+        assert_eq!(adapter_for_engine("docdb"), Some(Adapter::Documentdb));
+        for other in ["oracle-ee", "sqlserver-se", "db2-se", "neptune"] {
             assert_eq!(adapter_for_engine(other), None, "{other}");
         }
     }
@@ -1269,6 +1285,60 @@ mod tests {
         assert_eq!(shop.database, "postgres");
         assert!(!found[1].public);
         assert!(found[1].note.as_deref().unwrap().contains("SSH tunnel"));
+    }
+
+    #[test]
+    fn a_documentdb_cluster_is_listed_at_its_primary_with_its_reader_and_secret() {
+        let secret = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:docs-abc";
+        let cluster = DbCluster::builder()
+            .db_cluster_identifier("docs")
+            .engine("docdb")
+            .engine_version("5.0.0")
+            .endpoint("docs.cluster-abc.eu-west-1.docdb.amazonaws.com")
+            .reader_endpoint("docs.cluster-ro-abc.eu-west-1.docdb.amazonaws.com")
+            .port(27017)
+            .status("available")
+            .master_username("docdbadmin")
+            .master_user_secret(MasterUserSecret::builder().secret_arn(secret).build())
+            .db_cluster_members(
+                DbClusterMember::builder()
+                    .db_instance_identifier("docs-1")
+                    .build(),
+            )
+            .build();
+        let instances = [instance("docs-1", "docdb")
+            .db_cluster_identifier("docs")
+            .build()];
+        let found = found_in_region(&instances, &[cluster], "prod", "eu-west-1");
+        assert_eq!(found.len(), 1, "the cluster once, not its instance");
+        let docs = &found[0];
+        assert_eq!(docs.adapter, Some(Adapter::Documentdb));
+        assert_eq!(docs.port, 27017);
+        assert_eq!(docs.user, "docdbadmin");
+        assert!(is_docdb_host(&docs.host));
+        assert!(!is_rds_host(&docs.host));
+        let note = docs.note.as_deref().unwrap();
+        assert!(note.contains("DocumentDB cluster"), "{note}");
+        assert!(note.contains("cluster-ro-abc"), "{note}");
+        // Not reachable from outside its VPC: the tunnel note.
+        assert!(note.contains("SSH tunnel"), "{note}");
+        assert!(
+            matches!(&docs.auth, Auth::AwsSecret(s) if s.name == secret),
+            "{:?}",
+            docs.auth
+        );
+    }
+
+    #[test]
+    fn documentdb_hosts_are_told_apart() {
+        assert!(is_docdb_host(
+            "docs.cluster-abc.eu-west-1.docdb.amazonaws.com"
+        ));
+        assert!(is_docdb_host(
+            "DOCS.cluster-abc.cn-north-1.docdb.amazonaws.com.cn."
+        ));
+        assert!(!is_docdb_host("docdb.amazonaws.com.example.com"));
+        assert!(!is_docdb_host("orders.abc.eu-west-1.rds.amazonaws.com"));
     }
 
     #[test]
@@ -1816,6 +1886,22 @@ mod tests {
         named.database = "reports".into();
         let (target, _) = Secret::parse(RDS).unwrap().apply(&named, true).unwrap();
         assert_eq!(target.database, "reports");
+    }
+
+    #[test]
+    fn a_documentdb_secret_fills_in_user_host_and_port() {
+        // The shape DocumentDB writes: no dbname, and fields the connection ignores.
+        let docdb = r#"{"username":"docdbadmin","password":"p","engine":"mongo",
+            "host":"docs.cluster-abc.eu-west-1.docdb.amazonaws.com","port":27017,
+            "ssl":true,"dbClusterIdentifier":"docs"}"#;
+        let (target, password) = Secret::parse(docdb).unwrap().apply(&conn(), true).unwrap();
+        assert_eq!(password, "p");
+        assert_eq!(target.user, "docdbadmin");
+        assert_eq!(
+            (target.host.as_str(), target.port),
+            ("docs.cluster-abc.eu-west-1.docdb.amazonaws.com", 27017)
+        );
+        assert_eq!(target.database, "");
     }
 
     #[test]

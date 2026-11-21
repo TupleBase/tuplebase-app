@@ -76,8 +76,8 @@ right one already chosen.
 The value is read from AWS every time the connection opens and is kept in memory only, so a
 rotated password needs nothing from you. It can be:
 
-- JSON in the shape RDS writes: `username`, `password`, and optionally `host`, `port` and
-  `dbname`. The secret's `username` replaces the connection's user. A database set on the
+- JSON in the shape RDS and DocumentDB write: `username`, `password`, and optionally `host`,
+  `port` and `dbname`; other fields, such as DocumentDB's `engine` and `ssl`, are ignored. The secret's `username` replaces the connection's user. A database set on the
   connection wins over `dbname`.
 - Any other text, which is used as the password. The connection then needs a user.
 
@@ -177,12 +177,19 @@ Connections dialog counts it as needing a newer TupleBase. It is written back un
 its place whenever this version saves, and its name stays taken. A file with a `version` this
 version doesn't know is still not read, as above.
 
-### Verifying an RDS certificate
+### Verifying an RDS or DocumentDB certificate
 
 With **Encryption** set to **Verified**, a database at an `*.rds.amazonaws.com` (or
 `*.rds.amazonaws.com.cn`) host is also checked against
 [Amazon's RDS certificate authorities](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/UsingWithRDS.SSL.html),
 which come with the app.
+
+A DocumentDB cluster at a `*.docdb.amazonaws.com` (or `*.docdb.amazonaws.com.cn`) host is
+checked against the same authorities, and only those. The MongoDB driver reads authorities
+only from a file, so the app writes them, public data and no secret, to
+`certs/rds-global-bundle.pem` in its config folder, and rewrites it only when the bundle
+changes. Through an SSH tunnel the certificate names the cluster, not the tunnel, so use
+**Required** there.
 
 Redshift endpoints (`*.redshift.amazonaws.com`, `*.redshift-serverless.amazonaws.com`) use
 [certificates from AWS Certificate Manager](https://docs.aws.amazon.com/redshift/latest/mgmt/connecting-transitioning-to-acm-certs.html),
@@ -194,17 +201,21 @@ bundle of its own, which the app doesn't bring: if **Verified** fails there, use
 ### Finding databases in AWS
 
 **New connection** → **Amazon Web Services** lists the RDS databases, Aurora clusters,
-Redshift clusters and Redshift Serverless workgroups your AWS profile can see, in the regions
+DocumentDB clusters, Redshift clusters and Redshift Serverless workgroups your AWS profile can see, in the regions
 you choose (the profile's own by default). The
 app remembers the profile and regions you searched last, in `state.json`. Pick one and the
 form is filled in: name, host and port, master user, database, and **Encryption**:
 **Verified** for a public database (the RDS certificate is checked), **Required** for a
 private one, which you reach through an SSH tunnel. Its credentials are:
 
-- the master user's secret, when RDS or Redshift manages it in Secrets Manager;
+- the master user's secret, when RDS, DocumentDB or Redshift manages it in Secrets Manager;
 - otherwise an IAM token, when the database has IAM authentication on, and always for
   Redshift, which takes [temporary credentials](#redshift) from any cluster or workgroup;
 - otherwise a password you type.
+
+A DocumentDB cluster is listed once, at its cluster endpoint, which reaches the primary; the
+note names its reader endpoint, for reads only. It has no IAM sign-in in the app yet: the
+MongoDB driver's AWS sign-in needs a C library (D2 in ARCHITECTURE.md).
 
 A Redshift cluster fills in its master user and database, `dev` unless it names another; a
 Serverless workgroup those of its namespace. A service your AWS identity may not list, or that

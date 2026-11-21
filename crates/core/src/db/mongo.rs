@@ -22,7 +22,7 @@ use mongodb::results::CollectionType;
 use mongodb::{Client, Collection, IndexModel};
 use serde_json::{Map, Number, Value};
 
-use super::connect::{ACQUIRE_TIMEOUT, POOL_SIZE};
+use super::connect::{ACQUIRE_TIMEOUT, POOL_SIZE, ca_file};
 use super::{ColumnInfo, ObjectInfo, ObjectKind, QueryResult, ScriptResult, Source, TableInfo};
 use crate::config::{Adapter, Connection, TlsMode};
 use crate::mongo_shell::{AggregateOptions, Command, Op, ReadOp, Target};
@@ -92,11 +92,18 @@ pub(super) async fn options(
     let mut options = ClientOptions::parse(&uri)
         .await
         .context("reading the connection options")?;
-    apply(&mut options, conn, password);
+    let ca_file = ca_file(conn).context("saving Amazon's certificate authorities")?;
+    apply(&mut options, conn, password, ca_file);
     Ok(options)
 }
 
-fn apply(options: &mut ClientOptions, conn: &Connection, password: Option<&str>) {
+/// `ca_file` holds the only authorities to trust when verifying, for a DocumentDB host.
+fn apply(
+    options: &mut ClientOptions,
+    conn: &Connection,
+    password: Option<&str>,
+    ca_file: Option<std::path::PathBuf>,
+) {
     options.app_name = Some("TupleBase".into());
     options.server_selection_timeout = Some(ACQUIRE_TIMEOUT);
     options.connect_timeout = Some(ACQUIRE_TIMEOUT);
@@ -113,7 +120,7 @@ fn apply(options: &mut ClientOptions, conn: &Connection, password: Option<&str>)
                 .allow_invalid_certificates(true)
                 .build(),
         ),
-        TlsMode::Verify => Tls::Enabled(TlsOptions::default()),
+        TlsMode::Verify => Tls::Enabled(TlsOptions::builder().ca_file_path(ca_file).build()),
     });
     // A tunnel reaches one server: the replica set's other members, by the names it
     // gives them, are out of reach.
@@ -1191,6 +1198,20 @@ mod tests {
             panic!()
         };
         assert_eq!(verify.allow_invalid_certificates, None);
+    }
+
+    #[tokio::test]
+    async fn verifying_documentdb_trusts_amazons_authorities_from_their_file() {
+        let mut c = conn(Adapter::Documentdb, TlsMode::Verify);
+        c.host = "docs.cluster-abc.eu-west-1.docdb.amazonaws.com".into();
+        let mut options = ClientOptions::parse("mongodb://h:27017").await.unwrap();
+        let file = std::path::PathBuf::from("/config/certs/rds-global-bundle.pem");
+        apply(&mut options, &c, None, Some(file.clone()));
+        let Some(Tls::Enabled(tls)) = options.tls else {
+            panic!("TLS is on")
+        };
+        assert_eq!(tls.ca_file_path, Some(file));
+        assert_eq!(tls.allow_invalid_certificates, None);
     }
 
     #[tokio::test]

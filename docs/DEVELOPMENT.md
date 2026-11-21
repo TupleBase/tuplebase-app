@@ -110,8 +110,8 @@ DocumentDB can't run locally. Before a release that changes `db/mongo.rs`, try a
 by hand: add a DocumentDB connection with its cluster endpoint, port 27017, Encryption
 Required, and the options `replicaSet=rs0&readPreference=secondaryPreferred`; then list the
 collections, run a `find` and an `aggregate`, and on a read-only connection check that an
-`insertOne` is refused. Verified needs Amazon's certificate authorities, which the MongoDB
-driver doesn't get yet.
+`insertOne` is refused. From a host inside the VPC, also try Encryption Verified, which
+checks the cluster against Amazon's certificate authorities (see docs/CREDENTIALS.md).
 
 The fake AWS serves Secrets Manager, Parameter Store and RDS (listing only: its databases
 don't accept logins). To use it from the app or the AWS
